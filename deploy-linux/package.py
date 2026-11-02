@@ -109,7 +109,7 @@ def archive():
     for relative in ['node/bin/node', 'bin/es2api', 'payload/bin/kin-api-kernel', 'integration/node_modules/ws/package.json', 'vm2api/node_modules/ws/package.json', 'vm2api/web/dist/index.html', 'integration/resources/modeltrace/PROVENANCE.md']:
         if not (STAGE / relative).is_file():
             raise RuntimeError('Missing distribution component: ' + relative)
-    files = sorted(p for p in STAGE.rglob('*') if p.is_file())
+    files = sorted(p for p in STAGE.rglob('*') if p.is_file() and p != STAGE / 'SHA256SUMS')
     if any(p.suffix in {'.sqlite', '.db'} or p.name in {'local-secrets.json', 'linux-secrets.json', 'linux-config.json'} or p.relative_to(STAGE).parts[0] == 'runtime' for p in files):
         raise RuntimeError('Unexpected private runtime data in distribution')
     (STAGE / 'SHA256SUMS').write_text(''.join(digest(p) + '  ' + p.relative_to(STAGE).as_posix() + '\n' for p in files), encoding='utf-8')
