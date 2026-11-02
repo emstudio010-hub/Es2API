@@ -1,0 +1,12 @@
+{
+  "name": "es2api-integration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/start.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.22.1"
+  }
+}

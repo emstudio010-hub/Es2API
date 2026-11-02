@@ -1,0 +1,32 @@
+name: es2api-linux
+services:
+  postgres:
+    image: ${ES2API_POSTGRES_IMAGE:-postgres:18-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: es2api
+      POSTGRES_DB: es2api
+      POSTGRES_PASSWORD: ${ES2API_POSTGRES_PASSWORD:?Run es2api.sh init first}
+    ports: ["127.0.0.1:15433:5432"]
+    volumes: [postgres-data:/var/lib/postgresql]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U es2api -d es2api"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  redis:
+    image: ${ES2API_REDIS_IMAGE:-redis:8-alpine}
+    restart: unless-stopped
+    environment:
+      ES2API_REDIS_PASSWORD: ${ES2API_REDIS_PASSWORD:?Run es2api.sh init first}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$ES2API_REDIS_PASSWORD"']
+    ports: ["127.0.0.1:16380:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$ES2API_REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 40
+volumes:
+  postgres-data:
+  redis-data:

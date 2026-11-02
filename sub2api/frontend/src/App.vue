@@ -1,0 +1,183 @@
+<script setup lang="ts">
+import { RouterView, useRouter, useRoute } from 'vue-router'
+import { computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import Toast from '@/components/common/Toast.vue'
+import NavigationProgress from '@/components/common/NavigationProgress.vue'
+import AdminComplianceDialog from '@/components/admin/AdminComplianceDialog.vue'
+import { resolveRouteDocumentTitle, resolveRouteMetaKeys } from '@/router/title'
+import { useI18n } from 'vue-i18n'
+import AnnouncementPopup from '@/components/common/AnnouncementPopup.vue'
+import { useAppStore, useAuthStore, useSubscriptionStore, useAnnouncementStore, useAdminComplianceStore, useAdminSettingsStore } from '@/stores'
+import { getSetupStatus } from '@/api/setup'
+import { updateFavicon } from '@/utils/branding'
+import { FeatureFlags, isFeatureFlagEnabled } from '@/utils/featureFlags'
+import { resolveSiteBillingMode } from '@/utils/siteBillingMode'
+
+const router = useRouter()
+const { t, locale } = useI18n()
+const route = useRoute()
+const appStore = useAppStore()
+const authStore = useAuthStore()
+const subscriptionStore = useSubscriptionStore()
+const announcementStore = useAnnouncementStore()
+const adminComplianceStore = useAdminComplianceStore()
+const adminSettingsStore = useAdminSettingsStore()
+
+function updateDocumentTitle() {
+  const customMenuItems = [
+    ...(appStore.cachedPublicSettings?.custom_menu_items ?? []),
+    ...(authStore.isAdmin ? adminSettingsStore.customMenuItems : []),
+  ]
+  document.title = resolveRouteDocumentTitle(route, appStore.siteName, customMenuItems, {
+    billingMode: resolveSiteBillingMode(appStore.cachedPublicSettings),
+  })
+  const { descriptionKey } = resolveRouteMetaKeys(route, { billingMode: resolveSiteBillingMode(appStore.cachedPublicSettings) })
+  for (const [name, content] of Object.entries({
+    description: descriptionKey ? t(descriptionKey) : document.title,
+    robots: route.meta.requiresAuth !== false || route.path === '/setup' ? 'noindex, nofollow, noarchive' : 'index, follow',
+  })) {
+    const existing = [...document.head.querySelectorAll<HTMLMetaElement>(`meta[name="${name}"]`)]
+    const meta = existing.shift() || document.createElement('meta')
+    for (const duplicate of existing) duplicate.remove()
+    meta.name = name; meta.content = content; if (!meta.isConnected) document.head.appendChild(meta)
+  }
+}
+
+// Watch for site settings changes and update favicon/title
+watch(
+  () => appStore.siteLogo,
+  (newLogo) => {
+    if (newLogo) {
+      updateFavicon(newLogo)
+    }
+  },
+  { immediate: true }
+)
+
+watch(
+  [
+    () => route.fullPath,
+    () => locale.value,
+    () => route.meta.title,
+    () => route.meta.titleKey,
+    () => appStore.siteName,
+    () => appStore.cachedPublicSettings?.custom_menu_items,
+    () => appStore.cachedPublicSettings?.subscription_enabled,
+    () => appStore.cachedPublicSettings?.payment_balance_disabled,
+    () => authStore.isAdmin,
+    () => adminSettingsStore.customMenuItems,
+  ],
+  updateDocumentTitle,
+  { deep: true, immediate: true }
+)
+
+// Watch for authentication state and manage subscription data + announcements
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible' && authStore.isAuthenticated) {
+    announcementStore.fetchAnnouncements()
+  }
+}
+
+function onAdminComplianceRequired(event: Event) {
+  const detail = (event as CustomEvent<Record<string, string>>).detail || {}
+  adminComplianceStore.requireAcknowledgement(detail)
+}
+
+// 订阅功能开关（opt-out）。关闭后不再预加载/轮询订阅接口；开关在登录后才到达时补启动，反向则清空。
+const subscriptionFeatureEnabled = computed(() => isFeatureFlagEnabled(FeatureFlags.subscription))
+
+function startSubscriptionSync() {
+  subscriptionStore.fetchActiveSubscriptions().catch((error) => {
+    console.error('Failed to preload subscriptions:', error)
+  })
+  subscriptionStore.startPolling()
+}
+
+watch(subscriptionFeatureEnabled, (enabled) => {
+  if (!authStore.isAuthenticated) return
+  if (enabled) {
+    startSubscriptionSync()
+  } else {
+    subscriptionStore.clear()
+  }
+})
+
+watch(
+  () => authStore.isAuthenticated,
+  (isAuthenticated, oldValue) => {
+    if (isAuthenticated) {
+      if (authStore.isAdmin) {
+        adminComplianceStore.fetchStatus().catch((error) => {
+          console.error('Failed to fetch admin compliance status:', error)
+        })
+      }
+
+      // User logged in: preload subscriptions and start polling (skipped when the
+      // subscription feature is switched off; see the flag watcher below)
+      if (subscriptionFeatureEnabled.value) {
+        startSubscriptionSync()
+      }
+
+      // Announcements: new login vs page refresh restore
+      if (oldValue === false) {
+        // New login: delay 3s then force fetch
+        setTimeout(() => announcementStore.fetchAnnouncements(true), 3000)
+      } else {
+        // Page refresh restore (oldValue was undefined)
+        announcementStore.fetchAnnouncements()
+      }
+
+      // Register visibility change listener
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    } else {
+      // User logged out: clear data and stop polling
+      subscriptionStore.clear()
+      announcementStore.reset()
+      adminComplianceStore.reset()
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  },
+  { immediate: true }
+)
+
+// Route change trigger (throttled by store)
+router.afterEach(() => {
+  if (authStore.isAuthenticated) {
+    announcementStore.fetchAnnouncements()
+  }
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  window.removeEventListener('admin-compliance-required', onAdminComplianceRequired)
+})
+
+onMounted(async () => {
+  window.addEventListener('admin-compliance-required', onAdminComplianceRequired)
+
+  // Check if setup is needed
+  try {
+    const status = await getSetupStatus()
+    if (status.needs_setup && route.path !== '/setup') {
+      router.replace('/setup')
+      return
+    }
+  } catch {
+    // If setup endpoint fails, assume normal mode and continue
+  }
+
+  // Load public settings into appStore (will be cached for other components)
+  await appStore.fetchPublicSettings()
+
+  // Re-resolve document title now that site settings are available
+  updateDocumentTitle()
+})
+</script>
+
+<template>
+  <NavigationProgress />
+  <RouterView />
+  <Toast />
+  <AnnouncementPopup />
+  <AdminComplianceDialog />
+</template>

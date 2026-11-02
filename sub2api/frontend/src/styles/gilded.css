@@ -1,0 +1,41 @@
+/* Gold identifies actions and selected navigation; status colors keep their meaning. */
+:root {
+  --gilded-line: #ded0ac;
+  --gilded-paper: #fbfaf7;
+  --gilded-ink: #302d27;
+  --gilded-focus: #805614;
+}
+.dark {
+  --gilded-line: #514731;
+  --gilded-paper: #201e1a;
+  --gilded-ink: #e8e3d6;
+  --gilded-focus: #dfbd77;
+}
+input, textarea { caret-color: var(--gilded-focus); }
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline-color: var(--gilded-focus);
+}
+.console-heading { padding-bottom: 1.25rem; border-bottom: 1px solid var(--gilded-line); }
+.console-heading h1 { letter-spacing: -0.025em; font-weight: 600; }
+.pool-stat-strip {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 1rem; border-block: 1px solid var(--gilded-line);
+  background: var(--gilded-paper);
+}
+.pool-stat { padding: 0.8rem 1rem; }
+.pool-stat + .pool-stat { border-left: 1px solid var(--gilded-line); }
+.pool-stat dd { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--gilded-ink); }
+.isolation-note { margin-top: 0.8rem; max-width: 90ch; font-size: 0.75rem; line-height: 1.7; color: var(--gilded-ink); }
+.slot-identity { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.75rem; font-weight: 600; }
+.slot-details { margin-top: 0.65rem; font-size: 0.75rem; }
+.slot-details summary { width: fit-content; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; color: var(--gilded-focus); }
+.slot-details dl { display: grid; gap: 0.4rem; margin-top: 0.6rem; }
+.slot-details dl div { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: 0.5rem; }
+.slot-details dt { color: var(--gilded-ink); }
+.slot-details dd { overflow-wrap: anywhere; }
+.table-wrapper thead th { border-bottom-color: var(--gilded-line); }
+@media (max-width: 639px) {
+  .pool-stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pool-stat:nth-child(3) { border-left: 0; }
+  .pool-stat:nth-child(n+3) { border-top: 1px solid var(--gilded-line); }
+}

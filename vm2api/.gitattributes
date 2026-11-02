@@ -1,0 +1,16 @@
+* text=auto eol=lf
+scripts/*.sh text eol=lf
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+.env.example text eol=lf
+.dockerignore text eol=lf
+bin/kin-kernel binary
+bin/kin-egress binary
+bin/kin-slot-gate binary
+bin/kin-worker binary
+bin/kin-codex-kernel binary
+bin/kin-oauth-auth binary
+share/wrap-cli/cc-node binary
+share/wrap-cli/kin-kernel.bin binary
+share/wrap-cli/glibc239/** binary
+web/dist/** linguist-generated=true

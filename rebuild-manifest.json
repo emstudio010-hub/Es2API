@@ -1,0 +1,41 @@
+{
+  "product": "Es2API",
+  "created_at": "2026-10-25",
+  "source_repositories": {
+    "sub2api": {
+      "remote": "https://github.com/Wei-Shaw/sub2api.git",
+      "branch": "main",
+      "commit": "37067e8e340e9440d173a92b4faa05e8ce58368f",
+      "role": "control-plane-and-original-vue-admin-ui"
+    },
+    "vm2api": {
+      "remote": "https://github.com/dofastted/vm2api.git",
+      "branch": "main",
+      "commit": "6f188e94e10ff6ce9239b4c39f964da4c98916d7",
+      "role": "execution-slots-containers-egress-and-websocket"
+    }
+  },
+  "migration_policy": {
+    "credentials": "excluded",
+    "runtime_database": "excluded",
+    "provider_calls": "disabled-during-baseline",
+    "frontend_baseline": "sub2api",
+    "execution_baseline": "vm2api"
+  },
+  "planned_contracts": [
+    "account-import-to-slot-provision",
+    "account-delete-to-slot-removal",
+    "group-and-key-scope",
+    "fixed-ip-and-timezone",
+    "priority-fast-ultrafast-transparent-forwarding",
+    "responses-chat-and-websocket-auth",
+    "health-and-modeltrace-observability"
+  ],
+  "publication": {
+    "repository": "https://github.com/emstudio010-hub/Es2API",
+    "branch": "es2api",
+    "relationship": "VM2API derivative with Sub2API control plane",
+    "credentials": "excluded",
+    "runtime_data": "excluded"
+  }
+}

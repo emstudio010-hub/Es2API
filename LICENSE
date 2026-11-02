@@ -1,51 +1,26 @@
-vm2api License
+Es2API — component-specific license notice
 
-Copyright (c) 2026 vm2api contributors
+This repository is a derivative integration, not a blanket relicensing of
+VM2API, Sub2API, their payloads, or other third-party material.
 
-本仓库源码公开，便于个人学习、研究与非商用自建。
-Commercial use requires a separate written authorization.
+1. vm2api/ and modifications to its inherited code remain subject to the
+   original VM2API license in vm2api/LICENSE and licenses/VM2API-LICENSE.
+   That license restricts commercial use and requires separate written
+   authorization from the original copyright holder. Source availability
+   does not make that component OSI-approved open source.
 
-联系授权：Telegram @VM2API · https://t.me/VM2API
+2. sub2api/ and modifications to its inherited code remain under the license
+   in sub2api/LICENSE, copied to licenses/Sub2API-LICENSE (LGPL version 3).
+   Subcomponents and dependencies retain their own applicable notices.
 
+3. VM2API web UI and third-party ModelTrace materials retain their original
+   notices. See vm2api/web/LICENSE and integration/resources/modeltrace/.
 
-1. Non-commercial use
+4. Original Es2API integration/src code, original deployment tooling outside
+   inherited project directories, and original documentation are offered
+   under licenses/MIT-Es2API.txt, excluding all third-party-derived material.
+   This grant does not override or relax any upstream restriction on the
+   combined product or its components. Generated Es2API brand assets may be
+   used with this project; no upstream trademarks are licensed by this notice.
 
-You may use, copy, modify, and run this software for personal learning,
-research, evaluation, and non-commercial self-hosting, provided you keep
-this copyright notice and license text.
-
-You may not use this software for any commercial purpose without a
-separate written authorization from the copyright holder. Commercial
-purpose includes, without limitation:
-
-- selling access, hosting, or support as a paid service
-- using the software to operate, market, or deliver a business
-- redistributing the software or a derivative for a fee
-- using it inside a company or organization for production revenue
-
-2. Commercial use
-
-Obtain written authorization before any commercial use. Unauthorized
-commercial use is prohibited.
-
-3. No trademark license
-
-This license does not grant rights in the names vm2api, Claude, Claude
-Code, Anthropic, or any other marks of their respective owners.
-
-4. Disclaimer
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-中文摘要（与上文英文条款冲突时，以英文条款为准）
-
-- 个人学习、研究、非商用自建：可以使用、复制、修改和运行，并须保留本许可全文。
-- 商用（含对外收费、作为付费服务、公司生产营收、收费再分发等）：必须先取得书面授权。
-- 未授权商用禁止。申请授权请联系 Telegram @VM2API。
+See THIRD_PARTY_NOTICES.md for sources, revisions, and attribution.
