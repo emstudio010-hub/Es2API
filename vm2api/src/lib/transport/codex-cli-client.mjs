@@ -152,7 +152,7 @@ export async function refreshCliCredential(projectRoot, vm, { force = false, dea
 // timeout, cancellation, or loss of the host heartbeat (including host crashes).
 const RUNNER = String.raw`import os,sys,time,signal,subprocess,threading
 root=sys.argv[1]
-limit=int(sys.argv[2])
+limit=float(sys.argv[2])/1000
 try:
     proc=subprocess.Popen(sys.argv[3:],start_new_session=True)
 except OSError:
@@ -174,8 +174,13 @@ def watch():
         except OSError: stamp=None
         now=time.monotonic()
         if stamp!=prev: prev=stamp; last=now
-        if os.path.exists(root+'/cancel') or now-start>limit or now-last>20:
-            kill_group(); return
+        reason='timeout' if now-start>=limit else 'cancelled' if os.path.exists(root+'/cancel') else 'heartbeat_lost' if now-last>20 else None
+        if reason:
+            try:
+                with open(root+'/outcome','x') as f: f.write(reason)
+            finally:
+                kill_group()
+            return
 threading.Thread(target=watch,daemon=True).start()
 try:
     rc=proc.wait()
@@ -218,7 +223,22 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
   const dir = path.join(root, id)
   const guest = `/home/kincli/.es2api-requests/${id}`
   let failure = null, child, heartbeat, timeout, hardTimeout, cancelTimeout, emitted = false, firstTokenAt = null
-  let completed = false, usage = null, text = '', closed = false
+  let completed = false, usage = null, text = '', closed = false, terminalAttempted = false
+  const responseId = `resp_cli_${crypto.randomUUID().replaceAll('-', '')}`
+  const messageId = `msg_${crypto.randomUUID().replaceAll('-', '')}`
+  let sequence = 0
+  const emit = async value => {
+    if (terminalAttempted) return
+    emitted = true
+    if (value.type === 'response.completed' || value.type === 'response.failed') terminalAttempted = true
+    await onEvent?.(`data: ${JSON.stringify({ ...value, sequence_number: sequence++ })}\n\n`)
+  }
+  const emitFailure = async result => {
+    if (!emitted || terminalAttempted || signal?.aborted) return
+    // A delivery callback may itself have failed. Try one terminal frame only;
+    // never replace the original failure or expose the callback's diagnostics.
+    try { await emit({ type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', error: result.body.error, usage } }) } catch {}
+  }
   const cancel = code => {
     failure ||= code
     try { fs.writeFileSync(path.join(dir, 'cancel'), '') } catch {}
@@ -253,7 +273,7 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     for (const config of ['web_search="disabled"', 'cli_auth_credentials_store="file"', 'model_provider="openai"', 'model_providers.openai.request_max_retries=0', 'model_providers.openai.stream_max_retries=0', 'model_providers.openai.supports_websockets=false', 'mcp_servers={}', 'analytics.enabled=false', 'feedback.enabled=false']) argv.push('-c', config)
     if (request.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(request.effort)}`)
     argv.push('-')
-    const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(Math.max(1, Math.floor(remaining / 1000))), ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
+    const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(remaining), ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
     child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     child.stdin.on('error', () => {})
     child.stdin.end(request.prompt)
@@ -263,14 +283,25 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     hardTimeout = setTimeout(() => { cancel('codex_cli_timeout'); clearInterval(heartbeat); child.kill() }, remaining + 30000)
     let bytes = 0, pending = '', queue = Promise.resolve()
     const decoder = new StringDecoder('utf8')
-    const responseId = `resp_cli_${crypto.randomUUID().replaceAll('-', '')}`
-    const messageId = `msg_${crypto.randomUUID().replaceAll('-', '')}`
-    let sequence = 0
-    const emit = async value => { emitted = true; await onEvent?.(`data: ${JSON.stringify({ ...value, sequence_number: sequence++ })}\n\n`) }
     const eventLine = async line => {
-      if (failure || !line.trim()) return
+      if (!line.trim()) return
       let event
       try { event = JSON.parse(line) } catch { cancel('codex_cli_invalid_jsonl'); return }
+      if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string') { cancel('codex_cli_invalid_jsonl'); return }
+      // Cancellation stops delivery, not observation of already-produced real
+      // usage. Keep terminal usage queued behind a failed write observable.
+      if (event.type === 'turn.completed') {
+        if (completed || !Number.isSafeInteger(event.usage?.input_tokens) || !Number.isSafeInteger(event.usage?.output_tokens)) { cancel('codex_cli_usage_missing'); return }
+        const input = event.usage.input_tokens, output = event.usage.output_tokens, cached = event.usage.cached_input_tokens
+        const reasoning = event.usage.reasoning_output_tokens
+        if (input < 0 || output < 0 || !Number.isSafeInteger(input + output) || (cached != null && (!Number.isSafeInteger(cached) || cached < 0 || cached > input)) || (reasoning != null && (!Number.isSafeInteger(reasoning) || reasoning < 0 || reasoning > output))) { cancel('codex_cli_usage_invalid'); return }
+        completed = true
+        usage = { input_tokens: input, output_tokens: output, total_tokens: input + output }
+        if (cached != null) usage.input_tokens_details = { cached_tokens: cached }
+        if (reasoning != null) usage.output_tokens_details = { reasoning_tokens: reasoning }
+        return
+      }
+      if (failure) return
       if (event.type === 'turn.failed' || event.type === 'error') { cancel('codex_cli_turn_failed'); return }
       if (event.item && !['agent_message', 'reasoning'].includes(event.item.type)) { cancel('codex_cli_tool_execution_unsupported'); return }
       if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
@@ -284,15 +315,6 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
         text += delta
         firstTokenAt ||= Date.now()
         await emit({ type: 'response.output_text.delta', output_index: 0, item_id: messageId, content_index: 0, delta })
-      }
-      if (event.type === 'turn.completed') {
-        if (completed || !Number.isSafeInteger(event.usage?.input_tokens) || !Number.isSafeInteger(event.usage?.output_tokens)) { cancel('codex_cli_usage_missing'); return }
-        const input = event.usage.input_tokens, output = event.usage.output_tokens, cached = event.usage.cached_input_tokens ?? 0
-        const reasoning = event.usage.reasoning_output_tokens
-        if (input < 0 || output < 0 || !Number.isSafeInteger(input + output) || !Number.isSafeInteger(cached) || cached < 0 || cached > input || (reasoning != null && (!Number.isSafeInteger(reasoning) || reasoning < 0 || reasoning > output))) { cancel('codex_cli_usage_invalid'); return }
-        completed = true
-        usage = { input_tokens: input, output_tokens: output, total_tokens: input + output, input_tokens_details: { cached_tokens: cached } }
-        if (reasoning != null) usage.output_tokens_details = { reasoning_tokens: reasoning }
       }
     }
     child.stdout.on('data', chunk => {
@@ -309,10 +331,18 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     pending += decoder.end()
     await queue
     if (pending.trim()) await eventLine(pending)
+    if (!failure) {
+      let outcome = null
+      try { outcome = fs.readFileSync(path.join(dir, 'outcome'), 'utf8') }
+      catch (error) { if (error.code !== 'ENOENT') failure = 'codex_cli_supervisor_state_unreadable' }
+      if (outcome !== null) failure = new Map([
+        ['timeout', 'codex_cli_timeout'], ['cancelled', 'codex_cli_cancelled'], ['heartbeat_lost', 'codex_cli_heartbeat_lost'],
+      ]).get(outcome) || 'codex_cli_supervisor_state_invalid'
+    }
     if (!failure && (exit !== 0 || !completed || !text || !usage)) failure = 'codex_cli_incomplete'
     if (failure) {
-      const result = errorResult(failure === 'client_cancelled' ? 499 : failure === 'codex_cli_timeout' ? 504 : 502, failure, 'Codex CLI 执行未完成，请在实例中检查状态；本次未自动重试')
-      if (emitted) await emit({ type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', error: result.body.error, usage } })
+      const result = errorResult(['client_cancelled', 'codex_cli_cancelled'].includes(failure) ? 499 : failure === 'codex_cli_timeout' ? 504 : 502, failure, 'Codex CLI 执行未完成，请在实例中检查状态；本次未自动重试')
+      await emitFailure(result)
       return { ...result, committed: emitted, usage, firstTokenAt }
     }
     const part = { type: 'output_text', text, annotations: [] }
@@ -327,7 +357,9 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     const code = failure || (/^codex_cli_[a-z_]+$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed')
     cancel(code)
     // Do not expose spawn stderr, paths, argv, auth or network diagnostics.
-    return { ...errorResult(code === 'codex_cli_timeout' ? 504 : signal?.aborted || code === 'codex_cli_cancelled' || code === 'client_cancelled' ? 499 : 503, code, 'Codex CLI 准备或执行失败，请检查实例与 OAuth 状态'), committed: emitted, usage, firstTokenAt, ttftMs: firstTokenAt == null ? null : firstTokenAt - started }
+    const result = errorResult(code === 'codex_cli_timeout' ? 504 : signal?.aborted || code === 'codex_cli_cancelled' || code === 'client_cancelled' ? 499 : 503, code, 'Codex CLI 准备或执行失败，请检查实例与 OAuth 状态')
+    await emitFailure(result)
+    return { ...result, committed: emitted, usage, firstTokenAt, ttftMs: firstTokenAt == null ? null : firstTokenAt - started }
   } finally {
     clearInterval(heartbeat); clearTimeout(timeout); clearTimeout(hardTimeout); clearTimeout(cancelTimeout)
     signal?.removeEventListener('abort', abort)

@@ -1014,7 +1014,9 @@ export async function handleCodexProtocol({
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
-        if (res.headersSent || hopEmitted) {
+        // Buffered non-streaming events have not committed an HTTP response.
+        // A failed hop must still return its structured error and status.
+        if (res.headersSent || (stream && hopEmitted)) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
