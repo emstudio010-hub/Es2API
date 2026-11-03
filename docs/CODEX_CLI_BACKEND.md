@@ -18,7 +18,11 @@
 
 ## 隔离与进程生命周期
 
-固定版本工具目录只读挂入槽。每请求新建 CODEX_HOME、HOME 和空白工作目录，忽略用户配置/规则，read-only 沙箱，禁用 shell、浏览器、插件、apps、多代理、记忆等入口，关闭 MCP 配置与网页搜索。不继承宿主 Codex 认证。这里是 Docker 共享内核隔离，不是独立虚拟机或供应商客户端身份保证。
+固定版本工具目录只读挂入槽。每请求新建 CODEX_HOME、HOME 和空白工作目录，不复制宿主或账号已有的 Codex 配置/规则，read-only 沙箱，禁用 shell、浏览器、插件、apps、多代理、记忆等入口，关闭 MCP 配置与网页搜索。不继承宿主 Codex 认证。这里是 Docker 共享内核隔离，不是独立虚拟机或供应商客户端身份保证。
+
+从 `2026.11.04-preview.3` 起，开发者指令写入本请求 `CODEX_HOME/config.toml` 的 `developer_instructions` 字符串，文件以0400创建、归属执行用户；不再把调用者指令放入进程参数。JSON/TOML共有转义加上DEL转义，防止换行、引号或表标题变成配置项；非法Unicode直接拒绝。CLI读取的是这份新建配置，故不再传会跳过它的 `--ignore-user-config`；规则仍显式禁用。配置随临时请求目录一起清理，未确认退出时与认证副本一起保留至恢复。
+
+该变更保留developer指令角色，没有改用会替换基础系统指令的 `model_instructions_file`。输入上限按实际合并后的提示词及指令UTF-8字节计算，共1MiB；提示词走stdin，开发者指令走请求配置，不受Linux单个argv约128KiB的限制。供应商上下文限制和实际长输入能力仍需独立验收。
 
 临时 auth.json 只含短期 access/id token 和账号 ID，不复制 refresh token。刷新由控制面通过该账号固定出口完成，单进程按账号串行，并在落盘前检查凭据未被其他操作替换；额度刷新及手动刷新复用该路径。不能用多个独立控制面进程同时管理同一份账号文件。正常退出清理临时目录；不记录 stderr、认证、原始上游错误或代理密码。
 
@@ -30,6 +34,8 @@
 
 宿主崩溃或 Docker 客户端退出不能证明容器进程已停止。没有 supervisor done 标记时保留临时目录并阻止新调用。可在账号池工作区选择「恢复实例」：暂停调度、取消在途检测/执行，确认对应容器完全停止后，仅清理该账号 `.es2api-requests/req-*`，再开机并检查健康。无法读取 Docker 状态或仍有宿主请求未释放时拒绝清理。恢复期间拒绝其他开机、重载和删除操作。
 
+若容器内启动CLI时直接发生操作系统错误，supervisor确认尚未产生子进程后写入done并以126退出；该请求仍判失败，但可正常清理。已启动进程的退出确认规则不变。
+
 ## 实例操作
 
 账号池工作区支持启动、停止和恢复。管理 API 为 `POST /api/v1/admin/accounts/:id/{start|stop|recover}`，返回 202 后异步完成，页面每 3 秒刷新处理中状态，避免长时间拉取镜像超出网关超时。操作前后均核对账号、后端、代次与固定出口；停止/恢复会取消在途请求，需界面确认。完成后仍暂停调度，由用户检查后在运行设置中启用；同步状态也保留手动暂停。
@@ -40,4 +46,4 @@
 
 本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。
 
-参考：[官方非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[官方 CLI 命令](https://learn.chatgpt.com/docs/developer-commands?surface=cli)。
+参考：[官方非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[官方 CLI 命令](https://learn.chatgpt.com/docs/developer-commands?surface=cli)、[官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。本实现核对固定0.155.1源码提交 `be2951ea34f0d295ed0becf97079f92fa5f6950e` 的exec CLI、配置loader及developer指令合并逻辑；当前官方文档不能代替该固定版本的实际调用验收。

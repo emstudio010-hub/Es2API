@@ -14,6 +14,7 @@ import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { CODEX_CLI_CONTAINER_BIN, CODEX_CLI_VERSION, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
 import { codexCliJobs as active, codexCliInMaintenance } from './codex-cli-state.mjs'
+import { codexCliInstructionConfig } from './codex-cli-request-config.mjs'
 
 const runFile = promisify(execFile)
 const TIMEOUT_MS = 300000
@@ -71,8 +72,10 @@ export function codexCliRequest(body = {}, raw = body) {
   // no upstream response IDs or persistent CLI sessions are invented.
   const prompt = parts.length === 1 && parts[0].role === 'user' ? parts[0].text
     : `Continue the conversation supplied in this JSON transcript. Answer the last user message.\n${JSON.stringify(parts)}`
-  if (Buffer.byteLength(prompt) + Buffer.byteLength(instructions.join('\n')) > 1024 * 1024) fail('input size > 1 MiB')
-  return { prompt, instructions: instructions.join('\n\n'), effort, model: body.model }
+  const developerInstructions = instructions.join('\n\n')
+  if (!prompt.isWellFormed() || !developerInstructions.isWellFormed()) fail('invalid Unicode text')
+  if (Buffer.byteLength(prompt) + Buffer.byteLength(developerInstructions) > 1024 * 1024) fail('input size > 1 MiB')
+  return { prompt, instructions: developerInstructions, effort, model: body.model }
 }
 
 function supported(exec) {
@@ -146,7 +149,13 @@ export async function refreshCliCredential(projectRoot, vm, { force = false, dea
 const RUNNER = String.raw`import os,sys,time,signal,subprocess,threading
 root=sys.argv[1]
 limit=int(sys.argv[2])
-proc=subprocess.Popen(sys.argv[3:],start_new_session=True)
+try:
+    proc=subprocess.Popen(sys.argv[3:],start_new_session=True)
+except OSError:
+    # No child process exists. Mark the request confirmed rather than leaving
+    # an unrecoverable-looking request directory after an exec setup failure.
+    open(root+'/done','w').close()
+    sys.exit(126)
 ended=threading.Event()
 def kill_group():
     try: os.killpg(proc.pid,signal.SIGTERM)
@@ -220,21 +229,26 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     fs.mkdirSync(dir, { mode: 0o700 })
     fs.mkdirSync(path.join(dir, 'work'), { mode: 0o700 })
     fs.mkdirSync(path.join(dir, 'home'), { mode: 0o700 })
+    // A request-owned config avoids Linux's single-argument length limit and
+    // keeps caller instructions out of process argv. No account/home config is copied.
+    fs.writeFileSync(path.join(dir, 'home', 'config.toml'), codexCliInstructionConfig(request.instructions), { mode: 0o400, flag: 'wx' })
     fs.writeFileSync(path.join(dir, 'home', 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null, tokens: { id_token: account.id_token, access_token: account.access_token, refresh_token: '', account_id: account.chatgpt_account_id }, last_refresh: new Date().toISOString() }), { mode: 0o600 })
     fs.writeFileSync(path.join(dir, 'heartbeat'), '')
     const user = slotHost(exec.vm).execUser(exec.vm)
     if (process.platform !== 'win32') {
       const [uid, gid] = user.split(':').map(Number)
-      for (const target of [root, dir, path.join(dir, 'work'), path.join(dir, 'home'), path.join(dir, 'home', 'auth.json'), path.join(dir, 'heartbeat')]) fs.chownSync(target, uid, gid)
+      for (const target of [root, dir, path.join(dir, 'work'), path.join(dir, 'home'), path.join(dir, 'home', 'config.toml'), path.join(dir, 'home', 'auth.json'), path.join(dir, 'heartbeat')]) fs.chownSync(target, uid, gid)
     }
     if (signal?.aborted || failure) return errorResult(499, 'client_cancelled', '请求已取消')
     const remaining = deadline - Date.now()
     if (remaining <= 0) return errorResult(504, 'codex_cli_timeout', 'CLI 执行预算已用尽，未启动推理')
-    const argv = [CODEX_CLI_CONTAINER_BIN, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only', '-C', `${guest}/work`, '-m', request.model]
+    // CODEX_HOME contains only our generated config and short-lived auth copy.
+    // --ignore-user-config would discard the request's developer instructions.
+    const argv = [CODEX_CLI_CONTAINER_BIN, 'exec', '--json', '--ephemeral', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only', '-C', `${guest}/work`, '-m', request.model]
     for (const feature of ['shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_host', 'browser_use', 'browser_use_external', 'computer_use', 'image_generation', 'memories', 'hooks', 'in_app_browser', 'in_app_local_automation', 'in_app_chat', 'workspace_dependencies', 'goals']) argv.push('--disable', feature)
     for (const config of ['web_search="disabled"', 'cli_auth_credentials_store="file"', 'model_provider="openai"', 'model_providers.openai.request_max_retries=0', 'model_providers.openai.stream_max_retries=0', 'model_providers.openai.supports_websockets=false', 'mcp_servers={}', 'analytics.enabled=false', 'feedback.enabled=false']) argv.push('-c', config)
     if (request.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(request.effort)}`)
-    argv.push('-c', `developer_instructions=${JSON.stringify(request.instructions || 'Respond to the supplied user input with text. Do not invoke tools.')}`, '-')
+    argv.push('-')
     const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(Math.max(1, Math.floor(remaining / 1000))), ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
     child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     child.stdin.on('error', () => {})
