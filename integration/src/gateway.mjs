@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { once } from 'node:events'
 import { GatewayIsolation, responseObserver } from './gateway-isolation.mjs'
 import { isolatedUpgrade } from './gateway-websocket.mjs'
+import { createGatewayTransport, GATEWAY_TIMEOUT_MS } from './gateway-transport.mjs'
 
 export function gatewayToken(secret, groupId) {
   return crypto.createHmac('sha256', secret).update(`es2api-gateway-v1:${groupId}`).digest('hex')
@@ -36,7 +37,8 @@ function fail(res, status, code, message) {
 export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey, maxBodyBytes = 10 * 1024 * 1024, isolation = new GatewayIsolation(store) }) {
   const origin = new URL(baseUrl)
   if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password) throw new Error('Invalid VM2 origin')
-  return async (req, res, groupId, endpoint) => {
+  const transport = createGatewayTransport()
+  const handle = async (req, res, groupId, endpoint) => {
     const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]
     if (!equalSecret(bearer, gatewayToken(secret, groupId))) return fail(res, 401, 'authentication_error', 'Invalid execution credential')
     if (!(req.method === 'GET' && endpoint === 'models') && !(req.method === 'POST' && ['responses', 'responses/compact', 'chat/completions'].includes(endpoint))) return fail(res, 404, 'not_found', 'Unsupported execution endpoint')
@@ -57,7 +59,7 @@ export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey,
     const abort = () => { if (!res.writableFinished) { clientDisconnected = true; controller.abort() } }
     req.once('aborted', abort)
     res.once('close', abort)
-    const timeout = setTimeout(() => { timedOut = true; controller.abort() }, 15 * 60 * 1000)
+    const timeout = setTimeout(() => { timedOut = true; controller.abort() }, GATEWAY_TIMEOUT_MS)
     timeout.unref()
     let lease, status = 0, delivered = false, failureCode = null
     try {
@@ -75,7 +77,7 @@ export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey,
       const context = isolation.context(req, groupId, parsed)
       lease = isolation.select(context, group, accountPool)
       const isolatedBody = JSON.stringify(isolation.upstreamBody(context, lease.account, parsed))
-      const upstream = await fetch(new URL(`/v1/${endpoint}`, origin), {
+      const upstream = await transport.fetch(new URL(`/v1/${endpoint}`, origin), {
         method: 'POST', redirect: 'error', signal: controller.signal,
         headers: { ...forwardingHeaders(req), authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
           accept: 'application/json, text/event-stream', 'x-kin-vm': lease.account.vm_id,
@@ -109,4 +111,6 @@ export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey,
         ...(status >= 500 ? { overload_until: new Date(Date.now() + 15000).toISOString() } : {}) }) } catch { console.error('[es2api] gateway lease release failed') } }
     }
   }
+  handle.close = () => transport.close()
+  return handle
 }

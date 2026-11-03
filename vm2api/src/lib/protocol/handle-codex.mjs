@@ -76,6 +76,7 @@ import {
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
+import { codexBodyToChatCompletion, isCodexChatResponseError } from './codex-chat-response.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -985,42 +986,42 @@ export async function handleCodexProtocol({
           logBag.upstream_model = converted.body.model
         }
         if (delivered) {
-          attemptKind = 'succeeded'
-          bindSticky(outboundSessionId)
           const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
           logCodexUsage(logBag, usage, serviceTier)
           const imageUsage =
             result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
           if (imageUsage) logBag.image_usage = imageUsage
-          reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
-          logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
           logBag.upstream_model = converted.body.model
           if (hops > 1) logBag.codex_failed_over = true
+          let body
           if (!stream) {
-            let body
             try {
               const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
               if (responseTerminal !== 'failed' && !assembled.error && assembled.status === 'completed') logBag.inference_completed = true
               body =
                 protocol === 'anthropic.messages'
                   ? codexBodyToAnthropicMessage(assembled, converted.body.model)
-                  : assembled
-              if (cli && protocol === 'openai.chat') body = {
-                id: assembled.id, object: 'chat.completion', created: assembled.created_at, model: assembled.model,
-                choices: [{ index: 0, message: { role: 'assistant', content: assembled.output.flatMap(item => item.content || []).filter(part => part.type === 'output_text').map(part => part.text).join('') }, finish_reason: 'stop' }],
-                usage: openaiChatUsageFromExtract(extractOpenaiUsage(assembled.usage)),
-              }
+                  : protocol === 'openai.chat'
+                    ? codexBodyToChatCompletion(assembled, converted.body.model)
+                    : assembled
             } catch (error) {
-              if (!isToolArgumentsError(error)) throw error
+              if (!isToolArgumentsError(error) && !isCodexChatResponseError(error)) throw error
               stats.errors++
+              attemptKind = 'failed'
               logBag.error_code = error.code
               logBag.final_state = 'incomplete'
+              logBag.inference_completed = false
+              reportOpenAIAttempt(vm.id, 'failed', result.ttftMs ?? null)
               return json(res, 502, {
                 error: { type: 'upstream_protocol_error', code: error.code, message: error.message },
               })
             }
-            return json(res, 200, body)
           }
+          attemptKind = 'succeeded'
+          bindSticky(outboundSessionId)
+          reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
+          logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
+          if (!stream) return json(res, 200, body)
           if (!res.headersSent) writeSSEHeaders(res)
           return res.end()
         }

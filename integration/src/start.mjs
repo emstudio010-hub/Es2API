@@ -70,6 +70,7 @@ async function close(signal) {
   if (usageTimer) clearInterval(usageTimer)
   console.log(`[es2api] shutting down after ${signal}`)
   server.close(async () => {
+    await gateway.close()
     await usagePoller?.close()
     await modeltrace.close()
     store.close()

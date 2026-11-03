@@ -18,9 +18,9 @@ export function createGatewayCompletionObserver({ contentType = '', endpoint = '
     const response = payload.response || payload
     if (payload.error || response.error || ['error', 'response.failed', 'response.incomplete', 'response.cancelled', 'response.canceled'].includes(payload.type) ||
         ['failed', 'incomplete', 'cancelled', 'canceled'].includes(response.status)) { failed = true; return }
-    // Some existing Kernel JSON paths return a complete Responses envelope.
-    // Completion observation does not rewrite the payload's client protocol.
-    if (chat && response.object !== 'response') {
+    // Chat endpoints must return Chat payloads even if the upstream execution
+    // originally used Responses. Conversion belongs to the execution layer.
+    if (chat) {
       if (!['chat.completion', 'chat.completion.chunk'].includes(payload.object) || !id(payload.id) || !Array.isArray(payload.choices)) { invalid = true; return }
       for (const choice of payload.choices) {
         if (!Number.isSafeInteger(choice?.index) || choice.index < 0 || choice.index >= count) { invalid = true; continue }

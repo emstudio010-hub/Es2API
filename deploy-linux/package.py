@@ -8,7 +8,7 @@ import sys
 import tarfile
 
 ROOT = Path(__file__).resolve().parent.parent
-NAME = os.environ.get('ES2API_RELEASE_NAME', 'Es2API-linux-x64-20261104-r10')
+NAME = os.environ.get('ES2API_RELEASE_NAME', 'Es2API-linux-x64-20261104-r11')
 STAGE = ROOT / 'build-cache' / os.environ.get('ES2API_STAGE_FOLDER', NAME)
 DIST = ROOT / os.environ.get('ES2API_DIST_FOLDER', 'dist')
 PAYLOAD_ROOT = ROOT / 'build-cache/payload' if (ROOT / 'build-cache/payload').exists() else ROOT / 'runtime/vm2'
@@ -109,7 +109,7 @@ def stage():
     for name in ['package.json', 'package-lock.json']:
         copy(ROOT / 'integration' / name, STAGE / 'source/integration' / name)
     tree(ROOT / 'deploy-linux', STAGE / 'source/deploy-linux')
-    metadata = {'product': 'Es2API', 'version': os.environ.get('ES2API_RELEASE_VERSION', '2026.11.04-preview.10'), 'platform': 'linux', 'arch': 'x64', 'node': '24.22.2', 'payload_release': payload['release'], 'tests_run': False, 'contains_user_data': False, 'entrypoint': './es2api.sh', 'deployment_acceptance': 'not performed', 'google_oauth_requires_configuration': True}
+    metadata = {'product': 'Es2API', 'version': os.environ.get('ES2API_RELEASE_VERSION', '2026.11.04-preview.11'), 'platform': 'linux', 'arch': 'x64', 'node': '24.22.2', 'payload_release': payload['release'], 'tests_run': False, 'contains_user_data': False, 'entrypoint': './es2api.sh', 'deployment_acceptance': 'not performed', 'google_oauth_requires_configuration': True}
     (STAGE / 'release.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     print('Staged allowlisted release: ' + str(STAGE))
 
@@ -120,6 +120,9 @@ def archive():
     for relative in ['node/bin/node', 'bin/es2api', 'payload/bin/kin-api-kernel', 'integration/node_modules/ws/package.json', 'vm2api/node_modules/ws/package.json', 'vm2api/web/dist/index.html', 'integration/resources/modeltrace/PROVENANCE.md', 'vm2api/share/codex-cli/linux-x64/bin/codex', 'vm2api/share/codex-cli/linux-x64/codex-resources/bwrap', 'vm2api/share/codex-cli/linux-x64/LICENSE', 'vm2api/share/codex-cli/linux-x64/manifest.json']:
         if not (STAGE / relative).is_file():
             raise RuntimeError('Missing distribution component: ' + relative)
+    undici = STAGE / 'integration/node_modules/undici'
+    if not (undici / 'LICENSE').is_file() or json.loads((undici / 'package.json').read_text(encoding='utf-8'))['version'] != '8.12.3':
+        raise RuntimeError('Missing pinned gateway HTTP transport or license')
     files = sorted(p for p in STAGE.rglob('*') if p.is_file() and p != STAGE / 'SHA256SUMS')
     if any(p.suffix in {'.sqlite', '.db'} or p.name in {'local-secrets.json', 'linux-secrets.json', 'linux-config.json'} or p.relative_to(STAGE).parts[0] == 'runtime' for p in files):
         raise RuntimeError('Unexpected private runtime data in distribution')

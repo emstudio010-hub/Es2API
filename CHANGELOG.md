@@ -1,5 +1,12 @@
 # 变更记录
 
+## 2026.11.04-preview.11 — 非流式Chat与长等待
+
+- Kernel/CLI 共用非流式 Chat Completion 转换，保留文本、refusal、function/custom 工具调用、URL引用和真实用量；工具结束为tool_calls，明确的输出上限/过滤分别为length/content_filter。
+- 不可表达的输出/引用、无效输出或未明确结束的响应返回脱敏结构化502，保留已知用量；转换失败不再先记录成功或触发ModelTrace成功计数。
+- 私有执行转发使用固定Undici 8.12.3独立dispatcher，响应头/正文空闲预算显式15分钟，总预算仍15分钟、连接10秒；取消信号、背压和完成检查沿用，不修改全局fetch或增加推理重试。
+- 停服排空后关闭dispatcher；Linux包含锁定依赖与MIT许可，打包时强制核对版本和许可证。
+
 ## 2026.11.04-preview.10 — CLI 网关与流保活
 
 - 账号池网关按账号后端构造请求：CLI 不再被注入不支持的 prompt_cache_key；HTTP/WS 共用，显式调用者字段仍留给能力校验。

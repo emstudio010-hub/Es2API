@@ -66,6 +66,18 @@ CLI 健康检查通过、开始执行准备后，流式请求空闲10秒写一�
 
 明确failed/incomplete/cancelled/error正常转发，租约记失败；只有HTTP成功、协议完成、未取消且下游finish后才记成功。finish只证明本机写出，不能证明远端客户端已读取。响应截断中止连接并保留失败，区分调用者断连和15分钟网关超时；都不自动重放推理。用量和ModelTrace仍走各自原通道，不把保活、部分文本或HTTP200计为完成。
 
+## 非流式 Chat 与上游等待（preview.11）
+
+Kernel和CLI共享非流式Responses→Chat Completion转换。文本、refusal、function工具的原始arguments和custom工具的原始input分别保留；custom按官方type=custom、custom.name/input表示，不伪装function。工具调用finish_reason为tool_calls；只有明确incomplete_details.reason=max_output_tokens/content_filter才映射length/content_filter。失败、未知终止状态或无效结构返回脱敏502，不补成功stop。转换失败保留已知用量，但不先绑定成功会话、报告成功尝试或计入ModelTrace成功。账号池网关不再接受Chat端点返回Responses封装来满足完成条件；协议不匹配记失败，不在网关静默改写。
+
+URL引用转换并按拼接后的文本偏移修正；不能表达的文件引用、可见输出、非空logprobs等返回codex_chat_output_unsupported，建议使用Responses。reasoning项不进入assistant公开内容；不输出加密推理、伪造摘要或增加非标准reasoning字段。未提供created_at时使用转换时的本机Unix时间。当前只输出一个choice；流式Chat沿原路径，未在本版统一。
+
+私有推理HTTP转发采用Undici 8.12.3和独立Agent，headersTimeout/bodyTimeout显式15分钟、connectTimeout为10秒，避免此处默认5分钟响应头等待早于总预算结束。总预算仍从网关读取请求体前开始计15分钟，包含读取、路由、上游和下游finish；断连/总超时继续取消同一请求，不自动重放。管理/模型目录仍用原fetch，进程全局dispatcher不改。服务排空后关闭私有Agent；Linux生产依赖和许可证随包提供并校验。
+
+这不证明实际长等待通过，也不覆盖其他反向代理/客户端的超时；既有排队/健康阶段仍没有SSE保活。当前账号不迁移CLI，不进行新OAuth/真实调用。
+
+格式依据：[官方Chat Completion响应字段](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
+
 ## 验收边界
 
 本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。
