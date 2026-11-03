@@ -128,7 +128,28 @@ export interface TraceRun {
   applied_action: 'none' | Exclude<TraceAction, 'observe'>
   sample_count: number
   action_skipped_reason?: string
-  error?: { code: string; message: string }
+  error?: {
+    code: string
+    message: string
+    phase?: 'sampling' | 'comparison' | 'action'
+    http_status?: number
+    network_code?: string
+    response_state?: string
+    sample_index?: number
+    challenge_id?: string
+    completed_samples?: number
+    sample_duration_ms?: number
+    timeout_ms?: number
+  }
+  progress?: {
+    phase: 'sampling' | 'comparison' | 'action' | 'finished'
+    completed_samples: number
+    total_samples: number
+    sample_index?: number
+    challenge_id?: string
+    sample_started_at?: string
+    timeout_ms?: number
+  }
   result?: {
     status: TraceStatus
     expected_model: string
@@ -144,6 +165,7 @@ export interface TraceRun {
     challenge_id: string
     sha256: string
     length: number
+    duration_ms?: number
     usage: unknown
   }[]
 }

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { traceDefaults, validateTraceConfig } from './modeltrace-config.mjs'
 import { numberFingerprintBank, compareNumberFingerprint } from './number-fingerprint.mjs'
+import { publicTraceError } from './trace-response.mjs'
 
 const TIME_TRIGGERS = new Set(['interval', 'both', 'requests_and_interval', 'active_interval'])
 const COUNT_TRIGGERS = new Set(['requests', 'both', 'requests_and_interval'])
@@ -405,6 +406,8 @@ export class ModelTrace {
     const previous = account.modeltrace.state || {}
     this.store.updateAccount(run.account_id, { modeltrace_state: { ...previous, checkpoint: account.successful_requests,
       next_due: null } })
+    let sampleContext = null
+    let phase = 'sampling'
     try {
       if (typeof this.runner !== 'function') throw Object.assign(new Error('ModelTrace 执行器未配置'), { code: 'trace_runner_unavailable' })
       const candidates = [...bank.challenges]
@@ -415,6 +418,12 @@ export class ModelTrace {
       }
       const samples = []
       for (const challenge of picked) {
+        sampleContext = { sample_index: samples.length + 1, challenge_id: challenge.id,
+          completed_samples: samples.length, timeout_ms: config.timeout_ms }
+        const sampleStarted = this.clock()
+        run.progress = { ...sampleContext, phase, total_samples: config.sample_count,
+          sample_started_at: new Date(sampleStarted).toISOString() }
+        this.store.saveRun(run)
         if (controller.signal.aborted) throw Object.assign(new Error('检测已取消'), { code: 'trace_canceled' })
         const currentAccount = this.store.getAccount(run.account_id)
         if (!this.isSlotReady(currentAccount)) throw Object.assign(new Error('检测期间执行槽状态已变化'), { code: 'trace_context_changed' })
@@ -422,10 +431,13 @@ export class ModelTrace {
         if (controller.signal.aborted) throw Object.assign(new Error('检测已取消'), { code: 'trace_canceled' })
         const text = typeof output?.text === 'string' ? output.text : ''
         if (!text || text.length > 64000) throw Object.assign(new Error('检测样本为空或超过长度限制'), { code: 'invalid_trace_sample' })
-        samples.push({ challenge_id: challenge.id, expected_count: challenge.expected_count, text, sha256: crypto.createHash('sha256').update(text).digest('hex'), length: text.length, usage: output.usage || null })
+        samples.push({ challenge_id: challenge.id, expected_count: challenge.expected_count, text, sha256: crypto.createHash('sha256').update(text).digest('hex'), length: text.length, duration_ms: Math.max(0, this.clock() - sampleStarted), usage: output.usage || null })
         run.samples = samples.map(({ text, ...sample }) => sample)
+        run.progress.completed_samples = samples.length
         this.store.saveRun(run)
       }
+      phase = 'comparison'
+      run.progress = { phase, completed_samples: samples.length, total_samples: config.sample_count }
       const result = bank.method === 'shared-detector-v2'
         ? compareNumberFingerprint(samples, run.model, config.confidence_threshold)
         : { ...compareResponses(samples, references, run.model, config.confidence_threshold), method: 'text-similarity' }
@@ -438,9 +450,11 @@ export class ModelTrace {
       const currentConfig = currentAccount ? this.getAccountConfig(currentAccount) : config
       const currentBank = this.bank()
       const currentContext = traceContext(currentAccount, currentConfig, currentBank, run.model)
+      phase = 'action'
+      run.progress.phase = phase
       if (!this.isSlotReady(currentAccount) || currentContext !== context) {
         run.action_skipped_reason = '检测期间策略、目标模型、指纹库或执行槽状态发生变化；本次结果不执行账号动作'
-        this.store.updateAccount(run.account_id, { modeltrace_state: { ...(currentAccount.modeltrace.state || {}),
+        if (currentAccount) this.store.updateAccount(run.account_id, { modeltrace_state: { ...(currentAccount.modeltrace.state || {}),
           checkpoint: currentAccount.successful_requests, last_run_id: run.id, last_status: run.status,
           consecutive: 0, evidence_context: null } })
       } else {
@@ -448,16 +462,22 @@ export class ModelTrace {
       }
     } catch (error) {
       run.status = controller.signal.aborted ? 'canceled' : 'error'
-      run.error = { code: String(error?.code || 'trace_failed').slice(0, 80), message: controller.signal.aborted ? '检测已取消' : '检测执行失败，请检查执行器、槽位状态及服务日志' }
+      run.error = { ...publicTraceError(error, controller.signal.aborted), phase,
+        ...(phase === 'sampling' && sampleContext ? { ...sampleContext,
+          sample_duration_ms: Math.max(0, this.clock() - Date.parse(run.progress.sample_started_at)) } : {}) }
+      // Sampling/comparison failures cannot produce attribution. If an action
+      // write fails after comparison, retain the result and any recorded action.
+      if (phase !== 'action') delete run.result
       run.finished_at = new Date(this.clock()).toISOString()
       run.duration_ms = this.clock() - Date.parse(run.started_at)
       const currentAccount = this.store.getAccount(run.account_id)
       if (currentAccount) {
         const state = currentAccount.modeltrace.state || {}
         this.store.updateAccount(run.account_id, { modeltrace_state: { ...state, checkpoint: currentAccount.successful_requests,
-          last_run_id: run.id, last_status: run.status } })
+          last_run_id: run.id, last_status: run.status, consecutive: 0, evidence_context: null } })
       }
     }
+    if (run.progress) run.progress.phase = 'finished'
     const finishedAccount = this.store.getAccount(run.account_id)
     if (finishedAccount) {
       const effective = this.getAccountConfig(finishedAccount)

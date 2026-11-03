@@ -1,4 +1,5 @@
 import { VM2_PROTOCOL_PATHS, buildCodexImportRequest, buildVmProvisionRequest, normalizeVmStatus } from './contract.mjs'
+import { parseTraceResponse, readTraceBody, traceError, traceTransportError } from './trace-response.mjs'
 
 function joinUrl(base, path) {
   return `${String(base).replace(/\/$/, '')}${path}`
@@ -211,12 +212,9 @@ function responseText(payload) {
   if (typeof payload?.output_text === 'string') return payload.output_text
   const parts = []
   for (const item of payload?.output || []) {
-    for (const content of item?.content || []) if (typeof content?.text === 'string') parts.push(content.text)
+    for (const content of item?.content || []) if (content?.type === 'output_text' && typeof content.text === 'string') parts.push(content.text)
   }
   if (parts.length) return parts.join('')
-  const choice = payload?.choices?.[0]?.message?.content
-  if (typeof choice === 'string') return choice
-  if (Array.isArray(choice)) return choice.map(part => part?.text || '').join('')
   return ''
 }
 
@@ -229,36 +227,35 @@ export function createVm2TraceRunner({ baseUrl, apiKey, fetchImpl = globalThis.f
     if (!account?.vm_id) throw new Error('account has no bound VM2 slot')
     const timeout = AbortSignal.timeout(timeout_ms)
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
-    const response = await fetchImpl(`${origin}/v1/responses`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-        accept: 'application/json, text/event-stream',
-        'x-kin-vm': account.vm_id,
-        'x-es2api-modeltrace': '1',
-      },
-      body: JSON.stringify({ model, input: challenge.prompt, stream: false, store: false,
-        ...(challenge.instructions ? { instructions: challenge.instructions } : {}) }),
-      signal: combined,
-    })
-    const body = await response.text()
+    let response
+    try {
+      response = await fetchImpl(`${origin}/v1/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          'x-kin-vm': account.vm_id,
+          'x-es2api-modeltrace': '1',
+        },
+        body: JSON.stringify({ model, input: challenge.prompt, stream: false, store: false,
+          ...(challenge.instructions ? { instructions: challenge.instructions } : {}) }),
+        signal: combined,
+      })
+    } catch (error) { throw traceTransportError(error, { signal, timeout }) }
     if (!response.ok) {
-      const error = new Error(`VM2 trace request failed with HTTP ${response.status}`)
-      error.code = 'trace_upstream_error'
-      error.status = response.status
-      throw error
+      // Do not read or retain an untrusted provider error body.
+      void response.body?.cancel().catch(() => {})
+      throw traceError('trace_upstream_error', { status: response.status, http_status: response.status })
     }
-    let payload
-    try { payload = JSON.parse(body) } catch {
-      const events = body.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => {
-        try { return JSON.parse(line.slice(5).trim()) } catch { return null }
-      }).filter(Boolean)
-      const completed = events.find(event => event.type === 'response.completed')
-      payload = completed?.response
+    let body
+    try { body = await readTraceBody(response) } catch (error) {
+      if (error?.code === 'trace_response_too_large') throw error
+      throw traceTransportError(error, { signal, timeout, httpStatus: response.status })
     }
+    const payload = parseTraceResponse(body, response.status)
     const text = responseText(payload)
-    if (!text) throw Object.assign(new Error('VM2 trace response did not include output text'), { code: 'trace_empty_output' })
+    if (!text.trim()) throw traceError('trace_empty_output', { http_status: response.status, response_state: 'completed' })
     return { text, usage: payload?.usage || null }
   }
 }

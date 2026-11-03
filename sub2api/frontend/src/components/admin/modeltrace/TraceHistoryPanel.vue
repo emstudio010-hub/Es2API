@@ -18,7 +18,11 @@ const props = defineProps<{
   initialAccount?: string
 }>()
 const emit = defineEmits<{ changed: [] }>()
-const { t, locale } = useI18n()
+const { t, te, locale } = useI18n()
+function runErrorMessage(value: NonNullable<TraceRun['error']>) {
+  const key = `admin.modeltrace.history.errors.${value.code}`
+  return te(key) ? t(key) : value.message
+}
 const statuses = [
   'queued',
   'running',
@@ -512,12 +516,50 @@ onUnmounted(() => {
           </div>
         </dl>
         <p
+          v-if="detail.progress && isTraceActive(detail.status)"
+          role="status"
+          class="rounded-lg bg-gray-50 p-3 text-gray-700 dark:bg-dark-800 dark:text-dark-200"
+        >
+          {{ t('admin.modeltrace.history.progress', { completed: detail.progress.completed_samples, total: detail.progress.total_samples }) }}
+          <span v-if="detail.progress.sample_index">
+            {{ t('admin.modeltrace.history.currentSample', { index: detail.progress.sample_index }) }}
+          </span>
+        </p>
+        <div
           v-if="detail.error"
           role="alert"
-          class="rounded-lg bg-red-50 p-3 text-red-700 dark:bg-red-900/20 dark:text-red-400"
+          class="space-y-3 rounded-lg bg-red-50 p-3 text-red-700 dark:bg-red-900/20 dark:text-red-400"
         >
-          {{ detail.error.code }}: {{ detail.error.message }}
-        </p>
+          <p class="font-medium">{{ runErrorMessage(detail.error) }}</p>
+          <dl class="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+            <div v-if="detail.error.sample_index">
+              <dt>{{ t('admin.modeltrace.history.failureSample') }}</dt>
+              <dd class="mt-1 tabular-nums">{{ detail.error.sample_index }} / {{ detail.sample_count }}</dd>
+            </div>
+            <div v-if="detail.error.http_status != null">
+              <dt>{{ t('admin.modeltrace.history.httpStatus') }}</dt>
+              <dd class="mt-1 tabular-nums">{{ detail.error.http_status }}</dd>
+            </div>
+            <div v-if="detail.error.sample_duration_ms != null">
+              <dt>{{ t('admin.modeltrace.history.sampleDuration') }}</dt>
+              <dd class="mt-1 tabular-nums">{{ detail.error.sample_duration_ms }} ms</dd>
+            </div>
+            <div v-if="detail.error.timeout_ms != null">
+              <dt>{{ t('admin.modeltrace.history.sampleTimeout') }}</dt>
+              <dd class="mt-1 tabular-nums">{{ detail.error.timeout_ms }} ms</dd>
+            </div>
+          </dl>
+          <details class="text-xs">
+            <summary class="cursor-pointer">{{ t('admin.modeltrace.history.diagnostics') }}</summary>
+            <dl class="mt-2 space-y-2 break-all">
+              <div><dt>{{ t('admin.modeltrace.history.errorCode') }}</dt><dd class="font-mono">{{ detail.error.code }}</dd></div>
+              <div v-if="detail.error.challenge_id"><dt>{{ t('admin.modeltrace.history.challenge') }}</dt><dd class="font-mono">{{ detail.error.challenge_id }}</dd></div>
+              <div v-if="detail.error.network_code"><dt>{{ t('admin.modeltrace.history.networkCode') }}</dt><dd class="font-mono">{{ detail.error.network_code }}</dd></div>
+              <div v-if="detail.error.response_state"><dt>{{ t('admin.modeltrace.history.responseState') }}</dt><dd class="font-mono">{{ detail.error.response_state }}</dd></div>
+            </dl>
+          </details>
+          <p class="text-sm">{{ t(detail.error.phase === 'action' ? 'admin.modeltrace.history.actionFailureGuide' : 'admin.modeltrace.history.failureGuide') }}</p>
+        </div>
         <p
           v-if="detail.action_skipped_reason"
           class="rounded-lg bg-amber-50 p-3 text-amber-800 dark:bg-amber-900/20 dark:text-amber-300"
@@ -566,6 +608,9 @@ onUnmounted(() => {
               </p>
               <p class="mt-1 break-all font-mono text-xs text-gray-500">
                 SHA-256: {{ sample.sha256 }}
+              </p>
+              <p v-if="sample.duration_ms != null" class="mt-1 text-xs tabular-nums text-gray-500">
+                {{ t('admin.modeltrace.history.sampleDuration') }}: {{ sample.duration_ms }} ms
               </p>
             </li>
           </ul>

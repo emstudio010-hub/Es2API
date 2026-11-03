@@ -20,7 +20,7 @@ test('HTTP run uses the pinned VM2 slot, three independent challenges, scoring a
     requests.push({ path: req.url, headers: req.headers, body: JSON.parse(raw) })
     const output = outputs[requests.length - 1]
     res.writeHead(200, { 'content-type': requests.length % 2 ? 'application/json' : 'text/event-stream' })
-    const payload = { output: [{ type: 'message', content: [{ type: 'output_text', text: output.text }] }], usage: { output_tokens: 100 } }
+    const payload = { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: output.text }] }], usage: { output_tokens: 100 } }
     res.end(requests.length % 2 ? JSON.stringify(payload) : `data: ${JSON.stringify({ type: 'response.completed', response: payload })}\n\ndata: [DONE]\n\n`)
   })
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve))
