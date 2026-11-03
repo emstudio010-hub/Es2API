@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { createGatewayCompletionObserver } from './gateway-response.mjs'
 
 const TTL = 24 * 60 * 60 * 1000
 const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex')
@@ -115,32 +116,18 @@ export class GatewayIsolation {
   upstreamBody(context, account, body) {
     const result = { ...body }
     const id = this.upstreamHeaders(context, account)['x-session-id']
-    for (const key of ['session_id', 'conversation_id', 'thread_id', 'prompt_cache_key']) {
+    const cli = account.binding?.execution_backend === 'codex-cli'
+    for (const key of ['session_id', 'conversation_id', 'thread_id', ...(!cli ? ['prompt_cache_key'] : [])]) {
       if (Object.hasOwn(result, key)) result[key] = id
     }
-    result.prompt_cache_key = id
+    // CLI exec is ephemeral and rejects cache keys. Caller-provided unsupported
+    // fields remain intact for capability validation; never inject our own key.
+    if (!cli) result.prompt_cache_key = id
     return result
   }
 }
 
-export function responseObserver(isolation, context, account, contentType) {
-  let pending = '', discard = false
-  const decoder = new TextDecoder()
-  const parse = text => { try { isolation.observe(context, account, JSON.parse(text)) } catch (error) { if (error.code) throw error } }
-  const sse = contentType.includes('text/event-stream')
-  return {
-    push(chunk) {
-      const text = decoder.decode(chunk, { stream: true })
-      if (!sse) { if (!discard) { pending += text; if (pending.length > 10 * 1024 * 1024) { pending = ''; discard = true } }; return }
-      for (const part of text.split(/(?<=\n)/)) {
-        if (!discard) pending += part
-        if (pending.length > 1024 * 1024) { pending = ''; discard = true }
-        if (part.endsWith('\n')) {
-          if (!discard && pending.startsWith('data:')) parse(pending.slice(5).trim())
-          pending = ''; discard = false
-        }
-      }
-    },
-    end() { if (!discard && pending) parse(sse ? pending.replace(/^data:\s*/, '') : pending); pending = '' },
-  }
+export function responseObserver(isolation, context, account, contentType, options = {}) {
+  return createGatewayCompletionObserver({ contentType, ...options,
+    observe: payload => isolation.observe(context, account, payload) })
 }

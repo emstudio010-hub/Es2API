@@ -75,6 +75,7 @@ import {
   resolveOutboundSessionId,
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
+import { createDownstreamKeepalive } from './stream-keepalive.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -680,6 +681,7 @@ export async function handleCodexProtocol({
   let attempts = 0
   let switches = 0
   let counted = false
+  let cliKeepalive = null
   try {
     for (;;) {
       const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
@@ -847,6 +849,14 @@ export async function handleCodexProtocol({
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         let hopEmitted = false
+        if (cli && stream) {
+          cliKeepalive = createDownstreamKeepalive({ protocol, write: chunk => {
+            if (gone.signal.aborted || res.writableEnded || res.destroyed) return
+            if (!res.headersSent) writeSSEHeaders(res)
+            res.write(chunk)
+          } })
+          cliKeepalive.arm()
+        }
         const runHop = () =>
           runCodexKernelHop({
             hop: cli ? streamCodexCli : hop,
@@ -872,12 +882,14 @@ export async function handleCodexProtocol({
               hopEmitted = true
               if (conversionError) return
               const event = parseSseData(line).event
+              cliKeepalive?.observeLine(line)
               if (event) {
                 if (['response.incomplete', 'response.failed', 'response.cancelled', 'error'].includes(event.type) || event.error ||
                     ['incomplete', 'failed', 'cancelled'].includes(event.response?.status) || event.response?.error) responseTerminal = 'failed'
                 else if (event.type === 'response.completed' || event.response?.status === 'completed') responseTerminal =
                   !event.response?.status || event.response.status === 'completed' ? 'completed' : 'failed'
               }
+              if (responseTerminal) cliKeepalive?.stop()
               const tier = serviceTierFromSseLine(line)
               if (tier) responseServiceTier = tier
               const seen = usageFromSseLine(line)
@@ -912,6 +924,7 @@ export async function handleCodexProtocol({
             },
           })
         let result = await runHop()
+        cliKeepalive?.stop()
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
@@ -1017,6 +1030,12 @@ export async function handleCodexProtocol({
         // Buffered non-streaming events have not committed an HTTP response.
         // A failed hop must still return its structured error and status.
         if (res.headersSent || (stream && hopEmitted)) {
+          if (cli && stream && !responseTerminal && !gone.signal.aborted && !res.destroyed && !res.writableEnded) {
+            const error = result?.body?.error || { type: 'api_error', code: 'codex_cli_incomplete', message: 'Codex CLI did not complete' }
+            res.write(protocol === 'openai.responses'
+              ? `event: error\ndata: ${JSON.stringify({ type: 'error', error })}\n\n`
+              : `data: ${JSON.stringify({ error })}\n\ndata: [DONE]\n\n`)
+          }
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
@@ -1031,6 +1050,8 @@ export async function handleCodexProtocol({
         }
         break
       } finally {
+        cliKeepalive?.stop()
+        cliKeepalive = null
         lease.release()
         if (claimsWindow) {
           try {
@@ -1040,6 +1061,7 @@ export async function handleCodexProtocol({
       }
     }
   } finally {
+    cliKeepalive?.stop()
     gone.settle()
   }
   stats.errors++

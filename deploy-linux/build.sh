@@ -6,7 +6,7 @@ cd "$TASK_ROOT"
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || { echo '需要 Linux x86_64。' >&2; exit 1; }
 for tool in node npm go python3 curl sha256sum; do command -v "$tool" >/dev/null || { echo "缺少构建依赖：$tool" >&2; exit 1; }; done
 node --input-type=module -e 'if (Number(process.versions.node.split(".")[0]) < 24) throw new Error("Node.js 24+ required")'
-STAGE_FOLDER="${ES2API_STAGE_FOLDER:-${ES2API_RELEASE_NAME:-Es2API-linux-x64-20261104-r9}}"
+STAGE_FOLDER="${ES2API_STAGE_FOLDER:-${ES2API_RELEASE_NAME:-Es2API-linux-x64-20261104-r10}}"
 [[ ! -e "build-cache/$STAGE_FOLDER" ]] || { echo "分发暂存目录已存在：$STAGE_FOLDER" >&2; exit 1; }
 mkdir -p build-cache/linux build-cache/deps/integration build-cache/deps/vm2api build-cache/payload
 (

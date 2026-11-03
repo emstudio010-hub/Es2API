@@ -25,6 +25,7 @@ function equalSecret(a, b) {
   return left.length === right.length && crypto.timingSafeEqual(left, right)
 }
 function fail(res, status, code, message) {
+  if (res.destroyed || res.writableEnded) return
   if (res.headersSent) { res.destroy(); return }
   res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
   res.end(JSON.stringify({ error: { type: code, code, message } }))
@@ -52,12 +53,13 @@ export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey,
       return
     }
     const controller = new AbortController()
-    const abort = () => { if (!res.writableEnded) controller.abort() }
+    let clientDisconnected = false, timedOut = false
+    const abort = () => { if (!res.writableFinished) { clientDisconnected = true; controller.abort() } }
     req.once('aborted', abort)
     res.once('close', abort)
-    const timeout = setTimeout(() => controller.abort(), 15 * 60 * 1000)
+    const timeout = setTimeout(() => { timedOut = true; controller.abort() }, 15 * 60 * 1000)
     timeout.unref()
-    let lease, status = 0, delivered = false
+    let lease, status = 0, delivered = false, failureCode = null
     try {
       const chunks = []; let size = 0
       for await (const chunk of req) {
@@ -69,6 +71,7 @@ export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey,
       let parsed
       try { parsed = JSON.parse(body.toString('utf8')) } catch { return fail(res, 400, 'invalid_request_error', 'Invalid JSON') }
       if (!parsed || typeof parsed.model !== 'string') return fail(res, 400, 'invalid_request_error', 'model is required')
+      if (req.aborted || res.destroyed || controller.signal.aborted) throw Object.assign(new Error('Client disconnected'), { status: 499 })
       const context = isolation.context(req, groupId, parsed)
       lease = isolation.select(context, group, accountPool)
       const isolatedBody = JSON.stringify(isolation.upstreamBody(context, lease.account, parsed))
@@ -81,21 +84,27 @@ export function createPoolGateway({ accountPool, store, secret, baseUrl, apiKey,
       status = upstream.status
       res.writeHead(status, { 'content-type': upstream.headers.get('content-type') || 'application/json',
         'cache-control': 'no-store', 'x-accel-buffering': 'no' })
-      const observer = responseObserver(isolation, context, lease.account, upstream.headers.get('content-type') || '')
+      const observer = responseObserver(isolation, context, lease.account, upstream.headers.get('content-type') || '', { endpoint, expectedChoices: parsed.n })
       for await (const chunk of upstream.body || []) {
         observer.push(chunk)
         if (!res.write(chunk)) await once(res, 'drain', { signal: controller.signal })
       }
       observer.end()
+      if (upstream.ok && !observer.completed && !observer.rejected) throw Object.assign(new Error('Execution response did not complete'), { code: 'gateway_response_incomplete' })
+      if (upstream.ok && observer.rejected) failureCode = 'gateway_response_failed'
+      const finished = once(res, 'finish', { signal: controller.signal })
       res.end()
-      delivered = upstream.ok && !controller.signal.aborted
+      await finished
+      delivered = upstream.ok && observer.completed && !controller.signal.aborted && res.writableFinished
     } catch (error) {
-      const statusCode = error?.status || (error?.code === 'pool_unavailable' ? 503 : controller.signal.aborted ? 504 : 502)
+      failureCode = clientDisconnected ? 'gateway_client_cancelled' : timedOut ? 'gateway_timeout' :
+        error?.code === 'gateway_response_incomplete' ? 'gateway_response_incomplete' : `gateway_${status || 'transport'}`
+      const statusCode = error?.status || (error?.code === 'pool_unavailable' ? 503 : clientDisconnected ? 499 : timedOut ? 504 : 502)
       fail(res, statusCode, ['pool_unavailable', 'session_isolation_conflict', 'caller_namespace_required', 'invalid_session_identity', 'session_registry_full'].includes(error?.code) ? error.code : 'upstream_error', 'Execution could not complete')
     } finally {
       clearTimeout(timeout); req.off('aborted', abort); res.off('close', abort)
       if (lease) { try { accountPool.releaseRequest(lease.request_id, { success: delivered,
-        error_code: delivered ? null : `gateway_${status || 'transport'}`,
+        error_code: delivered ? null : failureCode || `gateway_${status || 'transport'}`,
         ...(status === 429 ? { rate_limited_until: new Date(Date.now() + 60000).toISOString() } : {}),
         ...(status >= 500 ? { overload_until: new Date(Date.now() + 15000).toISOString() } : {}) }) } catch { console.error('[es2api] gateway lease release failed') } }
     }
