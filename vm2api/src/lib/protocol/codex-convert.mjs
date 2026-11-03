@@ -307,6 +307,24 @@ export function anthropicToCodexResponses(body = {}) {
   })
 }
 
+// CLI owns its wire protocol. Keep supported caller parameters intact instead
+// of applying the Kernel's upstream field stripping and effort normalization.
+export function toCodexCliResponses(protocol, body) {
+  const stripped = stripCodexIdentity(body)
+  if (protocol === 'openai.chat') {
+    return { ok: true, body: chatToCodexResponses(stripped), converted: true }
+  }
+  if (protocol === 'openai.responses') {
+    const next = { ...stripped }
+    if (typeof next.input === 'string') next.input = codexTextInput(next.input)
+    else if (!Array.isArray(next.input) && Array.isArray(next.messages)) {
+      return { ok: true, body: chatToCodexResponses(next), converted: true }
+    }
+    return { ok: true, body: next, converted: typeof stripped.input === 'string' }
+  }
+  return { ok: false, code: 'codex_cli_protocol_unsupported' }
+}
+
 export function toCodexResponses(protocol, body, convert = {}) {
   const stripped = stripCodexIdentity(body)
   if (protocol === 'openai.responses') {
@@ -390,6 +408,15 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   }
   const event = parsed.event || {}
   const type = event.type || ''
+  if (['response.failed', 'response.incomplete', 'response.cancelled', 'error'].includes(type) ||
+      event.error || event.response?.error || ['failed', 'incomplete', 'cancelled'].includes(event.response?.status)) {
+    const error = event.response?.error || event.error || {
+      type: 'api_error', code: 'upstream_incomplete', message: 'Upstream response did not complete',
+    }
+    const usage = openaiChatUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage))
+    session.finished = true
+    return `data: ${JSON.stringify({ error, ...(usage ? { usage } : {}) })}\n\ndata: [DONE]\n\n`
+  }
   if (
     (type === 'response.output_item.added' || type === 'response.output_item.done') &&
     (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')

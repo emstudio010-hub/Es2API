@@ -33,6 +33,7 @@ function usageObject(body) {
  *   output_tokens?: number,
  *   cached_tokens?: number,
  *   cache_write_tokens?: number,
+ *   reasoning_tokens?: number,
  *   total_tokens?: number,
  * }}
  */
@@ -42,6 +43,9 @@ export function extractOpenaiUsage(body) {
 
   const input_tokens = asU64(usage.input_tokens) ?? asU64(usage.prompt_tokens)
   const output_tokens = asU64(usage.output_tokens) ?? asU64(usage.completion_tokens)
+  const reasoning_tokens =
+    nestedU64(usage, ['output_tokens_details', 'reasoning_tokens']) ??
+    nestedU64(usage, ['completion_tokens_details', 'reasoning_tokens'])
   const cached_tokens =
     nestedU64(usage, ['input_tokens_details', 'cached_tokens']) ??
     nestedU64(usage, ['prompt_tokens_details', 'cached_tokens']) ??
@@ -80,6 +84,7 @@ export function extractOpenaiUsage(body) {
   if (output_tokens != null) out.output_tokens = output_tokens
   if (cached_tokens != null) out.cached_tokens = cached_tokens
   if (cache_write_tokens != null) out.cache_write_tokens = cache_write_tokens
+  if (reasoning_tokens != null) out.reasoning_tokens = reasoning_tokens
   if (total_tokens != null) out.total_tokens = total_tokens
   return out
 }
@@ -100,6 +105,9 @@ export function openaiChatUsageFromExtract(extracted) {
     if (extracted.cache_write_tokens != null) {
       out.prompt_tokens_details.cache_creation_tokens = extracted.cache_write_tokens
     }
+  }
+  if (extracted.reasoning_tokens != null) {
+    out.completion_tokens_details = { reasoning_tokens: extracted.reasoning_tokens }
   }
   return out
 }

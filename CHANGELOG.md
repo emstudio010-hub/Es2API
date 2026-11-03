@@ -1,5 +1,12 @@
 # 变更记录
 
+## 2026.11.04-preview.8 — CLI 协议与用量回传
+
+- CLI 使用独立参数转换，绕开 Kernel 的字段裁剪和推理强度归一化；保留 minimal 等已允许值，原始请求与实际执行请求仍各自校验。
+- 会话 rebuild 模式不再向临时 CLI 请求注入 prompt_cache_key，避免通过入口校验后在执行层被拒绝。调用者显式缓存键仍返回不支持。
+- Chat 流式/非流式保留上游实际提供的 reasoning_tokens；未提供时不填零，不重复加到总量或计费输出。
+- Chat SSE 收到 failed/incomplete/cancelled/error 时发送错误及 DONE，保留已有真实用量，不伪造 stop 成功。
+
 ## 2026.11.04-preview.7 — 停机和删除退出确认
 
 - 本机Codex停止/删除持久写入操作意图；确认独立Kernel、Docker及宿主CLI请求退出后才允许清理和释放出口。

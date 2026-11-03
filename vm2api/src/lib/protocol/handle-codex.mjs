@@ -20,6 +20,7 @@ import {
   codexBodyToAnthropicMessage,
   isToolArgumentsError,
   toCodexResponses,
+  toCodexCliResponses,
 } from './codex-convert.mjs'
 import {
   extraFromCodexHeaders,
@@ -700,6 +701,7 @@ export async function handleCodexProtocol({
         continue
       }
       const cli = isCodexCliVm(vm)
+      let cliBody = null
       if (cli) {
         logBag.via = 'codex-cli'
         // A CLI invocation is a single attempt, including account failover.
@@ -711,7 +713,8 @@ export async function handleCodexProtocol({
           stats.errors++
           return json(res, 400, { error: { type: 'invalid_request_error', code: 'codex_cli_protocol_unsupported', message: 'CLI 文本后端目前仅支持 Responses 与 Chat Completions' } })
         }
-        try { codexCliRequest(converted.body, inbound) } catch (error) {
+        cliBody = toCodexCliResponses(protocol, ctx.body).body
+        try { codexCliRequest(cliBody, inbound) } catch (error) {
           lease.release()
           stats.errors++
           logBag.error_code = error.code
@@ -836,7 +839,10 @@ export async function handleCodexProtocol({
           previous_response_id: inboundSession.previous_response_id,
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
-        const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
+        // Rebuild cache keys belong to Kernel sessions. CLI exec is ephemeral;
+        // injecting one here would fail its second, transport-side validation.
+        const outboundBody = cli ? { ...cliBody, stream: true }
+          : applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
