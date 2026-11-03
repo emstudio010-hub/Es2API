@@ -104,6 +104,20 @@ WS每轮首次响应身份在现有隔离事务中claim，当前caller/group范�
 
 依据 [官方Chat输入](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[官方Responses输入项](https://developers.openai.com/api/reference/resources/responses/subresources/input_items/methods/list)、[官方异步工具调用类型对应](https://developers.openai.com/api/docs/guides/async-tool-calling) 核对形状。没有运行行为测试或真实账号验收。
 
+## CLI退出回执与复用（preview.14）
+
+CLI监督器不再创建空done文件。每次请求生成32字节随机nonce，监督器原子写入es2api-cli-exit-v1回执，记录request_id、nonce、phase、pid/pgid、exit_code、live_group_members=0。子进程未能spawn时以not_started/126及空pid登记；此类回执只允许清理，不可算推理成功。
+
+主进程wait后监督器发送KILL到原CLI进程组，等待watcher结束并最多5秒扫描/proc确认该组没有非Z/X进程。消失的pid允许跳过；无法读取、格式异常、超时或watcher未结束均不写回执。先flush/fsync临时文件，再rename成done，避免空文件或部分JSON被识别为完成。
+
+控制面在Docker管道close后最多2秒等待回执，读取器限制2KiB、普通非符号链接文件，核对open前后文件身份、UTF8、schema、request_id/nonce、状态、pid/pgid和退出码。非流式和最终Responses完成事件都必须额外具有匹配的exited/0回执；仅Docker exit0、turn.completed或已知usage均不能替代。已知真实usage仍保留，不估算、不增加推理重试。
+
+健康检查、新请求和最终目录清理共享该读取器。旧空done、非法或缺失回执一律保留请求目录、拒绝新推理复用，沿用明确恢复且确认该容器已停后的清理流程；不在升级时静默删除。账户级集成容量可在失败返回后释放，但CLI请求目录门仍阻止同槽未确认执行被复用。
+
+账号请求目录通过request-lock.json的wx创建独占认领，覆盖凭据准备、旧目录核对、启动、退出确认和清理。其他控制进程即使有独立内存Map，也不能同时正常认领同一目录。原拥有者释放前核对请求ID/nonce对应的完整锁内容；缺回执、host崩溃或无法确认退出时保留锁和请求目录，不按PID/文件年龄自动回收。现有明确恢复流程在两次确认该容器已停止、等待本控制进程finalizer后清理目录和锁。多个控制进程并发维护/重建仍不由此证明，外部修改锁不属于正常认领协议。
+
+该回执是本地监督器确认，非密码学/供应商/OS可信证明，仅覆盖原CLI进程组；主动脱离组的后代不由此证明，容器整体和跨账号隔离仍需独立验收。CLI仍文本exec；未做取消、心跳丢失、进程组扫描、并发、旧标记、真实调用或Linux安装行为验收。排队/健康阶段SSE保活仍待设计，需确保保活后权限/准入失败使用有效SSE错误而非再次写HTTP头。
+
 ## 验收边界
 
 本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。

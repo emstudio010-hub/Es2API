@@ -16,6 +16,8 @@ import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { CODEX_CLI_CONTAINER_BIN, CODEX_CLI_VERSION, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
 import { codexCliJobs as active, codexCliInMaintenance } from './codex-cli-state.mjs'
 import { codexCliInstructionConfig } from './codex-cli-request-config.mjs'
+import { readCodexCliExitReceipt, waitCodexCliExitReceipt } from './codex-cli-receipt.mjs'
+import { claimCodexCliRequest, hasCodexCliClaim } from './codex-cli-claim.mjs'
 
 const runFile = promisify(execFile)
 const TIMEOUT_MS = 300000
@@ -109,8 +111,9 @@ export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
   if (accounts.length !== 1 || !accounts[0].id_token || !accounts[0].chatgpt_account_id || (!accounts[0].access_token && !accounts[0].refresh_token)) return { ok: false, reachable: false, code: 'codex_cli_identity_required', status: 503 }
   if (needsAccessRefresh(accounts[0]) && !accounts[0].refresh_token) return { ok: false, reachable: false, code: 'codex_cli_refresh_required', status: 503 }
   try {
+    if (!active.has(exec.vmId) && hasCodexCliClaim(requestsRoot(exec))) return { ok: false, reachable: false, code: 'codex_cli_previous_run_unconfirmed', status: 503 }
     for (const entry of fs.readdirSync(requestsRoot(exec))) {
-      if (/^req-[a-f0-9-]+$/.test(entry) && !active.has(exec.vmId) && !fs.existsSync(path.join(requestsRoot(exec), entry, 'done'))) return { ok: false, reachable: false, code: 'codex_cli_previous_run_unconfirmed', status: 503 }
+      if (/^req-[a-f0-9-]+$/.test(entry) && !active.has(exec.vmId) && !readCodexCliExitReceipt(path.join(requestsRoot(exec), entry))) return { ok: false, reachable: false, code: 'codex_cli_previous_run_unconfirmed', status: 503 }
     }
   } catch (error) { if (error.code !== 'ENOENT') return { ok: false, reachable: false, code: 'codex_cli_state_unreadable', status: 503 } }
   try {
@@ -150,15 +153,36 @@ export async function refreshCliCredential(projectRoot, vm, { force = false, dea
 
 // This supervisor lives inside the slot. It kills the entire CLI process group on
 // timeout, cancellation, or loss of the host heartbeat (including host crashes).
-const RUNNER = String.raw`import os,sys,time,signal,subprocess,threading
+const RUNNER = String.raw`import os,sys,time,signal,subprocess,threading,json
 root=sys.argv[1]
 limit=float(sys.argv[2])/1000
+nonce=sys.argv[3]
+def receipt(rc,phase,pid):
+    value={'format':'es2api-cli-exit-v1','request_id':os.path.basename(root),'nonce':nonce,'phase':phase,'pid':pid,'pgid':pid,'exit_code':rc,'live_group_members':0}
+    with open(root+'/done.tmp','x') as f:
+        json.dump(value,f,separators=(',',':'))
+        f.flush(); os.fsync(f.fileno())
+    os.replace(root+'/done.tmp',root+'/done')
+
+def live_group(pgid):
+    # /proc stat: state, ppid, pgrp follow the final ')' of comm. A zombie
+    # cannot execute; an unreadable non-disappeared process is unconfirmed.
+    alive=[]
+    for name in os.listdir('/proc'):
+        if not name.isdigit(): continue
+        try:
+            with open('/proc/'+name+'/stat') as f: raw=f.read()
+            fields=raw[raw.rindex(')')+2:].split()
+            if int(fields[2])==pgid and fields[0] not in ('Z','X'): alive.append(int(name))
+        except (FileNotFoundError,ProcessLookupError): continue
+    return alive
+
 try:
-    proc=subprocess.Popen(sys.argv[3:],start_new_session=True)
+    proc=subprocess.Popen(sys.argv[4:],start_new_session=True)
 except OSError:
     # No child process exists. Mark the request confirmed rather than leaving
     # an unrecoverable-looking request directory after an exec setup failure.
-    open(root+'/done','w').close()
+    receipt(126,'not_started',None)
     sys.exit(126)
 ended=threading.Event()
 def kill_group():
@@ -181,14 +205,21 @@ def watch():
             finally:
                 kill_group()
             return
-threading.Thread(target=watch,daemon=True).start()
+watcher=threading.Thread(target=watch,daemon=True)
+watcher.start()
+rc=None
 try:
     rc=proc.wait()
 finally:
     ended.set()
     try: os.killpg(proc.pid,signal.SIGKILL)
     except ProcessLookupError: pass
-    open(root+'/done','w').close()
+    watcher.join(3)
+    until=time.monotonic()+5
+    while watcher.is_alive() or live_group(proc.pid):
+        if time.monotonic()>=until: sys.exit(125)
+        time.sleep(.1)
+    if rc is not None: receipt(rc if rc>=0 else 128-rc,'exited',proc.pid)
 sys.exit(rc if rc>=0 else 128-rc)
 `
 
@@ -208,22 +239,31 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
   if (signal?.aborted) return errorResult(499, 'client_cancelled', '请求已取消')
   if (active.has(exec.vmId)) return errorResult(429, 'codex_cli_busy', '此账号的 Codex CLI 正在执行，请稍后重试')
   const root = requestsRoot(exec)
+  const id = `req-${crypto.randomUUID()}`
+  const receiptNonce = crypto.randomBytes(32).toString('hex')
+  const dir = path.join(root, id)
+  let releaseClaim
   try {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+    releaseClaim = claimCodexCliRequest(root, id, receiptNonce)
     // Leftovers after a host crash may still be winding down. Never delete a
     // live child's auth or start another turn while its outcome is unknown.
     for (const entry of fs.readdirSync(root)) {
       if (!/^req-[a-f0-9-]+$/.test(entry)) continue
       const old = path.join(root, entry)
-      if (!fs.existsSync(path.join(old, 'done'))) return errorResult(503, 'codex_cli_previous_run_unconfirmed', '上次 CLI 进程尚未确认退出，请检查实例后恢复')
+      if (!readCodexCliExitReceipt(old)) {
+        releaseClaim()
+        return errorResult(503, 'codex_cli_previous_run_unconfirmed', '上次 CLI 进程尚未确认退出，请检查实例后恢复')
+      }
       fs.rmSync(old, { recursive: true, force: true })
     }
-  } catch { return errorResult(503, 'codex_cli_state_unreadable', 'CLI 请求目录不可用，请在实例中检查并恢复') }
-  const id = `req-${crypto.randomUUID()}`
-  const dir = path.join(root, id)
+  } catch (error) {
+    try { releaseClaim?.() } catch {}
+    return errorResult(503, error.code === 'codex_cli_previous_run_unconfirmed' ? error.code : 'codex_cli_state_unreadable', 'CLI 请求目录或执行占用尚未确认释放，请在实例中检查并恢复')
+  }
   const guest = `/home/kincli/.es2api-requests/${id}`
   let failure = null, child, heartbeat, timeout, hardTimeout, cancelTimeout, emitted = false, firstTokenAt = null
-  let completed = false, usage = null, text = '', closed = false, terminalAttempted = false
+  let completed = false, usage = null, text = '', closed = false, terminalAttempted = false, exitReceipt = null
   const responseId = `resp_cli_${crypto.randomUUID().replaceAll('-', '')}`
   const messageId = `msg_${crypto.randomUUID().replaceAll('-', '')}`
   let sequence = 0
@@ -273,7 +313,7 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     for (const config of ['web_search="disabled"', 'cli_auth_credentials_store="file"', 'model_provider="openai"', 'model_providers.openai.request_max_retries=0', 'model_providers.openai.stream_max_retries=0', 'model_providers.openai.supports_websockets=false', 'mcp_servers={}', 'analytics.enabled=false', 'feedback.enabled=false']) argv.push('-c', config)
     if (request.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(request.effort)}`)
     argv.push('-')
-    const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(remaining), ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
+    const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(remaining), receiptNonce, ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
     child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     child.stdin.on('error', () => {})
     child.stdin.end(request.prompt)
@@ -331,6 +371,7 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     pending += decoder.end()
     await queue
     if (pending.trim()) await eventLine(pending)
+    exitReceipt = await waitCodexCliExitReceipt(dir, receiptNonce)
     if (!failure) {
       let outcome = null
       try { outcome = fs.readFileSync(path.join(dir, 'outcome'), 'utf8') }
@@ -339,11 +380,12 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
         ['timeout', 'codex_cli_timeout'], ['cancelled', 'codex_cli_cancelled'], ['heartbeat_lost', 'codex_cli_heartbeat_lost'],
       ]).get(outcome) || 'codex_cli_supervisor_state_invalid'
     }
-    if (!failure && (exit !== 0 || !completed || !text || !usage)) failure = 'codex_cli_incomplete'
+    if (!failure && !exitReceipt) failure = 'codex_cli_exit_unconfirmed'
+    if (!failure && (exit !== 0 || exitReceipt.phase !== 'exited' || exitReceipt.exit_code !== 0 || !completed || !text || !usage)) failure = 'codex_cli_incomplete'
     if (failure) {
       const result = errorResult(['client_cancelled', 'codex_cli_cancelled'].includes(failure) ? 499 : failure === 'codex_cli_timeout' ? 504 : 502, failure, 'Codex CLI 执行未完成，请在实例中检查状态；本次未自动重试')
       await emitFailure(result)
-      return { ...result, committed: emitted, usage, firstTokenAt }
+      return { ...result, committed: emitted, usage, firstTokenAt, executionExitConfirmed: !!exitReceipt }
     }
     const part = { type: 'output_text', text, annotations: [] }
     const item = { id: messageId, type: 'message', status: 'completed', role: 'assistant', content: [part] }
@@ -352,7 +394,7 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     await emit({ type: 'response.content_part.done', output_index: 0, item_id: messageId, content_index: 0, part })
     await emit({ type: 'response.output_item.done', output_index: 0, item })
     await emit({ type: 'response.completed', response })
-    return { ok: true, status: 200, committed: true, terminalState: 'verified', body: response, usage, firstTokenAt, ttftMs: firstTokenAt - started }
+    return { ok: true, status: 200, committed: true, terminalState: 'verified', body: response, usage, firstTokenAt, ttftMs: firstTokenAt - started, executionExitConfirmed: true }
   } catch (error) {
     const code = failure || (/^codex_cli_[a-z_]+$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed')
     cancel(code)
@@ -365,8 +407,8 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     signal?.removeEventListener('abort', abort)
     active.delete(exec.vmId)
     // A crashed Docker client is not proof the in-container process exited.
-    if (!child || (closed && fs.existsSync(path.join(dir, 'done')))) {
-      try { fs.rmSync(dir, { recursive: true, force: true }) }
+    if (!child || (closed && readCodexCliExitReceipt(dir, receiptNonce))) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); releaseClaim() }
       catch { console.warn('[codex-cli] completed_request_cleanup_failed') }
     }
   }

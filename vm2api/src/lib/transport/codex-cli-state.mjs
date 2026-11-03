@@ -3,6 +3,7 @@ import path from 'node:path'
 import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { slotExecContainer } from '../vm/slot-exec.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { codexCliClaimPath } from './codex-cli-claim.mjs'
 
 export const codexCliJobs = new Map()
 const maintenance = new Set()
@@ -45,5 +46,13 @@ export async function clearStoppedCodexCliRequests(exec) {
     fs.rmSync(target, { recursive: true, force: true })
     cleared++
   }
+  // Recovery reached this point only after two exact-container stopped checks
+  // and the local request finalizer drain. Never clear a claim just for age/PID.
+  const claim = codexCliClaimPath(root)
+  try {
+    const stat = fs.lstatSync(claim)
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('invalid CLI request claim')
+    fs.unlinkSync(claim)
+  } catch (error) { if (error.code !== 'ENOENT') throw error }
   return { cleared }
 }
