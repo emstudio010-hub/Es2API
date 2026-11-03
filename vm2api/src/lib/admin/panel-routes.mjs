@@ -269,6 +269,7 @@ import { codexCliHealth, cancelCodexCli, refreshCliCredential } from '../transpo
 import { withCodexCredentialLock, assertCodexIntegrationBinding } from '../oauth/codex-credential-lock.mjs'
 import { checkpointCodexCredential } from '../oauth/codex-credential-handoff.mjs'
 import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
+import { withCodexKernelCredentialOwner } from '../oauth/codex-kernel-credential-owner.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
@@ -427,6 +428,7 @@ async function commitImportedCodexVm({
         return true
       }
     }
+    return withCodexKernelCredentialOwner(cfg.paths.project, existing.id, async () => {
     if (!account.access_token && account.refresh_token) {
       const slotProxy = requireSlotProxy(existing, importBody)
       if (!slotProxy.ok) throw Object.assign(new Error(slotProxy.message), { status: slotProxy.status, code: 'proxy_required' })
@@ -480,6 +482,7 @@ async function commitImportedCodexVm({
     })
     if (writtenCodex) Object.assign(existing, writtenCodex)
     return false
+    })
   })
   if (preserved) return { vm: summarizeVm(existing, cfg.paths.project, routingConfig),
     platform: 'openai', credential_preserved: true }

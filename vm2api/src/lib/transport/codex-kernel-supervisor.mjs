@@ -14,6 +14,7 @@ import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { codexKernelHealth, codexKernelPaths, codexSocketPath } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
+import { codexKernelIdentity, hasCodexKernelLease, withCodexKernelActivity } from './codex-kernel-activity.mjs'
 
 const starts = new Map()
 
@@ -182,7 +183,17 @@ export async function finishCodexRecycle(child, socketPath, { termMs = 2000, kil
   return { exited: true }
 }
 
-export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
+export async function ensureCodexKernel(exec, { timeoutMs = 8000, kernelLease } = {}) {
+  try {
+    const { projectRoot, vmId } = codexKernelIdentity(exec)
+    if (kernelLease && hasCodexKernelLease(projectRoot, vmId, kernelLease)) return await ensureCodexKernelActive(exec, { timeoutMs })
+    return await withCodexKernelActivity(projectRoot, vmId, () => ensureCodexKernelActive(exec, { timeoutMs }))
+  } catch (error) {
+    return { ok: false, reason: error.code || 'kernel_identity_unavailable' }
+  }
+}
+
+async function ensureCodexKernelActive(exec, { timeoutMs }) {
   const bin = codexKernelBinPath()
   if (!bin) return { ok: false, reason: 'bin_missing' }
   const paths = codexKernelPaths(exec)

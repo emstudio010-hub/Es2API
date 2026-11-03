@@ -1,11 +1,12 @@
 import { withCodexCredentialLock } from './codex-credential-lock.mjs'
 import { readCodexAccountsStrict, writeCodexAccounts, enrichCodexAccountIdentity } from '../vm/codex-slot.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { withCodexKernelCredentialOwner } from './codex-kernel-credential-owner.mjs'
 
 export function refreshStoredCodexCredential(projectRoot, vmId, {
   previous = null, usedAccess = null, refresh = refreshCodexAccessToken, ...options
 } = {}) {
-  return withCodexCredentialLock(projectRoot, vmId, async () => {
+  return withCodexCredentialLock(projectRoot, vmId, () => withCodexKernelCredentialOwner(projectRoot, vmId, async () => {
     const accounts = readCodexAccountsStrict(projectRoot, vmId)
     let index = previous ? accounts.findIndex(row =>
       (previous.refresh_token && row.refresh_token === previous.refresh_token)
@@ -32,5 +33,5 @@ export function refreshStoredCodexCredential(projectRoot, vmId, {
       expires_at: token.expires_at || account.expires_at })
     writeCodexAccounts(projectRoot, vmId, latest)
     return latest[index]
-  })
+  }, { timeoutMs: options.timeoutMs }))
 }
