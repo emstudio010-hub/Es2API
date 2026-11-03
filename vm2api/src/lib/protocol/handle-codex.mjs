@@ -304,6 +304,18 @@ function execFor(projectRoot, vm) {
   }
 }
 
+function logCodexUsage(logBag, usage, serviceTier) {
+  const extracted = extractOpenaiUsage(usage)
+  const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
+  logBag.usage = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
+  logBag.input_tokens = disjoint?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
+  logBag.output_tokens = disjoint?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
+  logBag.cache_read_tokens = disjoint?.cache_read_input_tokens ?? extracted?.cached_tokens ??
+    usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
+  logBag.cache_creation_tokens = disjoint?.cache_creation_input_tokens ?? extracted?.cache_write_tokens ??
+    usage?.input_tokens_details?.cache_write_tokens ?? usage?.cache_creation_tokens ?? null
+}
+
 export function isRetryableCodexTransport(result) {
   if (!result || result.ok === true) return false
   if (result.committed === true) return false
@@ -945,31 +957,21 @@ export async function handleCodexProtocol({
         logBag.inference_completed = !conversionError && responseTerminal !== 'failed' && !failedBody &&
           (responseTerminal === 'completed' || completedBody ||
             (responseTerminal === null && result?.ok === true && result.terminalState === 'verified'))
+        // CLI may report real usage before a final delivery/transport failure.
+        // Keep it observable without classifying the inference as completed.
+        if (cli && !delivered) {
+          if (usage) logCodexUsage(logBag, usage, null)
+          logBag.final_state = result?.terminalState || 'failed'
+          logBag.upstream_model = converted.body.model
+        }
         if (delivered) {
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
-          const extracted = extractOpenaiUsage(usage)
           const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
-          const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
-          const logged = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
-          logBag.usage = logged
+          logCodexUsage(logBag, usage, serviceTier)
           const imageUsage =
             result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
           if (imageUsage) logBag.image_usage = imageUsage
-          logBag.input_tokens = disjoint?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
-          logBag.output_tokens = disjoint?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
-          logBag.cache_read_tokens =
-            disjoint?.cache_read_input_tokens ??
-            extracted?.cached_tokens ??
-            usage?.input_tokens_details?.cached_tokens ??
-            usage?.cache_read_tokens ??
-            null
-          logBag.cache_creation_tokens =
-            disjoint?.cache_creation_input_tokens ??
-            extracted?.cache_write_tokens ??
-            usage?.input_tokens_details?.cache_write_tokens ??
-            usage?.cache_creation_tokens ??
-            null
           reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
           logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
           logBag.upstream_model = converted.body.model

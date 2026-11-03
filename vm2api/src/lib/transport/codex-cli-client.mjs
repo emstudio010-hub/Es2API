@@ -81,12 +81,27 @@ function supported(exec) {
 function projectOf(exec) { return path.dirname(path.dirname(path.dirname(exec.homeDir))) }
 function requestsRoot(exec) { return path.join(exec.homeDir, '.es2api-requests') }
 
+function accessExpiry(account) {
+  let expiry = Number(account?.expires_at) || Date.parse(account?.expires_at || '') || 0
+  if (expiry > 0 && expiry < 1e12) expiry *= 1000
+  try {
+    const jwtExpiry = Number(JSON.parse(Buffer.from(account.access_token.split('.')[1], 'base64url')).exp)
+    if (Number.isFinite(jwtExpiry) && jwtExpiry > 0) expiry = jwtExpiry * 1000
+  } catch {}
+  return Number.isFinite(expiry) ? expiry : 0
+}
+
+function needsAccessRefresh(account) {
+  return !account?.access_token || accessExpiry(account) < Date.now() + TIMEOUT_MS + 60000
+}
+
 export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
   if (!supported(exec)) return { ok: false, reachable: false, code: 'codex_cli_requires_local_dedicated_docker' }
   const payload = inspectCodexCliPayload()
   if (!payload.ok) return { ok: false, reachable: false, code: payload.code }
   const accounts = readCodexAccounts(projectOf(exec), exec.vm.id)
   if (accounts.length !== 1 || !accounts[0].id_token || !accounts[0].chatgpt_account_id || (!accounts[0].access_token && !accounts[0].refresh_token)) return { ok: false, reachable: false, code: 'codex_cli_identity_required', status: 503 }
+  if (needsAccessRefresh(accounts[0]) && !accounts[0].refresh_token) return { ok: false, reachable: false, code: 'codex_cli_refresh_required', status: 503 }
   try {
     for (const entry of fs.readdirSync(requestsRoot(exec))) {
       if (/^req-[a-f0-9-]+$/.test(entry) && !active.has(exec.vmId) && !fs.existsSync(path.join(requestsRoot(exec), entry, 'done'))) return { ok: false, reachable: false, code: 'codex_cli_previous_run_unconfirmed', status: 503 }
@@ -103,20 +118,19 @@ export const ensureCodexCli = codexCliHealth
 
 // The request copy deliberately has no rotating refresh token. Refresh is owned by
 // the control plane, never concurrently by an ephemeral CLI and the quota worker.
-export async function refreshCliCredential(projectRoot, vm, { force = false } = {}) {
+export async function refreshCliCredential(projectRoot, vm, { force = false, deadline = Infinity, signal } = {}) {
   if (!supported({ vm })) throw Object.assign(new Error('CLI 固定出口不可用，已停止刷新'), { code: 'codex_cli_proxy_required' })
   return withVmLock(`codex-cli-auth:${path.resolve(projectRoot)}:${vm.id}`, async () => {
+    if (signal?.aborted) throw Object.assign(new Error('CLI 请求已取消，未开始刷新'), { code: 'codex_cli_cancelled' })
+    if (Date.now() >= deadline) throw Object.assign(new Error('CLI 执行预算已用尽，未开始刷新'), { code: 'codex_cli_timeout' })
     const accounts = readCodexAccounts(projectRoot, vm.id)
     if (accounts.length !== 1) throw Object.assign(new Error('Codex CLI 要求每槽恰好一个 OAuth 账号'), { code: 'codex_cli_account_count' })
     let account = accounts[0]
-    let exp = Number(account.expires_at) || 0
-    try { exp = Number(JSON.parse(Buffer.from(account.access_token.split('.')[1], 'base64url')).exp) * 1000 || exp } catch {}
-    if (exp > 0 && exp < 1e12) exp *= 1000
-    if (force || !account.access_token || !exp || exp < Date.now() + TIMEOUT_MS + 60000) {
+    if (force || needsAccessRefresh(account)) {
       if (!account.refresh_token) throw Object.assign(new Error('OAuth 需要刷新；请重新导入含刷新令牌的凭据'), { code: 'codex_cli_refresh_required' })
       const usedRefresh = account.refresh_token
-      const token = await refreshCodexAccessToken({ refreshToken: usedRefresh, proxyUrl: hostProxyUrlForVm(vm), timeoutMs: 15000 })
-      if (!token.ok || !token.access_token) throw Object.assign(new Error('OAuth 刷新失败，请在账号管理中检查凭据'), { code: 'codex_cli_refresh_failed' })
+      const token = await refreshCodexAccessToken({ refreshToken: usedRefresh, proxyUrl: hostProxyUrlForVm(vm), timeoutMs: Math.max(1, Math.min(15000, deadline - Date.now())) })
+      if (!token.ok || !token.access_token) throw Object.assign(new Error('OAuth 刷新失败，请在账号管理中检查凭据'), { code: Date.now() >= deadline ? 'codex_cli_timeout' : 'codex_cli_refresh_failed' })
       const latest = readCodexAccounts(projectRoot, vm.id)[0]
       if (latest?.refresh_token !== usedRefresh) throw Object.assign(new Error('凭据已在其他操作中变化，请重试'), { code: 'codex_cli_credential_changed' })
       upsertCodexAccount(projectRoot, vm.id, { access_token: token.access_token, refresh_token: token.refresh_token || usedRefresh, id_token: token.id_token || account.id_token, expires_at: token.expires_at || account.expires_at })
@@ -167,6 +181,8 @@ export function cancelCodexCli(vmId) {
 }
 
 export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = {}) {
+  const started = Date.now()
+  const deadline = started + TIMEOUT_MS
   let request
   try { request = codexCliRequest(body, rawBody || body) } catch (error) { return errorResult(400, error.code, error.message) }
   if (!supported(exec)) return errorResult(503, 'codex_cli_requires_local_dedicated_docker', 'Codex CLI 需要本机 Docker 与固定非直连出口')
@@ -174,19 +190,20 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
   if (signal?.aborted) return errorResult(499, 'client_cancelled', '请求已取消')
   if (active.has(exec.vmId)) return errorResult(429, 'codex_cli_busy', '此账号的 Codex CLI 正在执行，请稍后重试')
   const root = requestsRoot(exec)
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
-  // Leftovers after a host crash may still be winding down. Never delete a live
-  // child's auth or start another turn while that child's outcome is unknown.
-  for (const entry of fs.readdirSync(root)) {
-    if (!/^req-[a-f0-9-]+$/.test(entry)) continue
-    const old = path.join(root, entry)
-    if (!fs.existsSync(path.join(old, 'done'))) return errorResult(503, 'codex_cli_previous_run_unconfirmed', '上次 CLI 进程尚未确认退出，请检查实例后恢复')
-    fs.rmSync(old, { recursive: true, force: true })
-  }
+  try {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+    // Leftovers after a host crash may still be winding down. Never delete a
+    // live child's auth or start another turn while its outcome is unknown.
+    for (const entry of fs.readdirSync(root)) {
+      if (!/^req-[a-f0-9-]+$/.test(entry)) continue
+      const old = path.join(root, entry)
+      if (!fs.existsSync(path.join(old, 'done'))) return errorResult(503, 'codex_cli_previous_run_unconfirmed', '上次 CLI 进程尚未确认退出，请检查实例后恢复')
+      fs.rmSync(old, { recursive: true, force: true })
+    }
+  } catch { return errorResult(503, 'codex_cli_state_unreadable', 'CLI 请求目录不可用，请在实例中检查并恢复') }
   const id = `req-${crypto.randomUUID()}`
   const dir = path.join(root, id)
   const guest = `/home/kincli/.es2api-requests/${id}`
-  const started = Date.now()
   let failure = null, child, heartbeat, timeout, hardTimeout, cancelTimeout, emitted = false, firstTokenAt = null
   let completed = false, usage = null, text = '', closed = false
   const cancel = code => {
@@ -198,7 +215,7 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
   const abort = () => cancel('client_cancelled')
   signal?.addEventListener('abort', abort, { once: true })
   try {
-    const account = await refreshCliCredential(projectOf(exec), exec.vm)
+    const account = await refreshCliCredential(projectOf(exec), exec.vm, { deadline, signal })
     if (signal?.aborted) return errorResult(499, 'client_cancelled', '请求已取消')
     fs.mkdirSync(dir, { mode: 0o700 })
     fs.mkdirSync(path.join(dir, 'work'), { mode: 0o700 })
@@ -211,19 +228,21 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
       for (const target of [root, dir, path.join(dir, 'work'), path.join(dir, 'home'), path.join(dir, 'home', 'auth.json'), path.join(dir, 'heartbeat')]) fs.chownSync(target, uid, gid)
     }
     if (signal?.aborted || failure) return errorResult(499, 'client_cancelled', '请求已取消')
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return errorResult(504, 'codex_cli_timeout', 'CLI 执行预算已用尽，未启动推理')
     const argv = [CODEX_CLI_CONTAINER_BIN, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only', '-C', `${guest}/work`, '-m', request.model]
     for (const feature of ['shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_host', 'browser_use', 'browser_use_external', 'computer_use', 'image_generation', 'memories', 'hooks', 'in_app_browser', 'in_app_local_automation', 'in_app_chat', 'workspace_dependencies', 'goals']) argv.push('--disable', feature)
     for (const config of ['web_search="disabled"', 'cli_auth_credentials_store="file"', 'model_provider="openai"', 'model_providers.openai.request_max_retries=0', 'model_providers.openai.stream_max_retries=0', 'model_providers.openai.supports_websockets=false', 'mcp_servers={}', 'analytics.enabled=false', 'feedback.enabled=false']) argv.push('-c', config)
     if (request.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(request.effort)}`)
     argv.push('-c', `developer_instructions=${JSON.stringify(request.instructions || 'Respond to the supplied user input with text. Do not invoke tools.')}`, '-')
-    const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(TIMEOUT_MS / 1000), ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
+    const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(Math.max(1, Math.floor(remaining / 1000))), ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
     child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     child.stdin.on('error', () => {})
     child.stdin.end(request.prompt)
     child.stderr.resume() // Never persist raw CLI diagnostics or upstream error bodies.
     heartbeat = setInterval(() => { try { const now = new Date(); fs.utimesSync(path.join(dir, 'heartbeat'), now, now) } catch {} }, 3000)
-    timeout = setTimeout(() => cancel('codex_cli_timeout'), TIMEOUT_MS)
-    hardTimeout = setTimeout(() => { cancel('codex_cli_timeout'); clearInterval(heartbeat); child.kill() }, TIMEOUT_MS + 30000)
+    timeout = setTimeout(() => cancel('codex_cli_timeout'), remaining)
+    hardTimeout = setTimeout(() => { cancel('codex_cli_timeout'); clearInterval(heartbeat); child.kill() }, remaining + 30000)
     let bytes = 0, pending = '', queue = Promise.resolve()
     const decoder = new StringDecoder('utf8')
     const responseId = `resp_cli_${crypto.randomUUID().replaceAll('-', '')}`
@@ -250,11 +269,12 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
       }
       if (event.type === 'turn.completed') {
         if (completed || !Number.isSafeInteger(event.usage?.input_tokens) || !Number.isSafeInteger(event.usage?.output_tokens)) { cancel('codex_cli_usage_missing'); return }
+        const input = event.usage.input_tokens, output = event.usage.output_tokens, cached = event.usage.cached_input_tokens ?? 0
+        const reasoning = event.usage.reasoning_output_tokens
+        if (input < 0 || output < 0 || !Number.isSafeInteger(input + output) || !Number.isSafeInteger(cached) || cached < 0 || cached > input || (reasoning != null && (!Number.isSafeInteger(reasoning) || reasoning < 0 || reasoning > output))) { cancel('codex_cli_usage_invalid'); return }
         completed = true
-        const input = event.usage.input_tokens, output = event.usage.output_tokens, cached = event.usage.cached_input_tokens || 0
-        if (input < 0 || output < 0 || !Number.isSafeInteger(cached) || cached < 0 || cached > input) { cancel('codex_cli_usage_invalid'); return }
         usage = { input_tokens: input, output_tokens: output, total_tokens: input + output, input_tokens_details: { cached_tokens: cached } }
-        if (Number.isSafeInteger(event.usage.reasoning_output_tokens)) usage.output_tokens_details = { reasoning_tokens: event.usage.reasoning_output_tokens }
+        if (reasoning != null) usage.output_tokens_details = { reasoning_tokens: reasoning }
       }
     }
     child.stdout.on('data', chunk => {
@@ -286,14 +306,18 @@ export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = 
     await emit({ type: 'response.completed', response })
     return { ok: true, status: 200, committed: true, terminalState: 'verified', body: response, usage, firstTokenAt, ttftMs: firstTokenAt - started }
   } catch (error) {
-    cancel('codex_cli_execution_failed')
+    const code = failure || (/^codex_cli_[a-z_]+$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed')
+    cancel(code)
     // Do not expose spawn stderr, paths, argv, auth or network diagnostics.
-    return { ...errorResult(503, /^codex_cli_[a-z_]+$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed', 'Codex CLI 准备或执行失败，请检查实例与 OAuth 状态'), committed: emitted }
+    return { ...errorResult(code === 'codex_cli_timeout' ? 504 : signal?.aborted || code === 'codex_cli_cancelled' || code === 'client_cancelled' ? 499 : 503, code, 'Codex CLI 准备或执行失败，请检查实例与 OAuth 状态'), committed: emitted, usage, firstTokenAt, ttftMs: firstTokenAt == null ? null : firstTokenAt - started }
   } finally {
     clearInterval(heartbeat); clearTimeout(timeout); clearTimeout(hardTimeout); clearTimeout(cancelTimeout)
     signal?.removeEventListener('abort', abort)
     active.delete(exec.vmId)
     // A crashed Docker client is not proof the in-container process exited.
-    if (!child || (closed && fs.existsSync(path.join(dir, 'done')))) fs.rmSync(dir, { recursive: true, force: true })
+    if (!child || (closed && fs.existsSync(path.join(dir, 'done')))) {
+      try { fs.rmSync(dir, { recursive: true, force: true }) }
+      catch { console.warn('[codex-cli] completed_request_cleanup_failed') }
+    }
   }
 }

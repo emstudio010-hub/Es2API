@@ -119,7 +119,10 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm)) {
     if (isCodexCliVm(vm)) {
       const health = await ensureCodexCli(slotExec(projectRoot, vm), { timeoutMs: opts.timeoutMs })
-      return { ...health, engine: 'codex-cli', ...(!health.ok ? { error: health.code === 'codex_cli_identity_required' ? 'CLI 需要包含 id_token、账号 ID 和访问/刷新令牌的完整 OAuth' : '容器内 CLI 未就绪，请检查 payload、固定出口及执行状态' } : {}) }
+      const message = health.code === 'codex_cli_identity_required' ? 'CLI 需要包含 id_token、账号 ID 和访问/刷新令牌的完整 OAuth'
+        : health.code === 'codex_cli_refresh_required' ? 'OAuth 即将过期且没有刷新令牌，请重新导入完整 OAuth'
+          : '容器内 CLI 未就绪，请检查 payload、固定出口及执行状态'
+      return { ...health, engine: 'codex-cli', ...(!health.ok ? { error: message } : {}) }
     }
     if (!eager) return { ok: true, skipped: true, reason: 'eager_start_off', engine: 'codex' }
     const write = opts.ops?.writeCodexKernelConfig || writeCodexKernelConfig
