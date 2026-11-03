@@ -102,7 +102,7 @@ function needsAccessRefresh(account) {
 export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
   if (!supported(exec)) return { ok: false, reachable: false, code: 'codex_cli_requires_local_dedicated_docker' }
   try { assertCodexCredentialNotHandingOff(projectOf(exec), exec.vm.id) }
-  catch { return { ok: false, reachable: false, status: 409, code: 'codex_credential_handoff_pending' } }
+  catch (error) { return { ok: false, reachable: false, status: 409, code: error.code || 'codex_credential_unavailable' } }
   const payload = inspectCodexCliPayload()
   if (!payload.ok) return { ok: false, reachable: false, code: payload.code }
   const accounts = readCodexAccounts(projectOf(exec), exec.vm.id)

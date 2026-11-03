@@ -414,6 +414,9 @@ async function commitImportedCodexVm({
 }) {
   const preserved = await withCodexCredentialLock(cfg.paths.project, existing.id, async () => {
     existing = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    if (existing.integration_binding?.account_id && !ifMissing) {
+      throw Object.assign(new Error('独立账号池不能通过旧执行槽入口替换 OAuth，请从账号管理维护'), { status: 409, code: 'account_pool_managed' })
+    }
     if (ifMissing) {
       assertCodexIntegrationBinding(existing, expectedBinding)
       const current = readCodexAccountsStrict(cfg.paths.project, existing.id)
@@ -569,7 +572,7 @@ async function syncInstalledKernels({
   if (traits) {
     for (const vm of localVms) {
       if (isCodexVm(vm)) continue
-      const gone = await destroySlot(vm)
+      const gone = await destroySlot(vm, project)
       if (!gone.ok) {
         const item = (local.items || []).find((row) => row.id === vm.id)
         if (item) {
@@ -3344,7 +3347,7 @@ export function createPanelHandler(ctx) {
         if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
         try {
           if (vm) {
-            const gone = await destroySlot(vm)
+            const gone = await destroySlot(vm, cfg.paths.project)
             // Local slots also retain credentials when Docker cannot confirm removal.
             if (!gone.ok) {
               return json(res, 409, {
@@ -3400,8 +3403,9 @@ export function createPanelHandler(ctx) {
         return await withVmLock(vmPath, async () => {
           if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          if (prev.integration_binding?.account_id) return json(res, 409, { ok: false, error: { code: 'account_pool_managed', message: '独立账号池实例请通过账号池运行设置重建；不能在旧执行槽入口重置归属' } })
           if (prev.credential_handoff) return json(res, 409, { ok: false, error: { code: 'codex_credential_handoff_pending', message: '凭据正在交接，请通过账号池重试完成重建' } })
-          const gone = await destroySlot(prev)
+          const gone = await destroySlot(prev, cfg.paths.project)
           if (!gone.ok) {
             return json(res, 500, { ok: false, error: { message: gone.error || 'destroy failed', code: gone.code } })
           }
@@ -3496,7 +3500,9 @@ export function createPanelHandler(ctx) {
             return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
           }
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          if (prev.integration_binding?.account_id) return json(res, 409, { ok: false, error: { code: 'account_pool_managed', message: '独立账号池凭据请通过账号管理维护；不能在旧执行槽入口清除账号' } })
           if (prev.credential_handoff) return json(res, 409, { ok: false, error: { code: 'codex_credential_handoff_pending', message: '凭据正在交接，不能清除凭据' } })
+          if (prev.codex_shutdown) return json(res, 409, { ok: false, error: { code: 'codex_shutdown_pending', message: '停机或删除尚未解除，不能清除凭据' } })
           prev.id = prev.id || id
           if (isCodexCliVm(prev) && cancelCodexCli(id)) return json(res, 409, { ok: false, error: { code: 'codex_cli_busy', message: 'CLI 正在退出，请等待执行结束后清除凭据' } })
           const slotDir = path.join(cfg.paths.project, 'vms', id)
@@ -3786,7 +3792,7 @@ export function createPanelHandler(ctx) {
           )
         }
         if (mode === 'traits') {
-          const gone = await destroySlot(vm)
+          const gone = await destroySlot(vm, cfg.paths.project)
           if (!gone.ok)
             return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
           const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
@@ -4430,8 +4436,8 @@ export function createPanelHandler(ctx) {
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
         if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const halt = await stopSlot(vm)
-        if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
+        const halt = await stopSlot(vm, cfg.paths.project)
+        if (!halt.ok) return json(res, 409, { ok: false, error: { code: halt.code || 'slot_stop_unconfirmed', message: halt.error || 'runtime stop failed' } })
         vm.status = 'stopped'
         vm.schedulable = false
         vm.schedule_disabled_reason = 'stopped'

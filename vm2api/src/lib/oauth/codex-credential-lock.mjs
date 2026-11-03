@@ -2,22 +2,25 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { withVmLock, isValidVmId } from '../vm/vm-file.mjs'
 
-export function assertCodexCredentialNotHandingOff(projectRoot, vmId) {
+export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown = false } = {}) {
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   if (vm.credential_handoff) throw Object.assign(new Error('凭据正在交接给重建任务；请重试完成重建'), {
     status: 409, code: 'codex_credential_handoff_pending',
   })
+  if (!allowShutdown && vm.codex_shutdown) throw Object.assign(new Error('实例已进入停机或删除流程；请完成操作后显式启动'), {
+    status: 409, code: 'codex_shutdown_pending',
+  })
   return vm
 }
 
 // All host-side Codex token exchanges and writes use this same key. The kernel
 // is stopped and confirmed before a handoff snapshot is read under this lock.
-export function withCodexCredentialLock(projectRoot, vmId, operation, { allowHandoff = false } = {}) {
+export function withCodexCredentialLock(projectRoot, vmId, operation, { allowHandoff = false, allowShutdown = false } = {}) {
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
   return withVmLock(`codex-credentials:${path.resolve(projectRoot)}:${vmId}`, () => {
-    if (!allowHandoff) assertCodexCredentialNotHandingOff(projectRoot, vmId)
+    if (!allowHandoff) assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown })
     return operation()
   })
 }

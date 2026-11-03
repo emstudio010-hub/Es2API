@@ -28,7 +28,16 @@ export async function stopCodexKernelForCheckpoint(projectRoot, vmId, binary) {
       // authority to signal them. Only an exact config argv is considered.
       let argv
       try { argv = fs.readFileSync(`/proc/${pidText}/cmdline`, 'utf8').split('\0') }
-      catch (error) { if (['ENOENT', 'ESRCH', 'EACCES'].includes(error.code)) continue; throw error }
+      catch (error) {
+        if (['ENOENT', 'ESRCH'].includes(error.code)) continue
+        if (error.code === 'EACCES') {
+          // An unreadable process belonging to this service could be ours;
+          // skipping it cannot establish that the slot kernel has exited.
+          try { if (fs.statSync(`/proc/${pidText}`).uid !== process.getuid()) continue }
+          catch (gone) { if (['ENOENT', 'ESRCH'].includes(gone.code)) continue; throw gone }
+        }
+        throw error
+      }
       if (!argv.includes(config)) continue
       const current = identity(Number(pidText))
       if (!current) continue

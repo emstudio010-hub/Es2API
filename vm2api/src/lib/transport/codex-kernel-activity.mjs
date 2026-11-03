@@ -43,12 +43,15 @@ export async function withCodexKernelActivity(projectRoot, vmId, operation) {
     cleanup(key, state)
   }
 }
-export async function withCodexKernelPause(projectRoot, vmId, operation, { timeoutMs = 15000 } = {}) {
+export async function withCodexKernelPause(projectRoot, vmId, operation, { timeoutMs = 15000, beforeDrain } = {}) {
   const { key, state } = entry(projectRoot, vmId)
   if (state.paused) throw busy()
   state.paused = true
   let timer
   try {
+    // Explicit stop/delete may cancel the owned processes after blocking new
+    // readers. Token refresh leaves this unset and never interrupts readers.
+    if (beforeDrain) await beforeDrain()
     if (state.readers.size) await new Promise((resolve, reject) => {
       state.drained = resolve
       timer = setTimeout(() => reject(busy()), Math.max(1, Math.min(15000, Number(timeoutMs) || 15000)))

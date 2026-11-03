@@ -262,7 +262,9 @@ export function persistCodexUsage(
  */
 export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), policy = null } = {}) {
   if (!projectRoot || !vm?.id) return { action: 'keep', reason: null }
-  if (getVm(projectRoot, vm.id)?.credential_handoff || vm.credential_handoff) return { action: 'keep', reason: 'credential_handoff' }
+  const current = getVm(projectRoot, vm.id)
+  if (current?.credential_handoff || vm.credential_handoff) return { action: 'keep', reason: 'credential_handoff' }
+  if (current?.codex_shutdown || vm.codex_shutdown) return { action: 'keep', reason: 'codex_shutdown' }
   const ev = evaluateCodexQuotaSchedule(vm, now, policy)
   const file = path.join(projectRoot, 'vms', `${vm.id}.json`)
   const leftover = isLeftoverQuotaScheduleOff(vm)
@@ -474,7 +476,7 @@ export function vmHasClaudeCredential(vm) {
  */
 export function vmHasSchedulableCredential(vm, projectRoot = null) {
   if (!vm) return false
-  if (vm.credential_handoff) return false
+  if (vm.credential_handoff || vm.codex_shutdown) return false
   if (!isCodexVm(vm)) {
     if (!vmHasClaudeCredential(vm)) return false
     // An expired access token with a recorded refresh failure is not a live
@@ -494,6 +496,7 @@ export function vmHasSchedulableCredential(vm, projectRoot = null) {
  */
 export function isVmScheduleReady(vm, { allowMissingCredential = false } = {}) {
   if (!vm) return false
+  if (vm.credential_handoff || vm.codex_shutdown) return false
   if (vm.schedulable === false && !isLeftoverQuotaScheduleOff(vm)) return false
   if (!allowMissingCredential && !vmHasClaudeCredential(vm)) return false
   const status = String(vm.status || '').toLowerCase()
@@ -512,7 +515,7 @@ export function setVmSchedulable(
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   const src = source === 'manual' || source === 'force' ? source : 'auto'
-  if (schedulable && vm.credential_handoff) return summarizeVm(vm)
+  if (schedulable && (vm.credential_handoff || vm.codex_shutdown)) return summarizeVm(vm)
   if (src === 'auto' && isManualScheduleLocked(vm)) return summarizeVm(vm)
   if (src === 'manual') vm.schedule_manual = true
   vm.schedulable = !!schedulable

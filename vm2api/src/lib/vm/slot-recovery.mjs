@@ -373,7 +373,16 @@ export async function diagnoseSlotServices(
 export async function powerOnSlot(args) {
   const vm = getVm(args.projectRoot, args.id)
   if (!vm || !isCodexVm(vm)) return powerOnSlotUnlocked(args)
-  try { return await withCodexCredentialLock(args.projectRoot, args.id, () => powerOnSlotUnlocked(args)) }
+  try { return await withCodexCredentialLock(args.projectRoot, args.id, () => {
+    const current = getVm(args.projectRoot, args.id)
+    const shutdown = current?.codex_shutdown
+    if (shutdown) {
+      if (shutdown.action !== 'stop' || shutdown.confirmed !== true) return { ok: false, status: 409,
+        code: shutdown.action === 'delete' ? 'codex_delete_pending' : 'codex_shutdown_unconfirmed', error: '请先重试完成原停机或删除操作' }
+      patchVmRecord(args.projectRoot, args.id, record => { delete record.codex_shutdown })
+    }
+    return powerOnSlotUnlocked(args)
+  }, { allowShutdown: true }) }
   catch (error) {
     if (error.code !== 'codex_credential_handoff_pending') throw error
     return { ok: false, status: 409, code: error.code, error: error.message }
@@ -463,9 +472,10 @@ const recovering = new Set()
 
 /**
  * Operator power cycle: stop → boot, with the watchdog held off the VM. The
- * record keeps its running intent across the stop, so a failed boot is still
- * picked up by automatic recovery. Afterwards the watchdog budget is reset and
- * the slot re-diagnosed.
+ * Non-Codex records keep their running intent across the stop. Local Codex
+ * records persist a stop intent until an explicit start after confirmed exit;
+ * an unconfirmed shutdown must not be picked up by automatic recovery.
+ * Afterwards the watchdog budget is reset and the slot re-diagnosed.
  */
 export async function recoverSlot({
   projectRoot,
@@ -541,7 +551,7 @@ export async function recoverSlot({
     }
     if (proceed) {
       proceed = await step('stop', async () => {
-        const halted = await stop(vm)
+        const halted = await stop(vm, projectRoot, { cliRecovery: isCodexCliVm(vm) })
         if (!halted?.ok) return { ok: false, code: 'stop_failed', message: halted?.error || '关机失败' }
         return { ok: true, message: STOP_MESSAGES[halted.action] || '已关机' }
       })
