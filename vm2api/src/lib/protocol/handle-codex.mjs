@@ -2,6 +2,8 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
+import { queueKeepaliveDelayMs } from '../core/config.mjs'
+import { registerCommittedJsonHandler } from '../http/respond.mjs'
 import { integrationDispatchRules, applyIntegrationDispatch } from '../pool/integration-dispatch.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
@@ -529,22 +531,22 @@ export function reasoningHistoryFallback(args, result) {
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback, allowRetry = true } = {}) {
+export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback, allowRetry = true, canRetry = () => true } = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
     if (onEvent) await onEvent(line)
   }
   let result = await hop({ ...args, onEvent: wrapped })
-  if (!allowRetry) return result
+  if (!allowRetry || args.signal?.aborted || !canRetry()) return result
   if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
     result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
   }
-  const fallback = !emitted && !result?.transport_retried ? reasoningHistoryFallback(args, result) : null
+  const fallback = !emitted && !result?.transport_retried && canRetry() ? reasoningHistoryFallback(args, result) : null
   if (fallback) {
     if (onReasoningFallback)
       await onReasoningFallback({ originalResult: result, body: fallback.args.body, ...fallback.info })
-    if (args.signal?.aborted) return result
+    if (args.signal?.aborted || !canRetry()) return result
     result = {
       ...(await hop({ ...fallback.args, onEvent: wrapped })),
       reasoning_history_retried: true,
@@ -574,6 +576,8 @@ export async function handleCodexProtocol({
   requestStartedAt = Date.now(),
   accountGate = null,
   ownerScope = null,
+  streamKeepaliveMs = 10_000,
+  queueKeepaliveDelay = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -683,8 +687,44 @@ export async function handleCodexProtocol({
   let attempts = 0
   let switches = 0
   let counted = false
-  let cliKeepalive = null
+  let downstreamKeepalive = null
+  let failureSent = false
+  const sendStreamFailure = (status, body) => {
+    downstreamKeepalive?.stop()
+    if (failureSent || gone.signal.aborted || res.destroyed || res.writableEnded) return
+    failureSent = true
+    logBag.inference_completed = false
+    logBag.upstream_status = Number(status) || 502
+    const error = body?.error || { type: 'api_error', code: 'codex_upstream', message: 'Codex request failed' }
+    logBag.error_code = error.code || 'codex_upstream'
+    if (!logBag.final_state) logBag.final_state = 'failed'
+    if (!res.headersSent) writeSSEHeaders(res)
+    // Once a keepalive committed 200, preserve the real failure status in the
+    // event. No response.completed, message_stop or finish_reason is invented.
+    const payload = protocol === 'openai.responses'
+      ? { type: 'error', code: error.code || 'codex_upstream', message: error.message || 'Codex request failed', param: error.param ?? null, error, status }
+      : { type: 'error', error, status }
+    res.end(protocol === 'openai.chat' || protocol === 'openai.completions'
+      ? `data: ${JSON.stringify({ error, status })}\n\ndata: [DONE]\n\n`
+      : `event: error\ndata: ${JSON.stringify(payload)}\n\n`)
+  }
+  if (stream) registerCommittedJsonHandler(res, sendStreamFailure)
+  const stopKeepalive = () => downstreamKeepalive?.stop()
+  gone.signal.addEventListener('abort', stopKeepalive, { once: true })
   try {
+    if (stream) {
+      downstreamKeepalive = createDownstreamKeepalive({ intervalMs: streamKeepaliveMs, protocol, write: chunk => {
+        if (gone.signal.aborted || res.writableEnded || res.destroyed) {
+          downstreamKeepalive?.stop()
+          return false
+        }
+        if (res.writableNeedDrain) return false
+        if (!res.headersSent) writeSSEHeaders(res)
+        res.write(chunk)
+        return true
+      } })
+      downstreamKeepalive.armAfter(queueKeepaliveDelay ?? queueKeepaliveDelayMs(routing))
+    }
     for (;;) {
       const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
       const picked = admitted.picked
@@ -744,7 +784,9 @@ export async function handleCodexProtocol({
       // means the 403 is already written.
       if (accountGate) {
         logBag.vm_id = vm.id
-        const blocked = await accountGate(scopeAccountFromVm(vm))
+        let blocked
+        try { blocked = await accountGate(scopeAccountFromVm(vm)) }
+        catch (error) { lease.release(); throw error }
         if (blocked) {
           lease.release()
           return
@@ -777,6 +819,8 @@ export async function handleCodexProtocol({
       }
       let attemptKind = 'failed'
       try {
+        if (gone.signal.aborted) { logBag.final_state = 'cancelled'; return }
+        downstreamKeepalive?.arm()
         const localExit = isLocalEgressProxy(vm.proxy)
         const written = cli ? null : writeCfg(projectRoot, vm, {
           // Same rule as slot start: a node on local egress must leave through
@@ -786,6 +830,7 @@ export async function handleCodexProtocol({
           routing,
         })
         const ready = await (cli ? ensureCodexCli : ensure)(execFor(projectRoot, vm))
+        if (gone.signal.aborted) { logBag.final_state = 'cancelled'; return }
         if (!ready?.ok) {
           // Kernel init failed: this seat goes back and the next candidate is re-admitted.
           last = {
@@ -807,7 +852,7 @@ export async function handleCodexProtocol({
             continue
           }
           stats.errors++
-          logBag.error_code = 'codex_kernel_unavailable'
+          logBag.error_code = last.body.error.code
           return json(res, 503, last.body)
         }
         hops += 1
@@ -851,18 +896,11 @@ export async function handleCodexProtocol({
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         let hopEmitted = false
-        if (cli && stream) {
-          cliKeepalive = createDownstreamKeepalive({ protocol, write: chunk => {
-            if (gone.signal.aborted || res.writableEnded || res.destroyed) return
-            if (!res.headersSent) writeSSEHeaders(res)
-            res.write(chunk)
-          } })
-          cliKeepalive.arm()
-        }
         const runHop = () =>
           runCodexKernelHop({
             hop: cli ? streamCodexCli : hop,
             allowRetry: !internalModeltrace && !cli,
+            canRetry: () => !res.headersSent && !gone.signal.aborted,
             args: {
               exec: execFor(projectRoot, vm),
               signal: gone.signal,
@@ -883,14 +921,14 @@ export async function handleCodexProtocol({
             onEvent: async (line) => {
               hopEmitted = true
               const event = parseSseData(line).event
-              cliKeepalive?.observeLine(line)
+              downstreamKeepalive?.observeLine(line)
               if (event) {
                 if (['response.incomplete', 'response.failed', 'response.cancelled', 'error'].includes(event.type) || event.error ||
                     ['incomplete', 'failed', 'cancelled'].includes(event.response?.status) || event.response?.error) responseTerminal = 'failed'
                 else if (event.type === 'response.completed' || event.response?.status === 'completed') responseTerminal =
                   !event.response?.status || event.response.status === 'completed' ? 'completed' : 'failed'
               }
-              if (responseTerminal) cliKeepalive?.stop()
+              if (responseTerminal) downstreamKeepalive?.stop()
               const tier = serviceTierFromSseLine(line)
               if (tier) responseServiceTier = tier
               const seen = usageFromSseLine(line)
@@ -902,6 +940,7 @@ export async function handleCodexProtocol({
                 chunks.push(line)
                 return
               }
+              if (gone.signal.aborted || res.destroyed || res.writableEnded) return
               if (!res.headersSent) writeSSEHeaders(res)
               if (protocol !== 'openai.responses') {
                 try {
@@ -913,6 +952,7 @@ export async function handleCodexProtocol({
                 } catch (error) {
                   if (error.code !== 'tool_arguments_mismatch' && !isCodexChatStreamError(error)) throw error
                   conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                  downstreamKeepalive?.stop()
                   res.write(
                     protocol === 'anthropic.messages'
                       ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
@@ -926,7 +966,7 @@ export async function handleCodexProtocol({
             },
           })
         let result = await runHop()
-        cliKeepalive?.stop()
+        downstreamKeepalive?.endAttempt()
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
@@ -940,12 +980,13 @@ export async function handleCodexProtocol({
             signal: gone.signal,
           })
         ) {
+          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
+          if (res.headersSent || gone.signal.aborted) break
           sameAccountRetries += 1
           attempts += 1
           hops += 1
           logBag.attempt_count = hops
           logBag.codex_same_account_retried = sameAccountRetries
-          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
           hopEmitted = false
           result = await runHop()
         }
@@ -958,6 +999,7 @@ export async function handleCodexProtocol({
           catch (error) {
             if (!isCodexChatStreamError(error)) throw error
             conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+            downstreamKeepalive?.stop()
             if (!gone.signal.aborted && !res.destroyed && !res.writableEnded) {
               if (!res.headersSent) writeSSEHeaders(res)
               res.write(`data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`)
@@ -1035,7 +1077,8 @@ export async function handleCodexProtocol({
           logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
           if (!stream) return json(res, 200, body)
           if (!res.headersSent) writeSSEHeaders(res)
-          return res.end()
+          if (!res.writableEnded && !res.destroyed) return res.end()
+          return
         }
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = codexFailureHold(result)
@@ -1043,16 +1086,12 @@ export async function handleCodexProtocol({
         // Buffered non-streaming events have not committed an HTTP response.
         // A failed hop must still return its structured error and status.
         if (res.headersSent || (stream && hopEmitted)) {
-          if (cli && stream && !responseTerminal && !gone.signal.aborted && !res.destroyed && !res.writableEnded) {
-            const error = result?.body?.error || { type: 'api_error', code: 'codex_cli_incomplete', message: 'Codex CLI did not complete' }
-            res.write(protocol === 'openai.responses'
-              ? `event: error\ndata: ${JSON.stringify({ type: 'error', error })}\n\n`
-              : `data: ${JSON.stringify({ error })}\n\ndata: [DONE]\n\n`)
-          }
+          if (stream && !responseTerminal && !conversionError) sendStreamFailure(result?.status || 502, result?.body)
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
-          return res.end()
+          if (!res.writableEnded && !res.destroyed) return res.end()
+          return
         }
         if (!cli && isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
@@ -1063,8 +1102,7 @@ export async function handleCodexProtocol({
         }
         break
       } finally {
-        cliKeepalive?.stop()
-        cliKeepalive = null
+        downstreamKeepalive?.endAttempt()
         lease.release()
         if (claimsWindow) {
           try {
@@ -1074,7 +1112,8 @@ export async function handleCodexProtocol({
       }
     }
   } finally {
-    cliKeepalive?.stop()
+    downstreamKeepalive?.stop()
+    gone.signal.removeEventListener('abort', stopKeepalive)
     gone.settle()
   }
   stats.errors++
@@ -1141,26 +1180,27 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
     // Queue-full has no retryAt. Every Codex pool_overloaded 429 still advertises >= 1s.
     const waitMs = Number(picked.retryAt) - Date.now()
     const retryAfterSec = Math.max(1, waitMs > 0 ? Math.ceil(waitMs / 1000) : 0)
-    res.setHeader?.('retry-after', String(retryAfterSec))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(retryAfterSec))
     return json(res, 429, {
       error: {
         type: 'rate_limit_error',
         code: 'pool_overloaded',
         message: CLIENT_POOL_BUSY_MESSAGE,
-        details: { reason: picked.error },
+        details: { reason: picked.error, retry_after_seconds: retryAfterSec },
       },
     })
   }
   if (picked.error === 'pool_resting') {
     // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
     const waitMs = Number(picked.retryAt) - Date.now()
-    res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
+    const retryAfterSec = Math.max(1, Math.ceil(waitMs / 1000) || 1)
+    if (!res.headersSent) res.setHeader?.('retry-after', String(retryAfterSec))
     return json(res, 503, {
       error: {
         type: 'api_error',
         code: ErrorCode.POOL_UNAVAILABLE,
         message: CLIENT_POOL_UNAVAILABLE_MESSAGE,
-        details: { reason: 'pool_resting' },
+        details: { reason: 'pool_resting', retry_after_seconds: retryAfterSec },
       },
     })
   }

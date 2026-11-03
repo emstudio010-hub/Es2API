@@ -136,7 +136,7 @@ export function resolveKeepaliveChunk({ protocol = 'anthropic.messages', userAge
 }
 
 /**
- * @param {{ intervalMs?: number, userAgent?: string, protocol?: string, write: (chunk: string) => void }} opts
+ * @param {{ intervalMs?: number, userAgent?: string, protocol?: string, write: (chunk: string) => (void | boolean) }} opts
  */
 export function createDownstreamKeepalive({
   intervalMs = DEFAULT_STREAM_KEEPALIVE_MS,
@@ -172,7 +172,10 @@ export function createDownstreamKeepalive({
     if (!due()) return
     if (typeof write !== 'function') return
     try {
-      write(resolveKeepaliveChunk({ protocol, userAgent, state }))
+      // false means skipped (e.g. a previous write still awaits drain).
+      // Callers using Node res.write must not return its backpressure boolean:
+      // even false there means that Node accepted and buffered the chunk.
+      if (write(resolveKeepaliveChunk({ protocol, userAgent, state })) === false) return
       written = true
       markWrite()
     } catch {

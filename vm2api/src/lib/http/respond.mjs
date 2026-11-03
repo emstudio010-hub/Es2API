@@ -15,6 +15,22 @@ function requestFromResponse(res) {
   return res?.req || res?._kinReq || null
 }
 
+// Only explicitly registered protocol requests may translate a late JSON
+// failure into SSE. Weak keys and response lifecycle cleanup prevent reuse.
+const committedJsonHandlers = new WeakMap()
+
+export function registerCommittedJsonHandler(res, handler) {
+  if (committedJsonHandlers.has(res)) throw new Error('Response already has a committed JSON handler')
+  committedJsonHandlers.set(res, handler)
+  const cleanup = () => {
+    committedJsonHandlers.delete(res)
+    res.removeListener?.('finish', cleanup)
+    res.removeListener?.('close', cleanup)
+  }
+  res.once?.('finish', cleanup)
+  res.once?.('close', cleanup)
+}
+
 function collectBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []
@@ -126,6 +142,9 @@ export function createRespond(cfg, options = {}) {
   }
 
   function json(res, status, body) {
+    if (res.writableEnded || res.destroyed) return
+    const committed = committedJsonHandlers.get(res)
+    if (res.headersSent && committed) return committed(status, body)
     const data = JSON.stringify(body)
     const headers = corsHeadersForRequest(requestFromResponse(res), {
       'content-type': 'application/json; charset=utf-8',

@@ -281,7 +281,7 @@ export function createHandleProtocol(deps) {
   }
 
   function sendMapped(res, mapped) {
-    if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+    if (mapped.retryAfterSec && !res.headersSent) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
     return json(res, mapped.status, mapped.body)
   }
 
@@ -749,6 +749,8 @@ export function createHandleProtocol(deps) {
     if (platform.platform === 'openai') {
       const routing = getRouting() || {}
       const codexSticky = {
+        streamKeepaliveMs: Number(routing?.failover?.stream_keepalive_ms ?? cfg.limits?.stream_keepalive_ms ?? 10_000),
+        queueKeepaliveDelay: queueKeepaliveDelayMs(routing, cfg.limits?.queue_keepalive_delay_ms),
         requestStartedAt: logCtx.t0,
         stickyRouter,
         sessions: accountQuota?.sessions || null,
