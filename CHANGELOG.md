@@ -1,5 +1,12 @@
 # 变更记录
 
+## 2026.11.04-preview.13 — 工具历史与WS响应归属
+
+- Kernel Chat补齐custom工具定义/指定与allowed_tools选择：Chat嵌套结构转为Responses平铺结构，grammar由嵌套转为平铺，保留原始input、format和function strict。
+- 历史assistant工具调用按call id记录类型，tool结果生成对应function_call_output/custom_tool_call_output；未知、重复、矛盾ID及缺失custom input明确拒绝，不丢弃或猜成function。保留assistant refusal、parallel_tool_calls和service_tier。
+- API账号在调度/供应商调用前拒绝多choice；其Anthropic中间格式无法保留custom原文，因此明确api_bridge_custom_tool_unsupported。API Responses桥接改用共享历史转换，保留规范function调用和结果，异常历史在上游调用前报错。
+- WS每轮首次response id先在事务中独占登记，拒绝当前caller/group范围内24小时索引里已知响应；同一连接另保留最多4096个ID摘要，不复用旧ID，满额关闭连接。双重ID矛盾、无身份的输出帧报协议错。
+
 ## 2026.11.04-preview.12 — 流式Chat与WS逐轮租约
 
 - 流式Chat改用独立有界状态，正文/refusal/function参数分别传递并与最终输出核对，稳定唯一id/created/model；缺少终止、前缀冲突或未知可见输出不能成功，保留已知用量。

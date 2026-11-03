@@ -20,6 +20,7 @@ import { finishChatSse, isCodexChatStreamError } from '../protocol/codex-chat-st
 import { codexBodyToChatCompletion, isCodexChatResponseError } from '../protocol/codex-chat-response.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
+import { hasCustomChatTools, isCodexChatInputError } from '../protocol/codex-chat-input.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind !== 'managed') return 'oauth'
@@ -216,6 +217,12 @@ export async function runApiInference({
   converters,
   requestContext = null,
 } = {}) {
+  const rejectInput = code => ({ ok: false, status: 400, via: 'api-kernel', terminalState: 'rejected',
+    body: { error: { type: 'invalid_request_error', code, message: 'This API bridge cannot preserve the requested choices or tool input.' } } })
+  // Neither bridge produces multiple choices. Reject before scheduler/provider
+  // work; the Anthropic intermediate cannot preserve Chat custom raw strings.
+  if (['openai.chat', 'openai.completions'].includes(protocol) && inbound?.n != null && inbound.n !== 1) return rejectInput('api_bridge_n_unsupported')
+  if (protocol === 'openai.chat' && hasCustomChatTools(inbound)) return rejectInput('api_bridge_custom_tool_unsupported')
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
   const picked = scheduler.pick(model)
@@ -248,9 +255,15 @@ export async function runApiInference({
       },
     }
   }
-  const body = isOpenAI
-    ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
-    : { ...canonical, model: picked.upstream_model, stream: true }
+  let body
+  try {
+    body = isOpenAI
+      ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
+      : { ...canonical, model: picked.upstream_model, stream: true }
+  } catch (error) {
+    if (!isCodexChatInputError(error)) throw error
+    return rejectInput(error.code)
+  }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
   const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind)
   const headers = mergeCallerProtocolHeaders(

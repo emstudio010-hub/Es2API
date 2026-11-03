@@ -17,6 +17,7 @@ export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, i
       let upstream, pinnedAccount, context, turn = null, closed = false, connecting = false
       let lastActivity = Date.now()
       const fallback = crypto.randomUUID()
+      const claimedIdentities = new Set()
       const release = outcome => {
         const current = turn
         if (!current) return
@@ -93,7 +94,12 @@ export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, i
           if (context && context.session !== next.session) throw new Error('Session changed')
           const lease = isolation.select(next, currentGroup, accountPool, pinnedAccount)
           // Establish ownership before operations that can throw after acquire.
-          turn = { lease, context: next, observer: createResponseTurnObserver(), pendingWrites: 0, terminal: null, cancelled: false, timer: null }
+          turn = { lease, context: next, observer: createResponseTurnObserver({ claimIdentity: id => {
+            const digest = crypto.createHash('sha256').update(id).digest('hex')
+            if (claimedIdentities.has(digest) || claimedIdentities.size >= 4096) throw new Error('Response identity cannot be reused')
+            isolation.claimResponse(next, lease.account, id)
+            claimedIdentities.add(digest)
+          } }), pendingWrites: 0, terminal: null, cancelled: false, timer: null }
           const current = turn
           current.timer = setTimeout(() => stop(1001, 'gateway_ws_turn_timeout'), 15 * 60 * 1000)
           current.timer.unref()

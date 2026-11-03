@@ -84,13 +84,25 @@ Chat SSE使用独立状态，不改变Anthropic/Responses组装共用的工具he
 
 最终借助共享非流式适配检查完整输出，再核对已发送正文/refusal和工具参数。只有明确完成才stop/tool_calls；明确max_output_tokens/content_filter分别为length/content_filter，仍不记实际完整推理。早到DONE、缺终止EOF、失败或未知输出不能宣告成功。已知usage在转换失败后仍观察保留，错误帧脱敏，不增加推理重试。API账号非流式Chat也使用共享适配；两条Chat流路径均检查EOF。Kernel的Chat入口在执行前拒绝n不等于1，CLI原始参数允许n=1，仍不支持多choice。
 
-当前官方Chat流工具delta只定义function，没有custom字段；custom输出、引用和其他不能表达的可见输出明确报codex_chat_stream_unsupported，建议使用非流式Chat或Responses，不将custom伪装function。推理进度/summary不暴露为非标准reasoning_content。CLI仍是文本exec，工具路径属于Kernel/API适配，不表示CLI已支持工具执行。Chat custom请求定义及历史工具结果的输入转换仍需补齐。
+当前官方Chat流工具delta只定义function，没有custom字段；custom输出、引用和其他不能表达的可见输出明确报codex_chat_stream_unsupported，建议使用非流式Chat或Responses，不将custom伪装function。推理进度/summary不暴露为非标准reasoning_content。CLI仍是文本exec，工具路径属于Kernel/API适配，不表示CLI已支持工具执行。Chat custom请求定义及历史工具结果的输入转换在preview.13补齐；API中间格式的custom限制见下节。
 
 WS连接保持原账号绑定，但每次response.create在同一隔离事务中重新检查分组、调度容量、账号/槽位/代次/凭据incarnation及previous/item引用，独立申请租约。完成/失败终止帧及所有先前帧本机send回调完成后才释放当轮结果；空闲连接不持并发，下一轮不换账号、不重放。一个连接仅允许一个活动轮次，未完成就发下一轮会关闭并记失败。完成观察检查响应id一致和完整completed输出；HTTP升级或文本/usage不能独立证明成功。
 
 WS逐轮15分钟预算，握手15秒、连接空闲15分钟。response.cancel和原生response.interrupt都只允许取消当前轮次，显式目标需归属本调用者并匹配当前response id；转为VM2实际支持的response.interrupt。取消确认写出或10秒到期后关闭当前连接，并记取消，不把确认当执行已退出。客户端断连/上游关闭/协议错误/背压/发送失败/停服均关闭本地上游并清理活动租约。send回调仅证明本机写出，不证明远端已读；容器取消和退出确认仍属于执行层的独立验收。
 
 格式依据：[官方Chat流事件](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)、[官方Responses流事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)。这些源码改动未经过行为测试或真实账号验收。
+
+## Chat输入历史与WS首次身份（preview.13）
+
+共享codex-chat-input.mjs处理Chat→Responses输入。custom定义与tool_choice从Chat的custom嵌套结构转换为Responses平铺结构；text格式保留，grammar的syntax/definition提到format顶层。原样保留custom.input字符串，包括空串和换行，不解析JSON；function.arguments字符串不重新编码，定义保留strict。assistant的refusal生成独立内容项。parallel_tool_calls、service_tier不再在Chat输入转换时丢掉，Kernel继续使用原有tier规范化，CLI继续原始能力门。
+
+历史按call id记录function/custom类型，tool结果必须引用此前调用，使用相应function_call_output/custom_tool_call_output。重复调用ID、重复结果、找不到调用、双重ID矛盾或无custom input均返回codex_chat_tool_history_invalid；定义/格式错误为codex_chat_tool_invalid。转换边界捕获并返回400，避免未命名空调用或call_unknown猜测。该输入适配并不在服务器执行客户工具。
+
+API账号仍先转Anthropic中间格式；该格式未能保留Chat custom的原始输入，因此在调度/供应商请求前明确api_bridge_custom_tool_unsupported，不绕过现有请求拦截/身份/提示词策略。两条API桥接对n不等于1明确api_bridge_n_unsupported。规范function历史通过共享Chat→Responses转换，替换以前把tool结果当用户文本、漏掉assistant调用的映射；不宣称API custom已经实现。
+
+WS每轮首次响应身份在现有隔离事务中claim，当前caller/group范围内的response索引已存在即拒绝，包括同一账号；同轮后续帧仍允许同一ID。新连接能识别24小时TTL内已记ID；同一连接另保存ID的SHA256摘要，最多4096个，满额即关闭并释放本轮失败结果，要求新连接。响应对象id与response_id矛盾或输出早于身份则关闭记失败；无ID错误/取消确认/keepalive不被当作成功响应。该检查不提供过期索引后的无限期重放识别，不证明容器隔离或执行退出。
+
+依据 [官方Chat输入](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[官方Responses输入项](https://developers.openai.com/api/reference/resources/responses/subresources/input_items/methods/list)、[官方异步工具调用类型对应](https://developers.openai.com/api/docs/guides/async-tool-calling) 核对形状。没有运行行为测试或真实账号验收。
 
 ## 验收边界
 

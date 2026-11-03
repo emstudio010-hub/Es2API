@@ -5,6 +5,8 @@
  */
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract } from './openai-usage.mjs'
 import { createCodexChatStream } from './codex-chat-stream.mjs'
+import { chatToCodexResponses, responsesToolChoice, isCodexChatInputError } from './codex-chat-input.mjs'
+export { chatToCodexResponses, responsesToolChoice } from './codex-chat-input.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -28,191 +30,6 @@ export function stripCodexIdentity(body = {}) {
     next.metadata = metadata
   }
   return next
-}
-
-function textParts(content) {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return content?.text || ''
-  return content
-    .map((part) => {
-      if (typeof part === 'string') return part
-      if (part?.type === 'text' || part?.type === 'input_text' || part?.type === 'output_text') return part.text || ''
-      return ''
-    })
-    .filter(Boolean)
-    .join('\n')
-}
-
-function imageUrlOf(part) {
-  if (typeof part?.image_url === 'string') return part.image_url
-  if (typeof part?.image_url?.url === 'string') return part.image_url.url
-  if (typeof part?.url === 'string') return part.url
-  return ''
-}
-
-function userContentParts(content) {
-  if (typeof content === 'string') return content ? [{ type: 'input_text', text: content }] : []
-  if (!Array.isArray(content)) {
-    const text = content?.text || ''
-    return text ? [{ type: 'input_text', text }] : []
-  }
-  const parts = []
-  for (const part of content) {
-    if (typeof part === 'string') {
-      if (part) parts.push({ type: 'input_text', text: part })
-      continue
-    }
-    if (!part || typeof part !== 'object') continue
-    if (part.type === 'image_url' || part.type === 'image' || part.type === 'input_image') {
-      const url = imageUrlOf(part)
-      if (url) parts.push({ type: 'input_image', image_url: url })
-      continue
-    }
-    const text = part.text || ''
-    if (text) parts.push({ type: 'input_text', text })
-  }
-  return parts
-}
-
-function toolArguments(call) {
-  const raw = call?.function?.arguments ?? call?.arguments ?? '{}'
-  return typeof raw === 'string' ? raw : JSON.stringify(raw ?? {})
-}
-
-/** Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text. */
-function chatMessageToItems(message) {
-  if (!message || typeof message !== 'object') return []
-  if (message.role === 'tool') {
-    const output = typeof message.content === 'string' ? message.content : textParts(message.content)
-    return [
-      {
-        type: 'function_call_output',
-        call_id: message.tool_call_id || message.id || 'call_unknown',
-        output: output || '',
-      },
-    ]
-  }
-  if (message.role === 'assistant') {
-    const items = []
-    const text = textParts(message.content)
-    if (text) {
-      items.push({
-        type: 'message',
-        role: 'assistant',
-        content: [{ type: 'output_text', text }],
-      })
-    }
-    for (const call of message.tool_calls || []) {
-      const name = call?.function?.name || call?.name
-      if (!name) continue
-      items.push({
-        type: 'function_call',
-        call_id: call.id || call.call_id || `call_${name}`,
-        name,
-        arguments: toolArguments(call),
-      })
-    }
-    return items
-  }
-  const role = message.role === 'system' || message.role === 'developer' ? 'developer' : 'user'
-  const parts = userContentParts(message.content)
-  if (!parts.length) return []
-  return [{ type: 'message', role, content: parts }]
-}
-
-const RESPONSES_CHOICE_MODES = new Set(['none', 'auto', 'required'])
-
-/** Responses requires tool_choice.name at the top level. Chat nests it under function.name. */
-export function responsesToolChoice(choice) {
-  if (choice == null || choice === false || choice === '') return undefined
-  if (typeof choice === 'string') {
-    const mode = choice.trim().toLowerCase()
-    if (mode === 'any') return 'required'
-    if (RESPONSES_CHOICE_MODES.has(mode)) return mode
-    return undefined
-  }
-  if (typeof choice !== 'object' || Array.isArray(choice)) return undefined
-
-  const type = String(choice.type || '').toLowerCase()
-  const name = String(choice.name || choice.function?.name || '').trim()
-
-  if (type === 'none' || type === 'auto' || type === 'required') return type
-  if (type === 'any') return 'required'
-
-  if (type === 'allowed_tools') {
-    const tools = (Array.isArray(choice.tools) ? choice.tools : [])
-      .map((tool) => {
-        if (!tool || typeof tool !== 'object') return null
-        const toolName = String(tool.name || tool.function?.name || '').trim()
-        if (tool.type === 'function' || tool.function) {
-          return toolName ? { type: 'function', name: toolName } : null
-        }
-        return tool
-      })
-      .filter(Boolean)
-    const mode = String(choice.mode || 'auto').toLowerCase() === 'required' ? 'required' : 'auto'
-    return tools.length ? { type: 'allowed_tools', mode, tools } : mode
-  }
-
-  if (type === 'function' || type === 'tool' || type === 'custom') {
-    if (!name) return type === 'custom' ? undefined : 'required'
-    return { type: type === 'tool' ? 'function' : type, name }
-  }
-
-  if (type === 'mcp') {
-    if (!choice.server_label) return name ? { type: 'function', name } : undefined
-    const out = { type: 'mcp', server_label: choice.server_label }
-    if (name) out.name = name
-    return out
-  }
-
-  if (name && !choice.name) return { type: type || 'function', name }
-  return choice
-}
-
-function toolsToCodex(tools) {
-  if (!Array.isArray(tools) || !tools.length) return undefined
-  return tools.map((tool) => {
-    if (tool?.type === 'function' && tool.function) {
-      return {
-        type: 'function',
-        name: tool.function.name,
-        description: tool.function.description || '',
-        parameters: tool.function.parameters || { type: 'object', properties: {} },
-      }
-    }
-    if (tool?.name) {
-      return {
-        type: 'function',
-        name: tool.name,
-        description: tool.description || '',
-        parameters: tool.input_schema || tool.parameters || { type: 'object', properties: {} },
-      }
-    }
-    return tool
-  })
-}
-
-export function chatToCodexResponses(body = {}) {
-  const messages = Array.isArray(body.messages) ? body.messages : []
-  const input = messages.flatMap(chatMessageToItems)
-  const out = {
-    model: body.model,
-    input,
-    stream: body.stream !== false,
-    store: false,
-  }
-  const tools = toolsToCodex(body.tools)
-  if (tools) out.tools = tools
-  const choice = responsesToolChoice(body.tool_choice)
-  if (choice) out.tool_choice = choice
-  if (body.reasoning) out.reasoning = body.reasoning
-  if (body.reasoning_effort) out.reasoning_effort = body.reasoning_effort
-  if (body.max_tokens || body.max_completion_tokens) {
-    out.max_output_tokens = body.max_tokens || body.max_completion_tokens
-  }
-  if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
-  return out
 }
 
 export function completionsToCodexResponses(body = {}) {
@@ -310,7 +127,7 @@ export function anthropicToCodexResponses(body = {}) {
 
 // CLI owns its wire protocol. Keep supported caller parameters intact instead
 // of applying the Kernel's upstream field stripping and effort normalization.
-export function toCodexCliResponses(protocol, body) {
+function convertCliInput(protocol, body) {
   const stripped = stripCodexIdentity(body)
   if (protocol === 'openai.chat') {
     return { ok: true, body: chatToCodexResponses(stripped), converted: true }
@@ -326,7 +143,7 @@ export function toCodexCliResponses(protocol, body) {
   return { ok: false, code: 'codex_cli_protocol_unsupported' }
 }
 
-export function toCodexResponses(protocol, body, convert = {}) {
+function convertKernelInput(protocol, body, convert = {}) {
   if (protocol === 'openai.chat' && body?.n != null && body.n !== 1) return { ok: false, code: 'codex_chat_n_unsupported' }
   const stripped = stripCodexIdentity(body)
   if (protocol === 'openai.responses') {
@@ -346,6 +163,21 @@ export function toCodexResponses(protocol, body, convert = {}) {
     return { ok: true, body: stripUnsupportedCodexFields(anthropicToCodexResponses(stripped)), converted: true }
   }
   return { ok: false, code: 'protocol_not_allowed' }
+}
+
+// Conversion failures must be rejected before any provider request or slot work.
+function guardedInput(convert) {
+  try { return convert() }
+  catch (error) {
+    if (!isCodexChatInputError(error)) throw error
+    return { ok: false, code: error.code }
+  }
+}
+export function toCodexResponses(protocol, body, convert = {}) {
+  return guardedInput(() => convertKernelInput(protocol, body, convert))
+}
+export function toCodexCliResponses(protocol, body) {
+  return guardedInput(() => convertCliInput(protocol, body))
 }
 
 export function createChatSseState(id = 'codex') {

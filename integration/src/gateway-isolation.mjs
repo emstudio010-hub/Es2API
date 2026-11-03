@@ -89,6 +89,17 @@ export class GatewayIsolation {
     })
   }
 
+  claimResponse(context, account, id) {
+    if (typeof id !== 'string' || !id || id.length > 512) throw denied()
+    const identity = hash(id)
+    // Claim once per response, before observing output. Even the same account
+    // cannot reuse a known id for a new WS inference lease.
+    return this.store.transaction(() => {
+      if (this.lookup(context, 'response', identity)) throw denied()
+      this.remember(context, 'response', identity, account)
+    })
+  }
+
   remember(context, kind, identity, account) {
     if (!identity) return
     this.assertAccount(account)
