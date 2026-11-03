@@ -39,7 +39,8 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { readCodexAccounts } from '../vm/codex-slot.mjs'
+import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -1160,15 +1161,12 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
   let pending = searchRefreshes.get(vm.id)
   if (!pending) {
     pending = (async () => {
-      const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
-      if (!tok?.ok || !tok.access_token) return ''
-      upsertCodexAccount(projectRoot, vm.id, {
-        access_token: tok.access_token,
-        refresh_token: tok.refresh_token || now.refresh,
-        id_token: tok.id_token || now.first.id_token,
-        expires_at: tok.expires_at || now.first.expires_at,
-      })
-      return tok.access_token
+      try {
+        const account = await refreshStoredCodexCredential(projectRoot, vm.id, {
+          previous: now.first, usedAccess, refresh, proxyUrl, fetchImpl,
+        })
+        return account.access_token
+      } catch { return '' }
     })().finally(() => searchRefreshes.delete(vm.id))
     searchRefreshes.set(vm.id, pending)
   }

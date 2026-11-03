@@ -16,6 +16,11 @@ function vmIdFrom(payload) {
   return payload?.vm?.id || payload?.data?.vm?.id || payload?.vm_id || payload?.data?.vm_id || payload?.data?.id || payload?.id || null
 }
 
+function credentialBinding(binding, proxyId = binding.proxy_id) {
+  return { account_id: binding.account_id, provision_generation: binding.provision_generation,
+    proxy_id: proxyId, execution_backend: binding.execution_backend || 'kernel' }
+}
+
 function assertSlot(binding, id, status = null) {
   if (status && (status.execution_backend || 'kernel') !== (binding.execution_backend || 'kernel')) throw Object.assign(new Error('执行槽后端与账号配置不一致'), { code: 'vm2_execution_backend_mismatch', status: 409 })
   if (String(id) !== buildVmProvisionRequest(binding).id || (status && status.id !== String(id))) {
@@ -102,7 +107,9 @@ export class AccountLifecycle {
         throw Object.assign(new Error('账号池尚未绑定出口，无法导入凭据或启动'), { status: 409, code: 'dedicated_proxy_unavailable' })
       }
       this.onState({ ...publicLifecycleResult({ accountId, vmId, phase: 'exit_bound', status: 'pending', credential }), slot: allocatedStatus })
-      await this.vm2.importCredential(vmId, credential, operationKey('import'))
+      await this.vm2.importCredential(vmId, credential, operationKey('import'), {
+        ifMissing: true, binding: credentialBinding(binding, allocatedStatus.egress.proxy_id),
+      })
       if (typeof this.vm2.startSlot === 'function') await this.vm2.startSlot(vmId, operationKey('start'))
       const rawStatus = await this.vm2.getSlot(vmId)
       const status = rawStatus?.id && typeof rawStatus.ready === 'boolean' ? rawStatus : normalizeVmStatus(rawStatus)
@@ -142,6 +149,18 @@ export class AccountLifecycle {
     const result = publicLifecycleResult({ accountId: binding.account_id, vmId: id, phase: 'deleted', status: 'deleted' })
     this.onState(result)
     return result
+  }
+
+  async checkpointCredential(accountInput, vmId, { generation = 1, acknowledgedHandoffId = null } = {}) {
+    const binding = normalizeAccountBinding({ ...accountInput, provision_generation: generation })
+    assertSlot(binding, vmId, await this.vm2.getSlot(vmId))
+    const result = await this.vm2.checkpointCredential(vmId, { ...credentialBinding(binding), acknowledged_handoff_id: acknowledgedHandoffId })
+    if (result.vm_id !== vmId || result.account_id !== binding.account_id
+      || result.provision_generation !== generation || !/^[a-f0-9-]{36}$/i.test(result.handoff_id || '')) {
+      throw Object.assign(new Error('凭据交接响应与账号归属不一致'), { status: 409, code: 'credential_handoff_changed' })
+    }
+    if (result.credential_missing === true && acknowledgedHandoffId === result.handoff_id) return { ...result, credential: null }
+    return { ...result, credential: normalizeOpenAICredential(result.credential) }
   }
 
   async inspect(accountInput, vmId) {

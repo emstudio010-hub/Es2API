@@ -36,6 +36,7 @@ function unsupportedOnHost(action) {
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
+  if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.credential_handoff || vm.credential_handoff)) return { ok: false, code: 'codex_credential_handoff_pending', error: '凭据正在交接，请完成重建后启动' }
   if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id) && !opts.cliRecovery) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中' }
   return slotHost(vm).start(vm, projectRoot, opts)
 }
@@ -50,6 +51,7 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
+  if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.credential_handoff || vm.credential_handoff)) return { ok: false, code: 'codex_credential_handoff_pending', error: '凭据正在交接，请完成重建后启动' }
   if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id) && !opts.cliRecovery) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中，暂不接受其他开机操作' }
   if (isCodexVm(vm)) {
     if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')

@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { normalizeOpenAICredential, publicCredentialStatus } from './contract.mjs'
 
 function credentialKey(value) {
   if (Buffer.isBuffer(value) && value.length === 32) return value
@@ -395,6 +396,37 @@ export class Store {
     const account = publicAccount(row)
     if (includeCredential) account.credentials = decryptJson(this.key, row.credential_ciphertext)
     return account
+  }
+
+  checkpointCredential(id, credential, { vmId, generation, handoffId, expectedFingerprint }) {
+    const normalized = normalizeOpenAICredential(credential)
+    const status = publicCredentialStatus(normalized)
+    return this.transaction(() => {
+      const account = this.getAccount(id)
+      if (!account || account.vm_id !== vmId || account.provision_generation !== generation
+        || account.credential.fingerprint !== expectedFingerprint) {
+        throw Object.assign(new Error('账号在凭据交接期间已变化，未保存或删除执行槽'), { status: 409, code: 'credential_handoff_changed' })
+      }
+      const binding = { ...account.binding, credential_handoff: { id: handoffId, vm_id: vmId,
+        generation, fingerprint: status.fingerprint, at: new Date().toISOString() } }
+      let result
+      try {
+        result = this.db.prepare(`UPDATE pool_accounts SET credential_ciphertext=?,credential_fingerprint=?,
+          has_access_token=?,has_refresh_token=?,has_id_token=?,has_api_key=?,binding_json=?,updated_at=?
+          WHERE id=? AND vm_id=? AND provision_generation=? AND credential_fingerprint=?`).run(
+          encryptJson(this.key, normalized), status.fingerprint, Number(status.has_access_token),
+          Number(status.has_refresh_token), Number(status.has_id_token), Number(status.has_api_key),
+          JSON.stringify(binding), new Date().toISOString(), String(id), vmId, generation, expectedFingerprint,
+        )
+      } catch (error) {
+        if (String(error?.message).includes('UNIQUE constraint failed: pool_accounts.credential_fingerprint')) {
+          throw Object.assign(new Error('交接凭据与另一账号重复，保留旧槽并停止重建'), { status: 409, code: 'credential_already_imported' })
+        }
+        throw error
+      }
+      if (result.changes !== 1) throw Object.assign(new Error('凭据交接未提交，未删除执行槽'), { status: 409, code: 'credential_handoff_changed' })
+      return this.getAccount(id)
+    })
   }
 
   listAccounts({ page = 1, page_size = 50, status, mode, group_id, search } = {}) {

@@ -16,7 +16,8 @@ import path from 'node:path'
 import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
+import { summarizeCodexSlot, readCodexAccounts } from '../vm/codex-slot.mjs'
+import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
@@ -31,7 +32,6 @@ import { modelsDevMeta } from './price-catalog.mjs'
 import { listOfficialModels, validateOfficialModel } from '../protocol/models.mjs'
 import {
   fetchChatgptModelCatalog,
-  refreshCodexAccessToken,
   resolveCodexCatalogVersion,
   CODEX_USER_AGENT,
 } from '../protocol/codex-models.mjs'
@@ -132,22 +132,6 @@ function listCodexVmsForCatalog(projectRoot, vm) {
   return out
 }
 
-function persistRefreshedCodexAccount(projectRoot, vmId, patch = {}, previous = {}) {
-  const accounts = readCodexAccounts(projectRoot, vmId)
-  let idx = accounts.findIndex(
-    (row) =>
-      (previous.refresh_token && row.refresh_token === previous.refresh_token) ||
-      (previous.access_token && row.access_token === previous.access_token),
-  )
-  if (idx < 0) idx = 0
-  const cur = { ...(accounts[idx] || {}), ...patch }
-  if (!cur.id) cur.id = cur.email || cur.chatgpt_account_id || 'codex'
-  if (!accounts.length) accounts.push(cur)
-  else accounts[idx] = cur
-  writeCodexAccounts(projectRoot, vmId, accounts)
-  return cur
-}
-
 /**
  * Pull ChatGPT GPT/Codex ids into model_policy.
  * rotate=true (panel sync) may refresh OAuth via refresh_token.
@@ -218,28 +202,21 @@ export async function syncCodexCatalog({
         })
       let live = await fetchOnce()
       if (live.error === 'upstream_auth' && rotate && refreshToken) {
-        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
-        if (!tok.ok) {
+        let saved
+        try {
+          saved = await refreshStoredCodexCredential(projectRoot, target.id, {
+            previous: account, usedAccess: access, proxyUrl, fetchImpl,
+          })
+        } catch {
           lastError = {
             ok: false,
-            error: tok.error || 'refresh_failed',
+            error: 'refresh_failed',
             message: 'GPT OAuth 刷新失败，请重新登录',
             vm_id: target.id,
           }
           continue
         }
-        persistRefreshedCodexAccount(
-          projectRoot,
-          target.id,
-          {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || account.id_token,
-            expires_at: tok.expires_at || account.expires_at,
-          },
-          account,
-        )
-        access = tok.access_token
+        access = saved.access_token
         live = await fetchOnce()
       }
       if (!live.ok || !live.ids?.length) {
@@ -1116,18 +1093,13 @@ export async function runVmTestChat(opts = {}) {
       const refreshToken = String(first.refresh_token || '').trim()
       if (refreshToken) {
         push('info', 'Codex hop 401，尝试刷新 OAuth')
-        const tok = await refreshCodexAccessToken({
-          refreshToken,
-          proxyUrl: hostProxyUrlForVm(vm),
-          fetchImpl: opts.fetchImpl,
-        })
-        if (tok.ok) {
-          persistRefreshedCodexAccount(projectRoot, vmId, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
-          })
+        let refreshed = false
+        try {
+          await refreshStoredCodexCredential(projectRoot, vmId, { previous: first,
+            proxyUrl: hostProxyUrlForVm(vm), fetchImpl: opts.fetchImpl })
+          refreshed = true
+        } catch { push('error', 'Codex OAuth 刷新失败或实例正在交接') }
+        if (refreshed) {
           result = await postV1Responses({
             baseUrl,
             apiKey,
@@ -1137,8 +1109,6 @@ export async function runVmTestChat(opts = {}) {
             timeoutMs,
             extraHeaders: opts.extraHeaders || {},
           })
-        } else {
-          push('error', `Codex OAuth 刷新失败: ${tok.error || 'refresh_failed'}`)
         }
       }
     }

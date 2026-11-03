@@ -29,7 +29,7 @@ import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { saveIntegrationDispatch } from '../pool/integration-dispatch.mjs'
-import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
+import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts, readCodexAccountsStrict } from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -266,6 +266,9 @@ import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { isCodexCliVm, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
 import { codexCliHealth, cancelCodexCli, refreshCliCredential } from '../transport/codex-cli-client.mjs'
+import { withCodexCredentialLock, assertCodexIntegrationBinding } from '../oauth/codex-credential-lock.mjs'
+import { checkpointCodexCredential } from '../oauth/codex-credential-handoff.mjs'
+import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
@@ -404,51 +407,82 @@ async function commitImportedCodexVm({
   account,
   catalogClientVersion = 'auto',
   routingConfig = {},
+  ifMissing = false,
+  expectedBinding = null,
+  importBody = {},
 }) {
-  const wasCodex = isCodexVm(existing)
-  if (isCodexCliVm(existing) && cancelCodexCli(existing.id)) throw Object.assign(new Error('CLI 正在退出，请等待执行结束后重新导入'), { status: 409, code: 'codex_cli_busy' })
-  const previousPolicy = existing.policy && typeof existing.policy === 'object' ? existing.policy : {}
-  const saved = upsertCodexAccount(cfg.paths.project, existing.id, account, { replaceCredentials: true })
-  existing.platform = 'openai'
-  existing.family = 'codex'
-  existing.codex_kernel = true
-  existing.codex = {
-    ...(existing.codex && typeof existing.codex === 'object' ? existing.codex : {}),
-    has_access: !!saved.access_token,
-    has_refresh: !!saved.refresh_token,
-    chatgpt_account_id: saved.chatgpt_account_id || null,
-    email: saved.email || null,
-    expires_at: saved.expires_at || null,
-  }
-  const global = normalizeOpenAIQuotaPolicy(routingConfig.codex?.quota || {})
-  const preservePin = (value, override) =>
-    previousPolicy[override] === true &&
-    typeof previousPolicy[value] === 'number' &&
-    Number.isInteger(previousPolicy[value]) &&
-    previousPolicy[value] >= 0
-  existing.policy = {
-    ...previousPolicy,
-    maxConcurrency:
-      wasCodex && preservePin('maxConcurrency', 'concurrencyOverride')
-        ? previousPolicy.maxConcurrency
-        : global.max_concurrency,
-    concurrencyOverride: wasCodex && preservePin('maxConcurrency', 'concurrencyOverride'),
-    maxRpm: wasCodex && preservePin('maxRpm', 'rpmOverride') ? previousPolicy.maxRpm : global.max_rpm,
-    rpmOverride: wasCodex && preservePin('maxRpm', 'rpmOverride'),
-    maxSessions:
-      wasCodex && preservePin('maxSessions', 'sessionsOverride') ? previousPolicy.maxSessions : global.max_sessions,
-    sessionsOverride: wasCodex && preservePin('maxSessions', 'sessionsOverride'),
-  }
-  stampVmKind(existing)
-  const writtenCodex = patchVmRecord(cfg.paths.project, existing.id, (vm) => {
-    vm.platform = existing.platform
-    vm.family = existing.family
-    vm.codex_kernel = existing.codex_kernel
-    vm.codex = existing.codex
-    vm.policy = existing.policy
-    stampVmKind(vm)
+  const preserved = await withCodexCredentialLock(cfg.paths.project, existing.id, async () => {
+    existing = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    if (ifMissing) {
+      assertCodexIntegrationBinding(existing, expectedBinding)
+      const current = readCodexAccountsStrict(cfg.paths.project, existing.id)
+      if (current.length) {
+        if (current.length !== 1 || (!current[0].access_token && !current[0].refresh_token)) {
+          throw Object.assign(new Error('现有 OAuth 记录不可确认，已保留原文件并停止导入'), { status: 409, code: 'codex_existing_credential_invalid' })
+        }
+        if (account.chatgpt_account_id && current[0].chatgpt_account_id
+          && account.chatgpt_account_id !== current[0].chatgpt_account_id) {
+          throw Object.assign(new Error('现有 OAuth 账号与导入身份不同，已拒绝覆盖'), { status: 409, code: 'codex_existing_identity_mismatch' })
+        }
+        return true
+      }
+    }
+    if (!account.access_token && account.refresh_token) {
+      const slotProxy = requireSlotProxy(existing, importBody)
+      if (!slotProxy.ok) throw Object.assign(new Error(slotProxy.message), { status: slotProxy.status, code: 'proxy_required' })
+      const tok = await refreshCodexAccessToken({ refreshToken: account.refresh_token, proxyUrl: slotProxy.proxyUrl })
+      if (!tok.ok || !tok.access_token) throw Object.assign(new Error('Refresh Token 换票失败，请检查 RT 或重新授权'), { status: 502, code: 'refresh_failed' })
+      account = { ...account, access_token: tok.access_token, refresh_token: tok.refresh_token || account.refresh_token,
+        id_token: tok.id_token || account.id_token, expires_at: tok.expires_at || account.expires_at }
+    }
+    const wasCodex = isCodexVm(existing)
+    if (isCodexCliVm(existing) && cancelCodexCli(existing.id)) throw Object.assign(new Error('CLI 正在退出，请等待执行结束后重新导入'), { status: 409, code: 'codex_cli_busy' })
+    const previousPolicy = existing.policy && typeof existing.policy === 'object' ? existing.policy : {}
+    const saved = upsertCodexAccount(cfg.paths.project, existing.id, account, { replaceCredentials: true })
+    existing.platform = 'openai'
+    existing.family = 'codex'
+    existing.codex_kernel = true
+    existing.codex = {
+      ...(existing.codex && typeof existing.codex === 'object' ? existing.codex : {}),
+      has_access: !!saved.access_token,
+      has_refresh: !!saved.refresh_token,
+      chatgpt_account_id: saved.chatgpt_account_id || null,
+      email: saved.email || null,
+      expires_at: saved.expires_at || null,
+    }
+    const global = normalizeOpenAIQuotaPolicy(routingConfig.codex?.quota || {})
+    const preservePin = (value, override) =>
+      previousPolicy[override] === true &&
+      typeof previousPolicy[value] === 'number' &&
+      Number.isInteger(previousPolicy[value]) &&
+      previousPolicy[value] >= 0
+    existing.policy = {
+      ...previousPolicy,
+      maxConcurrency:
+        wasCodex && preservePin('maxConcurrency', 'concurrencyOverride')
+          ? previousPolicy.maxConcurrency
+          : global.max_concurrency,
+      concurrencyOverride: wasCodex && preservePin('maxConcurrency', 'concurrencyOverride'),
+      maxRpm: wasCodex && preservePin('maxRpm', 'rpmOverride') ? previousPolicy.maxRpm : global.max_rpm,
+      rpmOverride: wasCodex && preservePin('maxRpm', 'rpmOverride'),
+      maxSessions:
+        wasCodex && preservePin('maxSessions', 'sessionsOverride') ? previousPolicy.maxSessions : global.max_sessions,
+      sessionsOverride: wasCodex && preservePin('maxSessions', 'sessionsOverride'),
+    }
+    stampVmKind(existing)
+    const writtenCodex = patchVmRecord(cfg.paths.project, existing.id, (vm) => {
+      vm.platform = existing.platform
+      vm.family = existing.family
+      vm.codex_kernel = existing.codex_kernel
+      vm.codex = existing.codex
+      vm.policy = existing.policy
+      stampVmKind(vm)
+    })
+    if (writtenCodex) Object.assign(existing, writtenCodex)
+    return false
   })
-  if (writtenCodex) Object.assign(existing, writtenCodex)
+  if (preserved) return { vm: summarizeVm(existing, cfg.paths.project, routingConfig),
+    platform: 'openai', credential_preserved: true }
   let catalog = null
   try {
     catalog = await syncCodexCatalog({
@@ -3363,6 +3397,7 @@ export function createPanelHandler(ctx) {
         return await withVmLock(vmPath, async () => {
           if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          if (prev.credential_handoff) return json(res, 409, { ok: false, error: { code: 'codex_credential_handoff_pending', message: '凭据正在交接，请通过账号池重试完成重建' } })
           const gone = await destroySlot(prev)
           if (!gone.ok) {
             return json(res, 500, { ok: false, error: { message: gone.error || 'destroy failed', code: gone.code } })
@@ -3458,6 +3493,7 @@ export function createPanelHandler(ctx) {
             return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
           }
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          if (prev.credential_handoff) return json(res, 409, { ok: false, error: { code: 'codex_credential_handoff_pending', message: '凭据正在交接，不能清除凭据' } })
           prev.id = prev.id || id
           if (isCodexCliVm(prev) && cancelCodexCli(id)) return json(res, 409, { ok: false, error: { code: 'codex_cli_busy', message: 'CLI 正在退出，请等待执行结束后清除凭据' } })
           const slotDir = path.join(cfg.paths.project, 'vms', id)
@@ -4397,7 +4433,13 @@ export function createPanelHandler(ctx) {
         vm.schedulable = false
         vm.schedule_disabled_reason = 'stopped'
         vm.updated_at = new Date().toISOString()
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
+        const stopped = patchVmRecord(cfg.paths.project, id, record => {
+          record.status = 'stopped'
+          record.schedulable = false
+          if (vm.runtime) record.runtime = vm.runtime
+          record.schedule_disabled_reason = record.credential_handoff ? 'credential_handoff' : 'stopped'
+          record.updated_at = new Date().toISOString()
+        })
         return json(
           res,
           200,
@@ -4406,8 +4448,22 @@ export function createPanelHandler(ctx) {
             runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
             kernel: GATEWAY_CAPABILITIES.kernel,
             halt: panel.publicSlotBoot(halt),
+            ...(stopped?.credential_handoff ? { credential_handoff_pending: true } : {}),
           }),
         )
+      }
+
+      // Private control-plane checkpoint. Never include credentials in VM views.
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/credential-checkpoint$/.test(p)) {
+        if (panelIdentity(req).role !== 'admin') return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Admin access required' } })
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('Pragma', 'no-cache')
+        const id = p.split('/')[4]
+        if (!isValidVmId(id)) return json(res, 400, { ok: false, error: { code: 'invalid_vm_id', message: 'Invalid VM id' } })
+        if (!fs.existsSync(path.join(cfg.paths.project, 'vms', `${id}.json`))) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        const body = await readBody(req, 16 * 1024)
+        const checkpoint = await checkpointCodexCredential(cfg.paths.project, id, body.expected_binding, stopSlot)
+        return json(res, 200, panel.ok(checkpoint))
       }
 
       // POST /api/panel/vms/import
@@ -4439,32 +4495,6 @@ export function createPanelHandler(ctx) {
               })
             }
             const account = { ...parsed.account }
-            if (!account.access_token && account.refresh_token) {
-              const slotProxy = requireSlotProxy(existing, body)
-              if (!slotProxy.ok) {
-                return json(res, slotProxy.status, {
-                  ok: false,
-                  error: { code: 'proxy_required', message: slotProxy.message },
-                })
-              }
-              const tok = await refreshCodexAccessToken({
-                refreshToken: account.refresh_token,
-                proxyUrl: slotProxy.proxyUrl,
-              })
-              if (!tok.ok) {
-                return json(res, 502, {
-                  ok: false,
-                  error: {
-                    code: tok.error || 'refresh_failed',
-                    message: 'Refresh Token 换票失败，请检查 RT 或改用 OAuth / 账号文件。',
-                  },
-                })
-              }
-              account.access_token = tok.access_token
-              account.refresh_token = tok.refresh_token || account.refresh_token
-              account.id_token = tok.id_token || account.id_token
-              account.expires_at = tok.expires_at || account.expires_at
-            }
             const committed = await commitImportedCodexVm({
               cfg,
               vmPath,
@@ -4472,6 +4502,9 @@ export function createPanelHandler(ctx) {
               account,
               catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
               routingConfig: ctx.routingConfig,
+              ifMissing: body.if_missing === true,
+              expectedBinding: body.expected_binding,
+              importBody: body,
             })
             return json(res, 200, panel.ok(committed))
           }
@@ -4956,30 +4989,7 @@ export function createPanelHandler(ctx) {
             catch { return json(res, 502, { ok: false, error: { code: 'codex_cli_refresh_failed', message: 'CLI OAuth 刷新失败，请检查账号凭据' } }) }
             return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
           }
-          const first = readCodexAccounts(cfg.paths.project, id)[0] || {}
-          const refreshToken = String(first.refresh_token || '').trim()
-          if (!refreshToken) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
-            })
-          }
-          const tok = await refreshCodexAccessToken({
-            refreshToken,
-            proxyUrl: hostProxyUrlForVm(vm),
-          })
-          if (!tok.ok) {
-            return json(res, 502, {
-              ok: false,
-              error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
-            })
-          }
-          upsertCodexAccount(cfg.paths.project, id, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
-          })
+          await refreshStoredCodexCredential(cfg.paths.project, id, { proxyUrl: hostProxyUrlForVm(vm) })
           return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
         }
         if (isApiKeyMode(vm?.claude?.mode)) {

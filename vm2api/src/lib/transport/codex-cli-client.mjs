@@ -9,7 +9,7 @@ import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { slotHost, hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
-import { withVmLock } from '../vm/vm-file.mjs'
+import { withCodexCredentialLock, assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { CODEX_CLI_CONTAINER_BIN, CODEX_CLI_VERSION, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
@@ -100,6 +100,8 @@ function needsAccessRefresh(account) {
 
 export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
   if (!supported(exec)) return { ok: false, reachable: false, code: 'codex_cli_requires_local_dedicated_docker' }
+  try { assertCodexCredentialNotHandingOff(projectOf(exec), exec.vm.id) }
+  catch { return { ok: false, reachable: false, status: 409, code: 'codex_credential_handoff_pending' } }
   const payload = inspectCodexCliPayload()
   if (!payload.ok) return { ok: false, reachable: false, code: payload.code }
   const accounts = readCodexAccounts(projectOf(exec), exec.vm.id)
@@ -123,7 +125,7 @@ export const ensureCodexCli = codexCliHealth
 // the control plane, never concurrently by an ephemeral CLI and the quota worker.
 export async function refreshCliCredential(projectRoot, vm, { force = false, deadline = Infinity, signal } = {}) {
   if (!supported({ vm })) throw Object.assign(new Error('CLI 固定出口不可用，已停止刷新'), { code: 'codex_cli_proxy_required' })
-  return withVmLock(`codex-cli-auth:${path.resolve(projectRoot)}:${vm.id}`, async () => {
+  return withCodexCredentialLock(projectRoot, vm.id, async () => {
     if (signal?.aborted) throw Object.assign(new Error('CLI 请求已取消，未开始刷新'), { code: 'codex_cli_cancelled' })
     if (Date.now() >= deadline) throw Object.assign(new Error('CLI 执行预算已用尽，未开始刷新'), { code: 'codex_cli_timeout' })
     const accounts = readCodexAccounts(projectRoot, vm.id)

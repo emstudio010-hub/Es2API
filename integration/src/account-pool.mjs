@@ -276,22 +276,40 @@ export class AccountPool {
     }
     const binding = normalizeAccountBinding({ ...(account.binding || {}), account_id: account.id,
       name: account.name, mode: account.mode, group_ids: account.group_ids, max_concurrency: account.concurrency })
+    let credential = account.credentials
     if (staleRebind && account.vm_id) {
       this.store.updateAccount(id, { status: 'provisioning', schedulable: false })
       try {
+        await this.beforeRemoveAccount(String(id))
+        const saved = account.binding?.credential_handoff
+        const committed = saved?.vm_id === account.vm_id && saved.generation === account.provision_generation
+          && saved.fingerprint === account.credential.fingerprint && /^[a-f0-9-]{36}$/i.test(saved.id || '')
+        let checkpoint
+        try {
+          checkpoint = await this.lifecycle.checkpointCredential({ ...account.binding, account_id: account.id }, account.vm_id,
+            { generation: account.provision_generation, acknowledgedHandoffId: committed ? saved.id : null })
+        } catch (error) {
+          if (error.status !== 404 || !committed) throw error
+        }
+        if (checkpoint?.credential) {
+          this.store.checkpointCredential(id, checkpoint.credential, { vmId: account.vm_id,
+            generation: account.provision_generation, handoffId: checkpoint.handoff_id,
+            expectedFingerprint: account.credential.fingerprint })
+          credential = checkpoint.credential
+        }
         await this.lifecycle.remove({ ...account.binding, account_id: account.id, mode: account.mode, group_ids: account.group_ids }, account.vm_id,
           { generation: account.provision_generation })
       } catch (error) {
         const safe = publicError(error)
         this.store.updateAccount(id, { status: 'error', schedulable: false, error_code: safe.code,
-          error_message: `旧执行槽删除未确认：${safe.message}`, slot_binding_stale: true })
+          error_message: `旧执行槽凭据交接或删除未确认：${safe.message}`, slot_binding_stale: true })
         throw Object.assign(new Error(safe.message), { status: error.status || 502, code: safe.code })
       }
-      this.store.updateAccount(id, { vm_id: null, slot_json: null, slot_binding_stale: false,
+      this.store.updateAccount(id, { vm_id: null, slot_json: null, slot_binding_stale: false, binding,
         provision_generation: account.provision_generation + 1 })
     }
     this.store.updateAccount(id, { status: 'provisioning', schedulable: false, error_code: null, error_message: null })
-    return this.runProvision(id, binding, account.credentials)
+    return this.runProvision(id, binding, credential)
   }
 
   async removeAccount(id) {
@@ -399,6 +417,7 @@ export class AccountPool {
       const binding = (requestedGroups || Object.keys(bindingPatch).length)
         ? this.resolveBinding(bindingInput, id)
         : { ...bindingInput, account_id: id }
+      if (account.binding?.credential_handoff) binding.credential_handoff = account.binding.credential_handoff
       if (requestedGroups) fields.group_ids = binding.group_ids
       if (requestedGroups || Object.keys(bindingPatch).length || Object.prototype.hasOwnProperty.call(input, 'concurrency')) {
         const previousBinding = JSON.stringify(account.binding || {})

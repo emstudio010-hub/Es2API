@@ -117,11 +117,11 @@ export class Vm2Client {
     })
   }
 
-  async importCredential(vmId, credential, idempotencyKey) {
+  async importCredential(vmId, credential, idempotencyKey, options = {}) {
     await this.ensureSession()
     return this.request(VM2_PROTOCOL_PATHS.import, {
       method: 'POST',
-      body: buildCodexImportRequest(vmId, credential),
+      body: buildCodexImportRequest(vmId, credential, options),
       idempotencyKey,
       timeoutMs: this.lifecycleTimeoutMs,
     })
@@ -135,6 +135,14 @@ export class Vm2Client {
       if (error.status === 409) throw Object.assign(new Error('没有可用的独占出口，请先导入未占用的 IP 资源，再重试该账号。已有固定出口不会自动更换。'), { status: 409, code: 'dedicated_proxy_unavailable' })
       throw error
     }
+  }
+
+  async checkpointCredential(vmId, binding) {
+    await this.ensureSession()
+    const payload = await this.request(`/api/panel/vms/${encodeURIComponent(vmId)}/credential-checkpoint`, {
+      method: 'POST', body: { expected_binding: binding }, timeoutMs: this.lifecycleTimeoutMs,
+    })
+    return payload.data || payload
   }
 
   async listExitResources() {

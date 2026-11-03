@@ -8,6 +8,7 @@ import { isCodexVm } from '../protocol/codex-route.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, hasSpendableCodexCredits } from '../protocol/codex-usage.mjs'
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
 import { selectOAuthCredential } from '../oauth/credential-import.mjs'
+import { assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
 
 export { isCodexVm }
 
@@ -25,8 +26,23 @@ export function readCodexAccounts(projectRoot, vmId) {
   }
 }
 
+// Lifecycle writes must distinguish an empty slot from a corrupt credential file.
+export function readCodexAccountsStrict(projectRoot, vmId) {
+  const file = codexCredentialPath(projectRoot, vmId)
+  try {
+    if (fs.statSync(file).size > 4 * 1024 * 1024) throw new Error('credential file too large')
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (!Array.isArray(raw?.accounts) || raw.accounts.some(row => !row || typeof row !== 'object' || Array.isArray(row))) throw new Error('invalid credential accounts')
+    return raw.accounts
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw Object.assign(new Error('实例凭据文件无法读取，已保留原文件'), { status: 409, code: 'codex_credential_file_invalid' })
+  }
+}
+
 export function writeCodexAccounts(projectRoot, vmId, accounts) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
+  if (fs.existsSync(path.join(projectRoot, 'vms', `${vmId}.json`))) assertCodexCredentialNotHandingOff(projectRoot, vmId)
   atomicWriteJson(
     codexCredentialPath(projectRoot, vmId),
     { accounts: Array.isArray(accounts) ? accounts.map(enrichCodexAccountIdentity) : [] },

@@ -169,13 +169,14 @@ export function buildVmProvisionRequest(binding) {
   return Object.fromEntries(Object.entries(request).filter(([, value]) => value !== null && value !== undefined))
 }
 
-export function buildCodexImportRequest(vmId, credential) {
+export function buildCodexImportRequest(vmId, credential, { ifMissing = false, binding = null } = {}) {
   const id = nonEmptyString(vmId, 'vm_id')
   const normalized = normalizeOpenAICredential(credential)
   return {
     vm_id: id,
     mode: 'oauth',
     auth_json: JSON.stringify(normalized),
+    ...(ifMissing ? { if_missing: true, expected_binding: binding } : {}),
   }
 }
 

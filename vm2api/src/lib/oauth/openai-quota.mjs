@@ -8,16 +8,17 @@ import { getVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
+import { readCodexAccounts, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
 import { isCodexCliVm } from '../vm/codex-cli-config.mjs'
 import { refreshCliCredential } from '../transport/codex-cli-client.mjs'
+import { refreshStoredCodexCredential } from './codex-credential-refresh.mjs'
 import {
   buildCodexUsageView,
   extraToCodexSnapshot,
   normalizeCodexCredits,
   normalizeCodexLimits,
 } from '../protocol/codex-usage.mjs'
-import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch } from '../protocol/codex-models.mjs'
 import { openaiIdentityFromJwt } from './openai-jwt.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -298,20 +299,11 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     } catch { return { ...slot, rotateError: 'codex_cli_refresh_failed' } }
   }
   if (!slot.refresh) return slot
-  const tok = await refreshCodexAccessToken({
-    refreshToken: slot.refresh,
-    proxyUrl: slot.proxyUrl,
-    fetchImpl,
-    timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
-  })
-  if (!tok.ok) return { ...slot, rotateError: tok.error || 'refresh_failed' }
-  upsertCodexAccount(projectRoot, vmId, {
-    access_token: tok.access_token,
-    refresh_token: tok.refresh_token,
-    id_token: tok.id_token || slot.first.id_token,
-    expires_at: tok.expires_at || slot.first.expires_at,
-  })
-  return { ...slot, access: tok.access_token, refresh: tok.refresh_token || slot.refresh }
+  try {
+    const account = await refreshStoredCodexCredential(projectRoot, vmId, { previous: slot.first,
+      usedAccess: slot.access, proxyUrl: slot.proxyUrl, fetchImpl, timeoutMs: OPENAI_QUOTA_TIMEOUT_MS })
+    return { ...slot, access: account.access_token, refresh: account.refresh_token }
+  } catch { return { ...slot, rotateError: 'refresh_failed' } }
 }
 
 function publicUsage(extra, resetCredits, credits, usagePayload = {}) {

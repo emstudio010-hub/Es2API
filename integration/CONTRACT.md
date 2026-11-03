@@ -14,6 +14,10 @@
 
 ## 账号导入闭环
 
+### 重试与凭据交接（preview.5）
+
+生命周期导入带 `if_missing=true` 与 `expected_binding`，执行面核对所属账号、代次、后端及独占出口；已有唯一 OAuth 记录时保留，不把最初导入的旧刷新令牌覆盖回去。损坏文件或身份冲突保留原文并拒绝导入。修改运行设置触发重建时，先取消 ModelTrace、冻结实例、确认容器及宿主 Kernel 退出，再经管理员内部凭据交接端点取得当前令牌。控制面以 CAS 条件事务加密保存最新凭据和回执后才删除旧槽；中断重试依赖保存的回执，不凭 404 推断凭据已经保存。详见 [凭据连续性](../docs/CREDENTIAL_CONTINUITY.md)。
+
 ### OAuth 记录与元数据（preview.4）
 
 控制面和执行面共同使用 `vm2api/src/lib/oauth/credential-import.mjs` 的纯解析函数。运行 integration 时需要保留仓库中同级的 vm2api 源码目录；Linux 分发包已经包含该文件。

@@ -37,6 +37,7 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
 import { isCredentialRefreshFailed } from '../pool/availability.mjs'
+import { withCodexCredentialLock } from '../oauth/codex-credential-lock.mjs'
 
 const HEALTH_TIMEOUT_MS = 1500
 const BRIDGE_HEAL_MIN_MS = 60_000
@@ -369,7 +370,17 @@ export async function diagnoseSlotServices(
  * The POST /start boot: bind (or allocate) the exit, adopt its timezone, start
  * the container and its inference runtime, then record the running intent.
  */
-export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null, ops = {}, cliRecovery = false }) {
+export async function powerOnSlot(args) {
+  const vm = getVm(args.projectRoot, args.id)
+  if (!vm || !isCodexVm(vm)) return powerOnSlotUnlocked(args)
+  try { return await withCodexCredentialLock(args.projectRoot, args.id, () => powerOnSlotUnlocked(args)) }
+  catch (error) {
+    if (error.code !== 'codex_credential_handoff_pending') throw error
+    return { ok: false, status: 409, code: error.code, error: error.message }
+  }
+}
+
+async function powerOnSlotUnlocked({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null, ops = {}, cliRecovery = false }) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
   try {

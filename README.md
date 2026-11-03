@@ -17,6 +17,7 @@ Es2API 将 **Sub2API 的用户、分组、Key、计费和管理界面**，与 **
 - [VM2API 分支、来源与架构](docs/UPSTREAM_AND_ARCHITECTURE.md)
 - [ModelTrace 算法、调度与限制](docs/MODELTRACE.md)
 - [一账号一工作区及自动 IP 分配](docs/ACCOUNT_WORKSPACES.md) · [真实 Codex CLI 后端（预览）](docs/CODEX_CLI_BACKEND.md)
+- [OAuth 刷新、重试与重建交接](docs/CREDENTIAL_CONTINUITY.md)
 - [变更记录](CHANGELOG.md) · [已知限制](docs/KNOWN_LIMITATIONS.md) · [源码构建](docs/BUILD.md)
 
 ## 增加了什么
@@ -64,9 +65,9 @@ flowchart LR
 从 [Releases](https://github.com/emstudio010-hub/Es2API/releases) 下载 `.tar.gz` 及 `.sha256`，在服务器执行：
 
 ```bash
-sha256sum -c Es2API-linux-x64-20261104-r4.tar.gz.sha256
-tar -xzf Es2API-linux-x64-20261104-r4.tar.gz
-cd Es2API-linux-x64-20261104-r4
+sha256sum -c Es2API-linux-x64-20261104-r5.tar.gz.sha256
+tar -xzf Es2API-linux-x64-20261104-r5.tar.gz
+cd Es2API-linux-x64-20261104-r5
 sudo ./es2api.sh init
 sudo ./es2api.sh run
 ```

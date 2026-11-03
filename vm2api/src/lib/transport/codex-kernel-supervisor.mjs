@@ -13,6 +13,7 @@ import { maxRequestBytes } from '../core/config.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { codexKernelHealth, codexKernelPaths, codexSocketPath } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
+import { assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
 
 const starts = new Map()
 
@@ -56,6 +57,7 @@ export function codexKernelRequestOptions(routing = {}) {
 
 export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxyRequired, routing } = {}) {
   if (!projectRoot || !vm?.id) return null
+  assertCodexCredentialNotHandingOff(projectRoot, vm.id)
   assertProxyAllowed(vm.proxy)
   if (proxyUrl) assertProxyAllowed({ url: proxyUrl })
   const runDir = path.join(projectRoot, 'vms', vm.id, 'run')
@@ -185,6 +187,10 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
   if (!bin) return { ok: false, reason: 'bin_missing' }
   const paths = codexKernelPaths(exec)
   if (!paths.configPath) return { ok: false, reason: 'config_missing' }
+  const projectRoot = exec.homeDir ? path.dirname(path.dirname(path.dirname(exec.homeDir)))
+    : path.dirname(path.dirname(path.dirname(path.dirname(paths.configPath))))
+  try { assertCodexCredentialNotHandingOff(projectRoot, exec.vmId || exec.vm?.id) }
+  catch { return { ok: false, reason: 'credential_handoff_or_record_unavailable' } }
   const wanted = configRequestBytes(paths.configPath)
   const stamped = readLimitStamp(paths.configPath)
   const inFlight = openAIRuntimeSignals(exec.vmId).inFlight
@@ -207,6 +213,8 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
   try {
     if (paths.socketPath) fs.unlinkSync(paths.socketPath)
   } catch {}
+  try { assertCodexCredentialNotHandingOff(projectRoot, exec.vmId || exec.vm?.id) }
+  catch { return { ok: false, reason: 'credential_handoff_or_record_unavailable' } }
   const child = spawn(bin, [paths.configPath], {
     env: kernelEnv(),
     stdio: ['ignore', 'ignore', 'pipe'],
