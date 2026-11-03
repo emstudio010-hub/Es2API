@@ -1,0 +1,39 @@
+# 真实 Codex CLI 执行后端（预览）
+
+## 创建与使用
+
+在「账号管理 → 导入 OAuth」选择 **Codex CLI（预览）**。每个账号仍对应一个工作区、固定独占代理资源和 Docker 执行槽。CLI 并发固定为 1；后端只允许创建时选择，历史账号继续使用原 Kernel，不自动迁移。缺少空闲代理或出口时区时停止创建，不回退直连。
+
+源码安装工具：`node vm2api/scripts/install-codex-cli.mjs`。安装器从 npm 下载固定的 `@openai/codex@0.155.1-linux-x64` 平台包，核对固定 SHA-512，仅提取 x64 ELF 与 bwrap，许可证从对应官方 tag 下载并校验 SHA-256。不执行 npm 包脚本。安装目录为 `vm2api/share/codex-cli/linux-x64/`，不提交二进制到源码仓库；新 Linux 打包流程会附带它。运行时必须使用 Linux x64 Docker；节点和 KVM 暂不开放此后端。
+
+## 调用能力
+
+- 复用原来的账号分组发布、API Key、调用租约、计费与用量回传。
+- HTTP Responses、Chat Completions 的纯文本请求，流式/非流式均经现有协议层适配。Anthropic Messages 与旧 Completions 暂不提供 CLI 适配。
+- 每次调用运行真实 `codex exec --json --ephemeral`，位于本账号容器内，而非宿主机 Kernel。完整多轮文本作为显式 JSON 对话记录传入新的一轮 exec，不宣称与原生逐条角色消息完全等价。
+- CLI JSONL 的 agent_message 完成后转成 Responses 文本事件，再适配客户端协议；这不是逐 token 直通，首条文本可能到消息完成后才出现。
+- 只在 CLI 退出码为 0、收到 turn.completed、文本与真实 usage 齐全时标记完成。输入、缓存输入、输出用量取自 CLI，部分失败保留已有 usage，不伪造成功。
+- CLI 后端关闭外层传输重试、同账号重试及账号切换；设置上游请求和流重试次数为 0。CLI 自身执行细节仍以固定版本行为为准，无法承诺供应商侧严格只执行一次。
+- 不支持原生函数/自定义工具、图片、搜索/图片端点、音频、输出 token 上限、温度、结构化输出、service tier、priority/fast/ultrafast 或 response ID 续接，返回明确错误。Responses WebSocket 复用同一请求层及能力检查，不拥有独立 CLI 持久会话。Completions 的 prompt 格式也不支持。模型/推理强度最终须由该账号和 CLI 支持。
+
+## 隔离与进程生命周期
+
+固定版本工具目录只读挂入槽。每请求新建 CODEX_HOME、HOME 和空白工作目录，忽略用户配置/规则，read-only 沙箱，禁用 shell、浏览器、插件、apps、多代理、记忆等入口，关闭 MCP 配置与网页搜索。不继承宿主 Codex 认证。这里是 Docker 共享内核隔离，不是独立虚拟机或供应商客户端身份保证。
+
+临时 auth.json 只含短期 access/id token 和账号 ID，不复制 refresh token。刷新由控制面通过该账号固定出口完成，单进程按账号串行，并在落盘前检查凭据未被其他操作替换；额度刷新及手动刷新复用该路径。不能用多个独立控制面进程同时管理同一份账号文件。正常退出清理临时目录；不记录 stderr、认证、原始上游错误或代理密码。
+
+默认总时限 5 分钟，JSONL 输出上限 4 MiB，输入文本/指令上限 1 MiB。容器内 Python supervisor 启动独立进程组；超时、取消文件或宿主心跳丢失会终止整组进程。停止/删除实例会取消 CLI；执行期间重新导入或清除凭据先发取消并返回忙碌，等待结束后重试。
+
+宿主崩溃或 Docker 客户端退出不能证明容器进程已停止。没有 supervisor done 标记时保留临时目录并阻止新调用。可在账号池工作区选择「恢复实例」：暂停调度、取消在途检测/执行，确认对应容器完全停止后，仅清理该账号 `.es2api-requests/req-*`，再开机并检查健康。无法读取 Docker 状态或仍有宿主请求未释放时拒绝清理。恢复期间拒绝其他开机、重载和删除操作。
+
+## 实例操作
+
+账号池工作区支持启动、停止和恢复。管理 API 为 `POST /api/v1/admin/accounts/:id/{start|stop|recover}`，返回 202 后异步完成，页面每 3 秒刷新处理中状态，避免长时间拉取镜像超出网关超时。操作前后均核对账号、后端、代次与固定出口；停止/恢复会取消在途请求，需界面确认。完成后仍暂停调度，由用户检查后在运行设置中启用；同步状态也保留手动暂停。
+
+停止和删除要由 Docker 再次确认。删除未确认时保留账号记录、凭据和出口；容器删除成功才清理账号目录和释放出口，失败可重试。当前操作是单控制面进程串行锁，不支持多控制面共享同一状态目录。
+
+## 验收边界
+
+本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。
+
+参考：[官方非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[官方 CLI 命令](https://learn.chatgpt.com/docs/developer-commands?surface=cli)。

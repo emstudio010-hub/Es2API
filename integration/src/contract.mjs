@@ -136,16 +136,20 @@ export function normalizeAccountBinding(input = {}) {
   const groupId = optionalString(source.group_id ?? source.groupId)
   const groupIds = uniqueStrings(source.group_ids ?? source.groupIds)
   const explicitGroups = groupId ? [groupId, ...groupIds] : groupIds
+  const backend = source.execution_backend || 'kernel'
+  if (!['kernel', 'codex-cli'].includes(backend)) throw Object.assign(new TypeError('execution_backend 必须为 kernel 或 codex-cli'), { status: 400, code: 'invalid_execution_backend' })
+  if (backend === 'codex-cli' && source.max_concurrency != null && source.max_concurrency !== 1) throw Object.assign(new TypeError('Codex CLI 每个账号仅支持一个并行执行'), { status: 400, code: 'codex_cli_concurrency' })
   return {
     account_id: accountId,
     name: optionalString(source.name) || accountId,
     mode,
     group_ids: [...new Set(explicitGroups)],
-    group_strategy: mode === ACCOUNT_MODES.LEASE ? 'per_slot' : explicitGroups.length ? 'shared' : 'unassigned',
+    group_strategy: mode === ACCOUNT_MODES.LEASE || source.group_strategy === 'per_slot' ? 'per_slot' : explicitGroups.length ? 'shared' : 'unassigned',
     proxy_id: optionalString(source.proxy_id ?? source.ip_id ?? source.ipId),
     ip_policy: 'fixed',
     ip_selection: 'create_only',
     identity_policy: 'ip_derived',
+    execution_backend: backend,
     provision_generation: Number.isSafeInteger(source.provision_generation) && source.provision_generation > 0 ? source.provision_generation : 1,
     // The VM2 create route derives the effective timezone from the selected
     // egress. Keeping an old value here is only for migration/display; it is
@@ -167,6 +171,7 @@ export function buildVmProvisionRequest(binding) {
     family: 'codex',
     kind: 'codex',
     codex_kernel: true,
+    execution_backend: normalized.execution_backend,
     runtime_type: 'docker',
     // VM2 creates an empty slot first. Credentials are imported before the
     // explicit start action so an empty container is never admitted.
@@ -232,10 +237,12 @@ export function normalizeVmStatus(payload = {}) {
   const codexHealth = asRecord(raw.data?.kernel?.codex_health ?? raw.kernel?.codex_health)
   const healthOk = health.ok === false || codexHealth.reachable === false ? false
     : health.ok === true || codexHealth.reachable === true ? true : null
-  const proxy = asRecord(vm.proxy ?? raw.proxy)
+  const proxy = asRecord(vm.proxy ?? raw.proxy ?? raw.data?.proxy)
+  const allocatedProxy = raw.allocated_proxy ?? raw.data?.allocated_proxy
   return {
     id,
     status,
+    execution_backend: vm.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
     ready: status === 'running' && healthOk !== false,
     schedulable: vm.schedulable === true,
     isolation: {
@@ -254,8 +261,8 @@ export function normalizeVmStatus(payload = {}) {
       checked_at: optionalString(health.checked_at),
     },
     egress: {
-      bound: !!(proxy.id || proxy.proxy_id || raw.allocated_proxy),
-      proxy_id: optionalString(proxy.id ?? proxy.proxy_id ?? raw.allocated_proxy?.id),
+      bound: !!(proxy.id || proxy.proxy_id || allocatedProxy?.id),
+      proxy_id: optionalString(proxy.id ?? proxy.proxy_id ?? allocatedProxy?.id),
       timezone: optionalString(vm.timezone ?? raw.timezone),
     },
   }

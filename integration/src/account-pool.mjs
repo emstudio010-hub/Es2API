@@ -104,11 +104,16 @@ export class AccountPool {
 
   resolveBinding(input, accountId) {
     let binding = normalizeAccountBinding({ ...input, account_id: accountId })
-    if (binding.mode === 'lease' && binding.group_ids.length === 0) {
-      const autoGroupId = `lease-${binding.account_id}`
-      const group = this.store.getGroup(autoGroupId) || this.store.createGroup({ id: autoGroupId, name: autoGroupId,
+    if (binding.group_ids.length === 0) {
+      const autoGroupId = `${binding.mode === 'lease' ? 'lease' : 'workspace'}-${binding.account_id}`
+      let group = this.store.getGroup(autoGroupId) || this.store.createGroup({ id: autoGroupId, name: autoGroupId,
         platform: 'openai', strategy: 'per_slot', lease_account_id: binding.account_id })
+      if (group.strategy === 'per_slot' && !group.lease_account_id && !group.account_count) {
+        if (this.store.claimLeaseGroup(group.id, binding.account_id)) group = this.store.getGroup(group.id)
+      }
+      if (group.strategy !== 'per_slot' || group.lease_account_id !== binding.account_id) throw Object.assign(new Error('账号池分组标识已被其他分组占用'), { status: 409, code: 'workspace_group_conflict' })
       binding = normalizeAccountBinding({ ...input, account_id: accountId, group_ids: [group.id] })
+      binding.group_strategy = 'per_slot'
     }
     if (binding.mode === 'lease' && binding.group_ids.length !== 1) {
       throw Object.assign(new Error('租赁模式必须且只能绑定一个独立分组'), { status: 400, code: 'lease_group_required' })
@@ -133,9 +138,10 @@ export class AccountPool {
     const accountId = String(input.account_id ?? input.id ?? '').trim()
     if (!/^[a-z0-9][a-z0-9_-]{0,75}$/i.test(accountId) || accountId.toLowerCase().endsWith('-chat')) throw Object.assign(new Error('account_id 格式无效（最多 76 个字母、数字、下划线或连字符，不能以 -chat 结尾）'), { status: 400, code: 'invalid_account_id' })
     if (this.store.getAccount(accountId)) throw Object.assign(new Error('账号已存在'), { status: 409, code: 'account_exists' })
+    if (input.group_ids?.length || input.groupIds?.length || input.group_id || input.groupId) throw Object.assign(new Error('导入账号会自动创建独立账号池，无需指定共享分组'), { status: 400, code: 'workspace_group_automatic' })
     const normalized = normalizeOpenAICredential(credential)
     const status = publicCredentialStatus(normalized)
-    const concurrency = input.concurrency ?? input.max_concurrency ?? 2
+    const concurrency = input.concurrency ?? input.max_concurrency ?? (input.execution_backend === 'codex-cli' ? 1 : 2)
     const priority = input.priority ?? 50
     assertInteger(concurrency, 'concurrency', 1, 256)
     assertInteger(priority, 'priority', 0, 100000)
@@ -231,6 +237,7 @@ export class AccountPool {
       }
       return this.store.updateAccount(id, {
         vm_id: result.vm_id,
+        binding: { ...latest.binding, proxy_id: result.slot.egress.proxy_id, timezone: result.slot.egress.timezone || latest.binding.timezone },
         status: 'ready',
         schedulable: this.store.getAccount(id).group_ids.length > 0 && this.store.getAccount(id).group_ids.every(groupId => this.store.getGroup(groupId)?.status === 'active'),
         slot_json: { status: 'running', ready: true, verified: true, ...result.slot },
@@ -272,7 +279,7 @@ export class AccountPool {
     if (staleRebind && account.vm_id) {
       this.store.updateAccount(id, { status: 'provisioning', schedulable: false })
       try {
-        await this.lifecycle.remove({ account_id: account.id, mode: account.mode, group_ids: account.group_ids }, account.vm_id,
+        await this.lifecycle.remove({ ...account.binding, account_id: account.id, mode: account.mode, group_ids: account.group_ids }, account.vm_id,
           { generation: account.provision_generation })
       } catch (error) {
         const safe = publicError(error)
@@ -300,7 +307,7 @@ export class AccountPool {
     this.store.updateAccount(id, { status: 'deleting', schedulable: false, deletion_pending: true })
     try {
       await this.beforeRemoveAccount(String(id))
-      if (account.vm_id) await this.lifecycle.remove({ account_id: account.id, mode: account.mode, group_ids: account.group_ids }, account.vm_id,
+      if (account.vm_id) await this.lifecycle.remove({ ...account.binding, account_id: account.id, mode: account.mode, group_ids: account.group_ids }, account.vm_id,
         { generation: account.provision_generation })
       this.store.transaction(() => {
         this.store.deleteAccount(id)
@@ -341,6 +348,7 @@ export class AccountPool {
     }
     let effectiveGroupIds = account.group_ids
     const bindingPatch = {}
+    if ('execution_backend' in input && input.execution_backend !== (account.binding?.execution_backend || 'kernel')) throw Object.assign(new Error('执行后端仅在导入账号时选择；修改需要删除并重新导入'), { status: 409, code: 'execution_backend_immutable' })
     if (Object.prototype.hasOwnProperty.call(input, 'proxy_id') || Object.prototype.hasOwnProperty.call(input, 'timezone')) {
       throw Object.assign(new Error('执行槽 IP 和时区只允许在创建容器时选择；需要变更时请删除并重新导入账号'), {
         status: 409,
@@ -353,6 +361,10 @@ export class AccountPool {
     if ('group_ids' in input) {
       if (!Array.isArray(input.group_ids)) throw Object.assign(new Error('group_ids 必须为数组'), { status: 400, code: 'invalid_group_ids' })
       requestedGroups = [...new Set(input.group_ids.map(value => String(value).trim()).filter(Boolean))]
+      if (account.group_ids.some(groupId => groupId === `workspace-${id}` && this.store.getGroup(groupId)?.lease_account_id === id) &&
+        JSON.stringify([...requestedGroups].sort()) !== JSON.stringify([...account.group_ids].sort())) {
+        throw Object.assign(new Error('独立账号池不能迁移到其他账号的分组'), { status: 409, code: 'workspace_group_locked' })
+      }
       if (account.mode === 'lease' && JSON.stringify(requestedGroups) !== JSON.stringify(account.group_ids)) {
         throw Object.assign(new Error('租赁账号不能迁移已有槽位分组'), { status: 409, code: 'lease_group_locked' })
       }
@@ -364,6 +376,7 @@ export class AccountPool {
     const slotBindingChanged = Object.keys(bindingPatch).length > 0 ||
       Object.prototype.hasOwnProperty.call(input, 'concurrency')
     if ('concurrency' in input) {
+      if (account.binding?.execution_backend === 'codex-cli' && input.concurrency !== 1) throw Object.assign(new Error('Codex CLI 每账号仅支持一个并行执行'), { status: 400, code: 'codex_cli_concurrency' })
       assertInteger(input.concurrency, 'concurrency', 1, 256)
       fields.concurrency = input.concurrency
     }
@@ -408,6 +421,7 @@ export class AccountPool {
   }
 
   async syncAccount(id) {
+    if (this.locks.has(String(id))) throw Object.assign(new Error('实例操作正在进行，请等待完成'), { status: 409, code: 'lifecycle_busy' })
     return this.withLock(id, async () => {
       const account = this.store.getAccount(id)
       if (!account) throw Object.assign(new Error('账号不存在'), { status: 404, code: 'account_not_found' })
@@ -417,13 +431,13 @@ export class AccountPool {
       try {
         const status = await this.lifecycle.inspect({ ...account.binding, provision_generation: account.provision_generation }, account.vm_id)
         const ready = status?.ready === true && (status.status == null || status.status === 'running') && status.health?.ok !== false
-        const schedulable = ready && !account.slot_binding_stale && account.group_ids.length > 0 &&
+        const schedulable = account.schedulable && ready && !account.slot_binding_stale && account.group_ids.length > 0 &&
           account.group_ids.every(groupId => this.store.getGroup(groupId)?.status === 'active') &&
           !(account.modeltrace?.state || {}).auto_paused
         return this.store.updateAccount(id, {
-          status: ready ? 'ready' : 'error', schedulable, slot_json: status,
-          last_health_check_at: new Date().toISOString(), error_code: ready ? null : 'slot_not_ready',
-          error_message: ready ? null : '执行槽健康检查未通过',
+          status: status.status === 'stopped' ? 'stopped' : ready ? 'ready' : 'error', schedulable, slot_json: status,
+          last_health_check_at: new Date().toISOString(), error_code: ready || status.status === 'stopped' ? null : 'slot_not_ready',
+          error_message: ready || status.status === 'stopped' ? null : '执行槽健康检查未通过',
         })
       } catch (error) {
         const safe = publicError(error)
@@ -431,6 +445,35 @@ export class AccountPool {
           last_health_check_at: new Date().toISOString(), error_code: safe.code, error_message: safe.message })
       }
     })
+  }
+
+  queueInstanceOperation(id, action) {
+    if (this.locks.has(String(id))) throw Object.assign(new Error('实例操作正在进行'), { status: 409, code: 'lifecycle_busy' })
+    if (!['start', 'stop', 'recover'].includes(action)) throw Object.assign(new Error('不支持的实例操作'), { status: 400, code: 'invalid_slot_action' })
+    const account = this.store.getAccount(id)
+    if (!account) throw Object.assign(new Error('账号不存在'), { status: 404, code: 'account_not_found' })
+    if (!account.vm_id || account.deletion_pending || ['provisioning', 'deleting'].includes(account.status)) throw Object.assign(new Error('账号尚无可操作的实例或生命周期操作尚未完成'), { status: 409, code: 'slot_not_available' })
+    if (account.slot_binding_stale && action !== 'stop') throw Object.assign(new Error('运行配置已变更，请先重建绑定'), { status: 409, code: 'slot_binding_stale' })
+    if (account.dispatch.inflight_requests > 0 && action === 'start') throw Object.assign(new Error('实例仍有在途请求'), { status: 409, code: 'account_busy' })
+    // Pause before any await so no new gateway lease is admitted. Power actions
+    // never silently re-enable a manually paused account after health returns.
+    this.store.updateAccount(id, { status: 'provisioning', schedulable: false, group_pause_restore: false, error_code: null, error_message: null })
+    // The browser gets 202 immediately; container pulls/recovery may take minutes.
+    // The existing persistent status becomes error if this process is interrupted.
+    void this.withLock(id, async () => {
+      try {
+        await this.beforeRemoveAccount(String(id))
+        const slot = await this.lifecycle.operate({ ...account.binding, account_id: account.id, provision_generation: account.provision_generation }, account.vm_id, action)
+        return this.store.updateAccount(id, { status: action === 'stop' ? 'stopped' : 'ready', schedulable: false,
+          slot_json: slot, error_code: null, error_message: null, last_health_check_at: new Date().toISOString() })
+      } catch (error) {
+        const safe = publicError(error)
+        this.store.updateAccount(id, { status: 'error', schedulable: false, error_code: safe.code, error_message: safe.message })
+      }
+    }).catch(() => {
+      this.store.updateAccount(id, { status: 'error', schedulable: false, error_code: 'slot_action_interrupted', error_message: '实例操作中断，请同步状态后检查' })
+    })
+    return this.store.getAccount(id)
   }
 
   acquireRequest(input = {}) { return this.store.acquireRequest(input) }

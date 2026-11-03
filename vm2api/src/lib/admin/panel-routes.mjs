@@ -264,6 +264,8 @@ import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
+import { isCodexCliVm, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
+import { codexCliHealth, cancelCodexCli, refreshCliCredential } from '../transport/codex-cli-client.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
@@ -404,6 +406,7 @@ async function commitImportedCodexVm({
   routingConfig = {},
 }) {
   const wasCodex = isCodexVm(existing)
+  if (isCodexCliVm(existing) && cancelCodexCli(existing.id)) throw Object.assign(new Error('CLI 正在退出，请等待执行结束后重新导入'), { status: 409, code: 'codex_cli_busy' })
   const previousPolicy = existing.policy && typeof existing.policy === 'object' ? existing.policy : {}
   const saved = upsertCodexAccount(cfg.paths.project, existing.id, account, { replaceCredentials: true })
   existing.platform = 'openai'
@@ -1004,7 +1007,7 @@ export function createPanelHandler(ctx) {
       return { go: missing, rust: missing }
     }
     if (isCodexVm(vm)) {
-      const health = await codexKernelHealth(exec, { timeoutMs: 600 })
+      const health = await (isCodexCliVm(vm) ? codexCliHealth : codexKernelHealth)(exec, { timeoutMs: isCodexCliVm(vm) ? 5000 : 600 })
       return {
         codex: {
           ...toPublicKernelHealth(health, 'codex'),
@@ -3305,23 +3308,26 @@ export function createPanelHandler(ctx) {
         try {
           if (vm) {
             const gone = await destroySlot(vm)
-            // A node slot that could not be removed keeps running there with the account's credential.
-            if (!gone.ok && slotHost(vm).kind === 'node') {
+            // Local slots also retain credentials when Docker cannot confirm removal.
+            if (!gone.ok) {
               return json(res, 409, {
                 ok: false,
-                error: { code: gone.code || 'remote_destroy_failed', message: gone.error || 'remote destroy failed' },
+                error: { code: gone.code || 'slot_destroy_failed', message: '容器删除尚未确认，账号记录、凭据和固定出口均已保留' },
               })
             }
           }
-        } catch {}
-        // detach this VM only — do not unbind other slots sharing the SOCKS5
-        try {
-          proxyPool.unbindVm(id)
-        } catch {}
-        // remove cli-home
+        } catch {
+          return json(res, 409, { ok: false, error: { code: 'slot_destroy_unconfirmed', message: '无法确认实例删除结果，数据与出口绑定已保留' } })
+        }
+        // Remove account files only after confirmed container removal.
         try {
           fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
-        } catch {}
+        } catch {
+          return json(res, 409, { ok: false, error: { code: 'slot_files_cleanup_failed', message: '容器已删除，但账号目录清理失败；记录与出口保留，可重试删除' } })
+        }
+        try { proxyPool.unbindVm(id) } catch {
+          return json(res, 409, { ok: false, error: { code: 'slot_proxy_release_failed', message: '容器已删除，但出口释放未确认；账号记录保留' } })
+        }
         fs.unlinkSync(vmPath)
         invalidateVmSlotReadCache(cfg.paths.project, id)
         try {
@@ -3453,6 +3459,7 @@ export function createPanelHandler(ctx) {
           }
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
           prev.id = prev.id || id
+          if (isCodexCliVm(prev) && cancelCodexCli(id)) return json(res, 409, { ok: false, error: { code: 'codex_cli_busy', message: 'CLI 正在退出，请等待执行结束后清除凭据' } })
           const slotDir = path.join(cfg.paths.project, 'vms', id)
           const removed = []
           for (const file of [
@@ -3493,7 +3500,7 @@ export function createPanelHandler(ctx) {
           const kernel = { stopped: false, restarted: false, error: null }
           try {
             kernel.stopped = !!stopCodexKernel(id)
-            if (isCodexVm(vm)) {
+            if (isCodexVm(vm) && !isCodexCliVm(vm)) {
               const started = await ensureCodexKernel(slotExec(cfg.paths.project, getVm(cfg.paths.project, id) || vm), {
                 timeoutMs: 8000,
               })
@@ -4003,6 +4010,19 @@ export function createPanelHandler(ctx) {
         }
         // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
         let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
+        const accountWorkspace = ident.role === 'admin' && body.slot_binding?.account_id && id === `es2-${body.slot_binding.account_id}`
+        const executionBackend = body.execution_backend || 'kernel'
+        if (!['kernel', 'codex-cli'].includes(executionBackend)) return json(res, 400, { ok: false, error: { code: 'invalid_execution_backend', message: '不支持的执行后端' } })
+        if (executionBackend === 'codex-cli') {
+          const probe = {}; stampVmKind(probe, body)
+          if (!accountWorkspace || nodeId || runtime !== 'docker' || !isCodexVm(probe) || Number(body.max_concurrency) !== 1) return json(res, 400, { ok: false, error: { code: 'codex_cli_requires_dedicated_docker', message: 'CLI 仅支持独立账号池、本机 Docker、并发 1' } })
+          const payload = inspectCodexCliPayload()
+          if (!payload.ok) return json(res, 503, { ok: false, error: { code: payload.code, message: payload.error } })
+        }
+        if (accountWorkspace && !pickedProxyId && body.auto_allocate_proxy === true) {
+          pickedProxyId = proxyPool.allocateForVm(id, { exclusive: true, allowLocal: false, reserve: false })?.id || ''
+          if (!pickedProxyId) return json(res, 409, { ok: false, error: { code: 'dedicated_proxy_unavailable', message: '没有可用的独占 IP，请导入未占用的代理资源后重试。不会回退本机直连。' } })
+        }
         if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
           // Local egress is per VPS: a generic pick resolves to the target machine's own row.
           const resolved = proxyPool.resolveLocalTarget(pickedProxyId, nodeId || null)
@@ -4024,7 +4044,7 @@ export function createPanelHandler(ctx) {
             })
           }
           const used = Array.isArray(row.bound_vm_ids) ? row.bound_vm_ids.length : 0
-          if (!row.enabled || row.status === 'dead' || row.blocked_reason || used >= (row.bind_limit || 5)) {
+          if (!row.enabled || ['dead', 'fail'].includes(row.status) || row.blocked_reason || used >= (row.bind_limit || 5) || (accountWorkspace && (used > 0 || row.kind === 'local'))) {
             return json(res, 409, {
               ok: false,
               error: { code: 'proxy_unavailable', message: '所选出口已失效或已绑满' },
@@ -4098,6 +4118,7 @@ export function createPanelHandler(ctx) {
         }
         const vm = {
           id,
+          execution_backend: executionBackend,
           name: body.name || padVm(idx),
           status: startNow ? 'running' : body.status || 'stopped',
           kernel: wantKernel,
@@ -4110,6 +4131,8 @@ export function createPanelHandler(ctx) {
           ...(ident.role === 'admin' && body.slot_binding?.account_id && id === `es2-${body.slot_binding.account_id}` ? {
             integration_binding: {
               account_id: String(body.slot_binding.account_id),
+              proxy_exclusive: true,
+              proxy_id: pickedProxyId || null,
               provision_generation: Number.isSafeInteger(body.slot_binding.provision_generation) && body.slot_binding.provision_generation > 0 ? body.slot_binding.provision_generation : 1,
             },
           } : {}),
@@ -4209,7 +4232,17 @@ export function createPanelHandler(ctx) {
           vm.policy.maxRpm = explicitRpm ? rawRpm : Number(ctx.routingConfig?.concurrency?.default_max_rpm ?? 0)
           vm.policy.rpmOverride = explicitRpm
         }
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
+        // Geo lookup above may yield. Recheck and reserve synchronously before
+        // persisting the slot so two simultaneous imports cannot share an exit.
+        if (fs.existsSync(vmPath)) return json(res, 409, { ok: false, error: { code: 'vm_exists', message: 'vm id exists' } })
+        if (accountWorkspace) {
+          const reserved = proxyPool.bind(pickedProxyId, id, { exclusive: true, allowLocal: false })
+          if (!reserved.ok) return json(res, 409, { ok: false, error: { code: 'dedicated_proxy_unavailable', message: '所选 IP 已被占用或不可用，请重试。' } })
+        }
+        try { atomicWriteJson(vmPath, vm, { mode: 0o600 }) } catch (error) {
+          if (accountWorkspace) proxyPool.unbind(pickedProxyId, id)
+          throw error
+        }
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
         try {
           seedFreshCliHome(cfg.paths.project, vm)
@@ -4221,7 +4254,7 @@ export function createPanelHandler(ctx) {
         const hasExit = (v) => !!(v?.proxy?.url || isLocalEgressProxy(v?.proxy))
         if (wantProxy && !hasExit(vm)) {
           if (pickedProxyId) {
-            const bound = proxyPool.bind(pickedProxyId, id)
+            const bound = proxyPool.bind(pickedProxyId, id, vm.integration_binding ? { exclusive: true, allowLocal: false } : {})
             if (bound.ok) allocated = bound.proxy
             else proxyError = bound.error || 'proxy_bind_failed'
           } else {
@@ -4229,13 +4262,19 @@ export function createPanelHandler(ctx) {
               allocated = proxyPool.allocateForVm(id, {
                 ownerUserId: vm.owner_user_id || null,
                 role: ident.role,
+                ...(vm.integration_binding ? { exclusive: true, allowLocal: false } : {}),
               })
             } catch (e) {}
           }
           if (allocated) {
             bindVmProxy(cfg.paths.project, id, proxyPool.getProxyForVm(id))
             adoptVmProxyBinding(vm, getVm(cfg.paths.project, id))
+            if (vm.integration_binding) {
+              vm.integration_binding.proxy_id = allocated.id
+              patchVmRecord(cfg.paths.project, id, { integration_binding: vm.integration_binding })
+            }
           }
+          if (!allocated && vm.integration_binding) proxyError ||= 'no_free_dedicated_proxy'
         }
         // vm is written again below; carry the exit's zone so that write keeps it.
         const zoned = await fillTimezoneFromExit(id)
@@ -4912,6 +4951,11 @@ export function createPanelHandler(ctx) {
         }
         const vm = getVm(cfg.paths.project, id)
         if (isCodexVm(vm)) {
+          if (isCodexCliVm(vm)) {
+            try { await refreshCliCredential(cfg.paths.project, vm, { force: true }) }
+            catch { return json(res, 502, { ok: false, error: { code: 'codex_cli_refresh_failed', message: 'CLI OAuth 刷新失败，请检查账号凭据' } }) }
+            return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
+          }
           const first = readCodexAccounts(cfg.paths.project, id)[0] || {}
           const refreshToken = String(first.refresh_token || '').trim()
           if (!refreshToken) {
@@ -5554,6 +5598,7 @@ export function createPanelHandler(ctx) {
         const text = body.text || body.lines || (Array.isArray(body) ? body.join('\n') : '')
         const ident = panelIdentity(req)
         const bindVmId = String(body.bind_vm_id || body.vm_id || '').trim()
+        if (bindVmId && getVm(cfg.paths.project, bindVmId)?.integration_binding?.proxy_exclusive) return json(res, 409, { ok: false, error: { code: 'account_exit_locked', message: '账号池出口在创建时固定，不能通过导入代理更换。' } })
         if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
           return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         }
@@ -5646,6 +5691,8 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PUT' && /^\/api\/panel\/proxies\/(?!config$)[^/]+$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024)
+        const assigned = proxyPool.snapshot().proxies.find(row => row.id === id)
+        if (assigned?.bound_vm_ids?.some(vmId => getVm(cfg.paths.project, vmId)?.integration_binding?.proxy_exclusive) && ['host', 'port', 'username', 'password'].some(key => Object.hasOwn(body, key))) return json(res, 409, { ok: false, error: { code: 'account_exit_locked', message: '已绑定账号池的固定出口不能修改连接信息。' } })
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
@@ -5813,7 +5860,9 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: { type: 'invalid_request_error', code: 'missing_field', message: 'vm_id required', param: 'vm_id' },
           })
-        const result = proxyPool.bind(id, vmId)
+        const record = getVm(cfg.paths.project, vmId)
+        if (record?.integration_binding?.proxy_exclusive && (record.integration_binding.proxy_id || record.proxy?.id) !== id) return json(res, 409, { ok: false, error: { code: 'account_exit_locked', message: '账号池出口在创建时固定。' } })
+        const result = proxyPool.bind(id, vmId, record?.integration_binding?.proxy_exclusive ? { exclusive: true, allowLocal: false } : {})
         if (!result.ok) {
           const message =
             result.error === 'proxy_bind_limit'
@@ -5858,6 +5907,7 @@ export function createPanelHandler(ctx) {
             : snap?.bound_vm_id
               ? [snap.bound_vm_id]
               : []
+        if (targets.some(target => getVm(cfg.paths.project, target)?.integration_binding?.proxy_exclusive)) return json(res, 409, { ok: false, error: { code: 'account_exit_locked', message: '请先删除账号池实例，再释放固定出口。' } })
         const result = proxyPool.unbind(id, vmId || null)
         if (!result.ok)
           return json(res, 404, {
@@ -5877,6 +5927,7 @@ export function createPanelHandler(ctx) {
         const id = p.split('/').pop()
         const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
         const targets = snap?.bound_vm_ids?.length ? snap.bound_vm_ids : snap?.bound_vm_id ? [snap.bound_vm_id] : []
+        if (targets.some(target => getVm(cfg.paths.project, target)?.integration_binding?.proxy_exclusive)) return json(res, 409, { ok: false, error: { code: 'account_exit_locked', message: '请先删除账号池实例，再删除固定出口。' } })
         const result = proxyPool.remove(id)
         if (!result.ok)
           return json(res, 404, {
@@ -5893,13 +5944,19 @@ export function createPanelHandler(ctx) {
       // Auto-allocate proxy for a VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/allocate-proxy$/.test(p)) {
         const vmId = p.split('/')[4]
-        const allocated = proxyPool.allocateForVm(vmId)
+        const record = getVm(cfg.paths.project, vmId)
+        if (!record || userMissesVmId(req, cfg.paths.project, vmId)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        const binding = record.integration_binding
+        const allocated = proxyPool.allocateForVm(vmId, binding?.proxy_exclusive ? {
+          exclusive: true, allowLocal: false, fixed: true, preferredId: binding.proxy_id || record.proxy?.id || null,
+        } : {})
         if (!allocated)
           return json(res, 409, {
             ok: false,
             error: { type: 'api_error', code: 'no_free_proxy', message: 'No free SOCKS5 in pool' },
           })
         bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
+        if (binding?.proxy_exclusive) patchVmRecord(cfg.paths.project, vmId, { integration_binding: { ...binding, proxy_id: allocated.id } })
         if (egressEnabled()) await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyForVm(vmId))
         let worker = null
         const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {

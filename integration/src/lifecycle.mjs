@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import {
   buildCodexImportRequest,
   buildVmProvisionRequest,
@@ -16,8 +17,12 @@ function vmIdFrom(payload) {
 }
 
 function assertSlot(binding, id, status = null) {
+  if (status && (status.execution_backend || 'kernel') !== (binding.execution_backend || 'kernel')) throw Object.assign(new Error('执行槽后端与账号配置不一致'), { code: 'vm2_execution_backend_mismatch', status: 409 })
   if (String(id) !== buildVmProvisionRequest(binding).id || (status && status.id !== String(id))) {
     throw Object.assign(new Error('执行槽与账号不匹配，已拒绝操作'), { code: 'vm2_slot_binding_mismatch', status: 409 })
+  }
+  if (binding.proxy_id && status?.egress?.bound && status.egress.proxy_id !== binding.proxy_id) {
+    throw Object.assign(new Error('执行槽出口与账号固定 IP 不一致，已拒绝操作'), { code: 'vm2_exit_binding_mismatch', status: 409 })
   }
   if (status?.isolation?.account_id && (status.isolation.account_id !== binding.account_id ||
     (status.isolation.generation && status.isolation.generation !== binding.provision_generation))) {
@@ -65,13 +70,38 @@ export class AccountLifecycle {
         }
       }
       if (!vmId) {
-        created = await this.vm2.createSlot(binding, operationKey('create'))
-        vmId = vmIdFrom(created)
+        try {
+          created = await this.vm2.createSlot(binding, operationKey('create'))
+          vmId = vmIdFrom(created)
+        } catch (error) {
+          // A response can be lost after persistence. Adopt only a slot with
+          // the matching account and generation, then resume the same identity.
+          const candidate = buildVmProvisionRequest(binding).id
+          let existing
+          try { existing = await this.vm2.getSlot(candidate) } catch { throw error }
+          if (!existing.isolation?.account_id) throw error
+          assertSlot(binding, candidate, existing)
+          vmId = candidate
+        }
       }
       if (!vmId) throw Object.assign(new Error('VM2 create response did not include vm id'), { code: 'vm2_missing_vm_id' })
       assertSlot(binding, vmId)
+      const createdSlot = created ? normalizeVmStatus(created) : null
       this.onState({ ...publicLifecycleResult({ accountId, vmId, phase: 'slot_created', status: 'pending', credential }),
-        slot: { id: vmId, status: 'provisioning', ready: false } })
+        slot: { id: vmId, status: 'provisioning', ready: false, ...(createdSlot?.egress?.bound ? { egress: createdSlot.egress } : {}) } })
+      // Reserve an exit before credentials are sent. Retrying an empty slot uses
+      // the same canonical identity and the fixed-exit allocator.
+      let allocatedStatus = await this.vm2.getSlot(vmId)
+      assertSlot(binding, vmId, allocatedStatus)
+      if (!allocatedStatus.egress?.bound) {
+        await this.vm2.ensureSlotProxy(vmId)
+        allocatedStatus = await this.vm2.getSlot(vmId)
+      }
+      assertSlot(binding, vmId, allocatedStatus)
+      if (!allocatedStatus.egress?.bound || !allocatedStatus.egress.proxy_id) {
+        throw Object.assign(new Error('账号池尚未绑定出口，无法导入凭据或启动'), { status: 409, code: 'dedicated_proxy_unavailable' })
+      }
+      this.onState({ ...publicLifecycleResult({ accountId, vmId, phase: 'exit_bound', status: 'pending', credential }), slot: allocatedStatus })
       await this.vm2.importCredential(vmId, credential, operationKey('import'))
       if (typeof this.vm2.startSlot === 'function') await this.vm2.startSlot(vmId, operationKey('start'))
       const rawStatus = await this.vm2.getSlot(vmId)
@@ -124,6 +154,21 @@ export class AccountLifecycle {
     assertSlot(binding, id, status)
     this.onState({ ...publicLifecycleResult({ accountId: binding.account_id, vmId: id,
       phase: 'health_checked', status: status.ready ? 'running' : 'error' }), slot: status })
+    return status
+  }
+
+  async operate(accountInput, vmId, action) {
+    if (!['start', 'stop', 'recover'].includes(action)) throw new TypeError('invalid slot action')
+    const binding = normalizeAccountBinding(accountInput)
+    const id = String(vmId || '')
+    assertSlot(binding, id, await this.vm2.getSlot(id))
+    const operationKey = `account-${action}:g${binding.provision_generation}:${binding.account_id}:${crypto.randomUUID()}`
+    if (action === 'start') await this.vm2.startSlot(id, operationKey)
+    else if (action === 'stop') await this.vm2.stopSlot(id, operationKey)
+    else await this.vm2.recoverSlot(id, operationKey)
+    const status = await this.vm2.getSlot(id)
+    assertSlot(binding, id, status)
+    if (action === 'stop' ? status.status !== 'stopped' : !status.ready) throw Object.assign(new Error('实例操作结果尚未确认，请同步状态后检查'), { status: 502, code: 'slot_action_unconfirmed' })
     return status
   }
 }

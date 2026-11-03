@@ -909,7 +909,8 @@ export async function buildVmDetail({
     official_cc: gpt ? null : readOfficialCcStatus(officialCcHome(cfg.paths.project, id)),
     kernel: gpt
       ? {
-          credential_owner: 'codex',
+          credential_owner: summary.execution_backend === 'codex-cli' ? 'control-plane' : 'codex',
+          execution_backend: summary.execution_backend || 'kernel',
           configured_engine: null,
           resolved_engine: null,
           active_engine: null,
@@ -2078,6 +2079,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         (u7 != null && gateZone(u7, weeklySafety, quotaGate) !== GATE_OPEN),
     fingerprint: v.fingerprint || null,
     physical_features: publicPhysicalFeatures(v),
+    identity_policy: v.identity_policy || null,
+    integration_binding: v.integration_binding || null,
+    execution_backend: v.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
     runtime: v.runtime || null,
     ip: v.ip || v.runtime?.ip || null,
     pid: v.pid || v.runtime?.pid || null,

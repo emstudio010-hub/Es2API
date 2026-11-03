@@ -9,6 +9,8 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
+import { isCodexCliVm } from '../vm/codex-cli-config.mjs'
+import { refreshCliCredential } from '../transport/codex-cli-client.mjs'
 import {
   buildCodexUsageView,
   extraToCodexSnapshot,
@@ -289,6 +291,12 @@ async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchI
 }
 
 async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
+  if (isCodexCliVm(slot.vm)) {
+    try {
+      const account = await refreshCliCredential(projectRoot, slot.vm, { force: true })
+      return { ...slot, access: account.access_token, refresh: account.refresh_token }
+    } catch { return { ...slot, rotateError: 'codex_cli_refresh_failed' } }
+  }
   if (!slot.refresh) return slot
   const tok = await refreshCodexAccessToken({
     refreshToken: slot.refresh,

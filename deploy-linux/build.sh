@@ -6,7 +6,8 @@ cd "$TASK_ROOT"
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || { echo '需要 Linux x86_64。' >&2; exit 1; }
 for tool in node npm go python3 curl sha256sum; do command -v "$tool" >/dev/null || { echo "缺少构建依赖：$tool" >&2; exit 1; }; done
 node --input-type=module -e 'if (Number(process.versions.node.split(".")[0]) < 24) throw new Error("Node.js 24+ required")'
-[[ ! -e build-cache/Es2API-linux-x64-20261102 ]] || { echo '分发暂存目录已存在，请保留旧产物或设置 ES2API_STAGE_FOLDER 后重试。' >&2; if [[ -z "${ES2API_STAGE_FOLDER:-}" ]]; then exit 1; fi; }
+STAGE_FOLDER="${ES2API_STAGE_FOLDER:-${ES2API_RELEASE_NAME:-Es2API-linux-x64-20261104}}"
+[[ ! -e "build-cache/$STAGE_FOLDER" ]] || { echo "分发暂存目录已存在：$STAGE_FOLDER" >&2; exit 1; }
 mkdir -p build-cache/linux build-cache/deps/integration build-cache/deps/vm2api build-cache/payload
 (
   cd sub2api/frontend
@@ -32,6 +33,7 @@ for project in integration vm2api; do
   npm ci --prefix "build-cache/deps/$project" --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund
 done
 node vm2api/scripts/fetch-payload.mjs --dest "$TASK_ROOT/build-cache/payload"
+node vm2api/scripts/install-codex-cli.mjs
 curl --fail --location https://nodejs.org/dist/v24.22.2/SHASUMS256.txt -o build-cache/node-v24.22.2-SHASUMS256.txt
 curl --fail --location https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz -o build-cache/node-v24.22.2-linux-x64.tar.xz
 (

@@ -27,8 +27,10 @@ import {
   codexQuotaPark,
   CODEX_DEFAULT_PARK_MS,
 } from './codex-usage.mjs'
-import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, disjointOpenaiUsage } from './openai-usage.mjs'
+import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, disjointOpenaiUsage, openaiChatUsageFromExtract } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
+import { streamCodexCli, ensureCodexCli, codexCliRequest } from '../transport/codex-cli-client.mjs'
+import { isCodexCliVm } from '../vm/codex-cli-config.mjs'
 import {
   codexKernelRequestOptions,
   ensureCodexKernel,
@@ -684,6 +686,30 @@ export async function handleCodexProtocol({
         pickOpts.excluded.add(admitted.vmId)
         continue
       }
+      const cli = isCodexCliVm(vm)
+      if (cli) {
+        logBag.via = 'codex-cli'
+        // A CLI invocation is a single attempt, including account failover.
+        failoverBudget.maxAttempts = 1
+        failoverBudget.maxSwitches = 0
+        failoverBudget.maxSameAccountRetries = 0
+        if (!['openai.responses', 'openai.chat'].includes(protocol)) {
+          lease.release()
+          stats.errors++
+          return json(res, 400, { error: { type: 'invalid_request_error', code: 'codex_cli_protocol_unsupported', message: 'CLI 文本后端目前仅支持 Responses 与 Chat Completions' } })
+        }
+        try { codexCliRequest(converted.body, inbound) } catch (error) {
+          lease.release()
+          stats.errors++
+          logBag.error_code = error.code
+          return json(res, 400, { error: { type: 'invalid_request_error', code: error.code, message: error.message } })
+        }
+        if (['priority', 'fast', 'ultrafast'].some(name => req.headers?.[name] != null)) {
+          lease.release()
+          stats.errors++
+          return json(res, 400, { error: { type: 'invalid_request_error', code: 'codex_cli_unsupported_parameter', message: 'CLI 文本后端暂不支持 priority/fast/ultrafast 请求头' } })
+        }
+      }
       attempts += 1
       if (attempts > failoverBudget.maxAttempts) {
         lease.release()
@@ -732,14 +758,14 @@ export async function handleCodexProtocol({
       let attemptKind = 'failed'
       try {
         const localExit = isLocalEgressProxy(vm.proxy)
-        const written = writeCfg(projectRoot, vm, {
+        const written = cli ? null : writeCfg(projectRoot, vm, {
           // Same rule as slot start: a node on local egress must leave through
           // that node's forwarder, not the control plane's deployment proxy.
           proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),
           proxyRequired: true,
           routing,
         })
-        const ready = await ensure(execFor(projectRoot, vm))
+        const ready = await (cli ? ensureCodexCli : ensure)(execFor(projectRoot, vm))
         if (!ready?.ok) {
           // Kernel init failed: this seat goes back and the next candidate is re-admitted.
           last = {
@@ -749,8 +775,8 @@ export async function handleCodexProtocol({
             body: {
               error: {
                 type: 'api_error',
-                code: 'codex_kernel_unavailable',
-                message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
+                code: cli ? (ready?.code || 'codex_cli_unavailable') : 'codex_kernel_unavailable',
+                message: cli ? '容器内 Codex CLI 尚未就绪，请检查固定版本 payload、容器和出口。' : `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。`,
               },
             },
           }
@@ -804,12 +830,13 @@ export async function handleCodexProtocol({
         let hopEmitted = false
         const runHop = () =>
           runCodexKernelHop({
-            hop,
-            allowRetry: !internalModeltrace,
+            hop: cli ? streamCodexCli : hop,
+            allowRetry: !internalModeltrace && !cli,
             args: {
               exec: execFor(projectRoot, vm),
               signal: gone.signal,
               body: outboundBody,
+              rawBody: inbound,
               reqHeaders: req.headers,
               envelope: {
                 body: outboundBody,
@@ -956,6 +983,11 @@ export async function handleCodexProtocol({
                 protocol === 'anthropic.messages'
                   ? codexBodyToAnthropicMessage(assembled, converted.body.model)
                   : assembled
+              if (cli && protocol === 'openai.chat') body = {
+                id: assembled.id, object: 'chat.completion', created: assembled.created_at, model: assembled.model,
+                choices: [{ index: 0, message: { role: 'assistant', content: assembled.output.flatMap(item => item.content || []).filter(part => part.type === 'output_text').map(part => part.text).join('') }, finish_reason: 'stop' }],
+                usage: openaiChatUsageFromExtract(extractOpenaiUsage(assembled.usage)),
+              }
             } catch (error) {
               if (!isToolArgumentsError(error)) throw error
               stats.errors++
@@ -979,7 +1011,7 @@ export async function handleCodexProtocol({
           logBag.upstream_status = result?.status || 0
           return res.end()
         }
-        if (isCodexFailoverError(result)) {
+        if (!cli && isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
           leaveSticky()
           switches += 1
@@ -1266,6 +1298,7 @@ export async function handleCodexSearch({
         const vm = getVm(projectRoot, admitted.vmId)
         pickOpts.excluded.add(admitted.vmId)
         if (!vm || !isCodexVm(vm)) continue
+        if (isCodexCliVm(vm)) return reject(400, 'invalid_request_error', 'codex_cli_text_only', 'CLI 后端仅提供文本推理，不支持搜索端点')
         if (!attempts) {
           stats.requests++
           stats.by_route['openai.search'] = (stats.by_route['openai.search'] || 0) + 1
@@ -1418,6 +1451,7 @@ export async function handleCodexImages({
         const vm = getVm(projectRoot, admitted.vmId)
         excluded.add(admitted.vmId)
         if (!vm || !isCodexVm(vm)) continue
+        if (isCodexCliVm(vm)) return reject(400, 'invalid_request_error', 'codex_cli_text_only', 'CLI 后端仅提供文本推理，不支持图片端点')
         if (!attempts) {
           stats.requests++
           stats.by_route['openai.images'] = (stats.by_route['openai.images'] || 0) + 1

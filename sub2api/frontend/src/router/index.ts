@@ -526,6 +526,13 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/admin/account-pool/:workspaceId',
+    name: 'AdminAccountWorkspace',
+    component: () => import('@/views/admin/AccountPoolView.vue'),
+    props: route => ({ workspaceId: String(route.params.workspaceId), surface: 'pools' }),
+    meta: { requiresAuth: true, requiresAdmin: true, title: 'Account workspace', titleKey: 'admin.accountPool.workspace' }
+  },
+  {
     path: '/admin/modeltrace',
     name: 'AdminModelTrace',
     component: () => import('@/views/admin/ModelTraceView.vue'),
@@ -540,6 +547,13 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/admin/accounts',
     name: 'AdminAccounts',
+    component: () => import('@/views/admin/AccountPoolView.vue'),
+    props: { surface: 'accounts' },
+    meta: { requiresAuth: true, requiresAdmin: true, title: 'OAuth accounts', titleKey: 'admin.accountPool.accountsTitle' }
+  },
+  {
+    path: '/admin/provider-accounts',
+    name: 'AdminProviderAccounts',
     component: () => import('@/views/admin/AccountsView.vue'),
     meta: {
       requiresAuth: true,

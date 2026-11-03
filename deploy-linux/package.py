@@ -8,7 +8,7 @@ import sys
 import tarfile
 
 ROOT = Path(__file__).resolve().parent.parent
-NAME = os.environ.get('ES2API_RELEASE_NAME', 'Es2API-linux-x64-20261102')
+NAME = os.environ.get('ES2API_RELEASE_NAME', 'Es2API-linux-x64-20261104')
 STAGE = ROOT / 'build-cache' / os.environ.get('ES2API_STAGE_FOLDER', NAME)
 DIST = ROOT / os.environ.get('ES2API_DIST_FOLDER', 'dist')
 PAYLOAD_ROOT = ROOT / 'build-cache/payload' if (ROOT / 'build-cache/payload').exists() else ROOT / 'runtime/vm2'
@@ -64,6 +64,15 @@ def stage():
         copy(ROOT / 'vm2api' / name, STAGE / 'vm2api' / name)
     tree(ROOT / 'vm2api/docker', STAGE / 'payload/docker')
     tree(ROOT / 'vm2api/share/wrap-cli', STAGE / 'payload/share/wrap-cli')
+    tree(ROOT / 'vm2api/share/codex-cli', STAGE / 'vm2api/share/codex-cli')
+    if not (STAGE / 'vm2api/share/codex-cli/linux-x64/source/bubblewrap/COPYING').is_file():
+        raise RuntimeError('Missing bubblewrap license/source; run the Codex CLI installer first.')
+    cli_root = STAGE / 'vm2api/share/codex-cli/linux-x64'
+    cli = json.loads((cli_root / 'manifest.json').read_text(encoding='utf-8'))
+    if cli['version'] != '0.155.1' or cli['platform'] != 'linux-x64':
+        raise RuntimeError('Unexpected Codex CLI version/platform')
+    if (cli_root / 'bin/codex').stat().st_size != cli['bytes'] or digest(cli_root / 'bin/codex') != cli['sha256'] or digest(cli_root / 'codex-resources/bwrap') != cli['bwrap_sha256']:
+        raise RuntimeError('Codex CLI payload mismatch')
     payload = json.loads((ROOT / 'vm2api/deploy/payload.json').read_text(encoding='utf-8'))
     for item in payload['files']:
         relative = Path(item['path'])
@@ -100,13 +109,13 @@ def stage():
     for name in ['package.json', 'package-lock.json']:
         copy(ROOT / 'integration' / name, STAGE / 'source/integration' / name)
     tree(ROOT / 'deploy-linux', STAGE / 'source/deploy-linux')
-    metadata = {'product': 'Es2API', 'version': '2026.11.02', 'platform': 'linux', 'arch': 'x64', 'node': '24.22.2', 'payload_release': payload['release'], 'tests_run': False, 'contains_user_data': False, 'entrypoint': './es2api.sh', 'deployment_acceptance': 'not performed', 'google_oauth_requires_configuration': True}
+    metadata = {'product': 'Es2API', 'version': '2026.11.04', 'platform': 'linux', 'arch': 'x64', 'node': '24.22.2', 'payload_release': payload['release'], 'tests_run': False, 'contains_user_data': False, 'entrypoint': './es2api.sh', 'deployment_acceptance': 'not performed', 'google_oauth_requires_configuration': True}
     (STAGE / 'release.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     print('Staged allowlisted release: ' + str(STAGE))
 
 def archive():
     # Required compiled artifacts and dependency installs must exist before archiving.
-    for relative in ['node/bin/node', 'bin/es2api', 'payload/bin/kin-api-kernel', 'integration/node_modules/ws/package.json', 'vm2api/node_modules/ws/package.json', 'vm2api/web/dist/index.html', 'integration/resources/modeltrace/PROVENANCE.md']:
+    for relative in ['node/bin/node', 'bin/es2api', 'payload/bin/kin-api-kernel', 'integration/node_modules/ws/package.json', 'vm2api/node_modules/ws/package.json', 'vm2api/web/dist/index.html', 'integration/resources/modeltrace/PROVENANCE.md', 'vm2api/share/codex-cli/linux-x64/bin/codex', 'vm2api/share/codex-cli/linux-x64/codex-resources/bwrap', 'vm2api/share/codex-cli/linux-x64/LICENSE', 'vm2api/share/codex-cli/linux-x64/manifest.json']:
         if not (STAGE / relative).is_file():
             raise RuntimeError('Missing distribution component: ' + relative)
     files = sorted(p for p in STAGE.rglob('*') if p.is_file() and p != STAGE / 'SHA256SUMS')
@@ -121,7 +130,7 @@ def archive():
         info.uid = info.gid = 0
         info.uname = info.gname = 'root'
         relative = info.name[len(NAME) + 1:]
-        executable = relative in {'bin/es2api', 'node/bin/node', 'es2api.sh', 'install-service.sh'} or relative.startswith('payload/bin/') or (relative.startswith('payload/share/') and not relative.endswith('.json'))
+        executable = relative in {'bin/es2api', 'node/bin/node', 'es2api.sh', 'install-service.sh', 'vm2api/share/codex-cli/linux-x64/bin/codex', 'vm2api/share/codex-cli/linux-x64/codex-resources/bwrap'} or relative.startswith('payload/bin/') or (relative.startswith('payload/share/') and not relative.endswith('.json'))
         info.mode = 0o755 if info.isdir() or executable or relative.endswith('.sh') else 0o644
         return info
     with tarfile.open(str(target), 'w:gz', compresslevel=6) as tar:

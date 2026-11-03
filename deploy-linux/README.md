@@ -13,8 +13,8 @@
 解压到独立目录，例如 `/opt/es2api`（systemd 安装路径不支持空格/中文）。不要覆盖正在运行的目录。
 
 ```bash
-tar -xzf Es2API-linux-x64-20261102.tar.gz
-cd Es2API-linux-x64-20261102
+tar -xzf Es2API-linux-x64-20261104.tar.gz
+cd Es2API-linux-x64-20261104
 sudo ./es2api.sh init
 sudo ./es2api.sh run
 ```
@@ -51,6 +51,8 @@ Compose 项目固定为 `es2api-linux`，命名卷由 Compose 管理，一台主
 升级前停止 systemd 并完成数据库/密钥备份，将新包解压到新目录，迁入完整 `runtime/`，并更新 systemd 路径。`runtime/vm2/bin`、`share`、`docker` 是本包首次初始化复制的公共组件；升级时应用停止后，应与新包 `payload/` 同步这些公共目录。`data`、`vms`、`routing.json` 和密钥不可覆盖。保留旧包及备份作为回滚材料；涉及数据库迁移时仅替换二进制不保证可回滚。
 
 ## 构建边界
+
+本版附带 Codex CLI 0.155.1 与 bwrap，工具目录和对应源码许可证位于 `vm2api/share/codex-cli/linux-x64/`。新账号导入时可选择 CLI 后端；仅支持文本 Responses/Chat，单账号并发为 1，已有账号保留 Kernel。实例页支持异步启动、停止、恢复，操作后保持暂停调度。能力与验收边界见 `docs/CODEX_CLI_BACKEND.md`。
 
 本包已完成前端/Go 编译、分发文件与固定组件哈希核对。按所有者要求没有运行测试、Linux 部署验收、浏览器验收或真实供应商推理。历史 ModelTrace 第三样本 502 尚未闭环；新隔离机制的并发/跨账号/SSE/WS 仍未实测。Docker 容器共享宿主内核，共用代理时可能共用公网 IP；不代表独立虚拟机。不可据本包称正式生产验收完成。
 

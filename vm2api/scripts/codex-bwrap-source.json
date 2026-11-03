@@ -1,0 +1,255 @@
+{
+  "commit": "be2951ea34f0d295ed0becf97079f92fa5f6950e",
+  "files": [
+    {
+      "path": ".dir-locals.el",
+      "sha": "35140408952c53560859ef46f3a7523e1edf966e",
+      "bytes": 63
+    },
+    {
+      "path": ".editorconfig",
+      "sha": "89742b6981fd1938e2f1d3d858126a0b081f55aa",
+      "bytes": 103
+    },
+    {
+      "path": ".github/workflows/check.yml",
+      "sha": "8a747d52ca0fcb86f4a3833bb8bed12081b486d3",
+      "bytes": 3214
+    },
+    {
+      "path": "CODE-OF-CONDUCT.md",
+      "sha": "8c417a60968d1981f5cbe426e12a907752bfb614",
+      "bytes": 195
+    },
+    {
+      "path": "COPYING",
+      "sha": "5bc8fb2c8f757e34a0d8f4644f589d57609e213f",
+      "bytes": 25383
+    },
+    {
+      "path": "LICENSE",
+      "sha": "d24842f3cdcf2e447f9a7a26fa387ad63f5c4b91",
+      "bytes": 7
+    },
+    {
+      "path": "NEWS.md",
+      "sha": "eb82ed98d9d735b40553094d15aa0607312c8159",
+      "bytes": 3137
+    },
+    {
+      "path": "README.md",
+      "sha": "1f838ce0a1a3967d5ca029a0a6bf526da3b428c7",
+      "bytes": 11238
+    },
+    {
+      "path": "SECURITY.md",
+      "sha": "7e0fb3274666d2055ac2b002bbed193db4fa879a",
+      "bytes": 2375
+    },
+    {
+      "path": "bind-mount.c",
+      "sha": "a2e1ac6c40741aba9d566fad54691a6552bc859e",
+      "bytes": 15808
+    },
+    {
+      "path": "bind-mount.h",
+      "sha": "8a361fbd5fc6f1f8251cafae8c5d1e71e0090eaf",
+      "bytes": 1822
+    },
+    {
+      "path": "bubblewrap.c",
+      "sha": "9039ddfa80aff65d8296a21098bf43befeb00be5",
+      "bytes": 117032
+    },
+    {
+      "path": "bubblewrap.jpg",
+      "sha": "d3c243dface42da83cdec1be9bd93f5475120a9b",
+      "bytes": 40239
+    },
+    {
+      "path": "bwrap.xml",
+      "sha": "f379f0fa46a98ddb648efef6ca9e49e29b7e8c4f",
+      "bytes": 32070
+    },
+    {
+      "path": "ci/builddeps.sh",
+      "sha": "5bca51e255dc2148d660df24d72f98302b8841e1",
+      "bytes": 1790
+    },
+    {
+      "path": "ci/enable-userns.sh",
+      "sha": "9310e558b5a64c281d6b75dec6a86a340e9f4f76",
+      "bytes": 124
+    },
+    {
+      "path": "completions/bash/bwrap",
+      "sha": "e7a523c2850036b4e882e795e7b7aab5603087e8",
+      "bytes": 1218
+    },
+    {
+      "path": "completions/bash/meson.build",
+      "sha": "323ad3973bcacc41bfae7f0a864f6fc9005c7ec3",
+      "bytes": 944
+    },
+    {
+      "path": "completions/meson.build",
+      "sha": "958c90a2ebbcfb2e9a172706d932551949e0331f",
+      "bytes": 131
+    },
+    {
+      "path": "completions/zsh/_bwrap",
+      "sha": "fbddda435e446bd0a434e92924ea3eca94cb9e83",
+      "bytes": 7396
+    },
+    {
+      "path": "completions/zsh/meson.build",
+      "sha": "7bda727c77d5be4d408bc2b519df33c97b1064fe",
+      "bytes": 219
+    },
+    {
+      "path": "demos/bubblewrap-shell.sh",
+      "sha": "1cdb788f383d4144f422ec1878d37f95102c34b2",
+      "bytes": 1204
+    },
+    {
+      "path": "demos/flatpak-run.sh",
+      "sha": "91493104403e9a017cf34a4823f5412c8904a0e5",
+      "bytes": 2642
+    },
+    {
+      "path": "demos/flatpak.bpf",
+      "sha": "ee4fe18a8ccaffa2a6ecf1ba6755f60cd241f106",
+      "bytes": 744
+    },
+    {
+      "path": "demos/userns-block-fd.py",
+      "sha": "37a40f2f0eb786b781c494441d28ffa2ee324937",
+      "bytes": 969
+    },
+    {
+      "path": "meson.build",
+      "sha": "520d0a5f477ac220453702103fae4c6c34942422",
+      "bytes": 4613
+    },
+    {
+      "path": "meson_options.txt",
+      "sha": "05b1c7873e68c997ca5405d760a60fc83b5f8d29",
+      "bytes": 1673
+    },
+    {
+      "path": "network.c",
+      "sha": "373d606a0abe3435fd5909ba8910e25fab4140be",
+      "bytes": 5429
+    },
+    {
+      "path": "network.h",
+      "sha": "3346b496606a46dea8ed65f9a1654306a46eb490",
+      "bytes": 819
+    },
+    {
+      "path": "packaging/bubblewrap.spec",
+      "sha": "0a8001fe4729720f0da341994209eea4cca9c45f",
+      "bytes": 1302
+    },
+    {
+      "path": "release-checklist.md",
+      "sha": "0c1479e44732a274c85797e7bf69c24cf37ae76a",
+      "bytes": 777
+    },
+    {
+      "path": "tests/libtest-core.sh",
+      "sha": "11df3a3749d616e0e3723e659417d6dd5c654572",
+      "bytes": 4780
+    },
+    {
+      "path": "tests/libtest.sh",
+      "sha": "d55bb02bc28a54adacf7fc1b55872395aa8932e2",
+      "bytes": 3340
+    },
+    {
+      "path": "tests/meson.build",
+      "sha": "87bf709e9902cfaccfbbbd0121bc9b52d81b64c4",
+      "bytes": 1391
+    },
+    {
+      "path": "tests/test-run.sh",
+      "sha": "1003e8c4b1d593dae19cae1d55239085ae112780",
+      "bytes": 28658
+    },
+    {
+      "path": "tests/test-seccomp.py",
+      "sha": "3ce02ef888f7cbfc47d5bdfeb3f89c6587c8c827",
+      "bytes": 19642
+    },
+    {
+      "path": "tests/test-specifying-pidns.sh",
+      "sha": "de38b977fddc25dbbab93ded8a83158576e46537",
+      "bytes": 863
+    },
+    {
+      "path": "tests/test-specifying-userns.sh",
+      "sha": "07c5b4a3476835c7d98584131957772bf931855b",
+      "bytes": 756
+    },
+    {
+      "path": "tests/test-utils.c",
+      "sha": "64f42ff18c0dba3877e9bf2f3eb92b02a48f1a39",
+      "bytes": 6589
+    },
+    {
+      "path": "tests/try-syscall.c",
+      "sha": "6f2f112c6ec5bdceed2c1fa56009cf72bc8d9fad",
+      "bytes": 4674
+    },
+    {
+      "path": "tests/use-as-subproject/.gitignore",
+      "sha": "371a7d97bbe611cb20a2ca07f6c43a9bd67f668e",
+      "bytes": 23
+    },
+    {
+      "path": "tests/use-as-subproject/README",
+      "sha": "97d2e88eb177cea6b16ed49793b9387be301eaa4",
+      "bytes": 188
+    },
+    {
+      "path": "tests/use-as-subproject/assert-correct-rpath.py",
+      "sha": "10b0947ca698af332b17a3d8281c37b9ea376461",
+      "bytes": 697
+    },
+    {
+      "path": "tests/use-as-subproject/config.h",
+      "sha": "4a99af4ddbafb8c25244924cade1593de642b923",
+      "bytes": 66
+    },
+    {
+      "path": "tests/use-as-subproject/dummy-config.h.in",
+      "sha": "1d1e56a8c6b3be83a78d5c939bb2b7fea71f531f",
+      "bytes": 76
+    },
+    {
+      "path": "tests/use-as-subproject/meson.build",
+      "sha": "bc4781cd0ee29c10fb20c6522ca1a53d92fcd7b2",
+      "bytes": 343
+    },
+    {
+      "path": "uncrustify.cfg",
+      "sha": "6d3ad56518d3ab92e358a317a12f9754c06a2203",
+      "bytes": 4474
+    },
+    {
+      "path": "uncrustify.sh",
+      "sha": "7c9080b19951b575db155fe762d3a4d104f485ef",
+      "bytes": 102
+    },
+    {
+      "path": "utils.c",
+      "sha": "7b7349ab824c8780597b2abb39f181d0e63702eb",
+      "bytes": 21879
+    },
+    {
+      "path": "utils.h",
+      "sha": "079fe7c9362e04b952544b1daab0331c2dbe16f1",
+      "bytes": 6435
+    }
+  ]
+}

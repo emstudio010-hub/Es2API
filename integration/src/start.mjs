@@ -34,6 +34,10 @@ const accountPool = new AccountPool({ store, lifecycle: new AccountLifecycle({ v
   const fields = {}
   if (state.vm_id) fields.vm_id = state.vm_id
   if (state.slot) fields.slot_json = state.slot
+  if (['slot_created', 'exit_bound'].includes(state.phase) && state.slot?.egress?.proxy_id) {
+    const account = store.getAccount(state.account_id)
+    if (account) fields.binding = { ...account.binding, proxy_id: state.slot.egress.proxy_id, timezone: state.slot.egress.timezone || account.binding.timezone }
+  }
   if (state.phase === 'slot_created') { fields.status = 'provisioning'; fields.schedulable = false }
   if (state.phase === 'error') { fields.status = 'error'; fields.schedulable = false; fields.error_code = 'lifecycle_failed'; fields.error_message = 'VM2 槽位创建或导入失败' }
   if (Object.keys(fields).length) store.updateAccount(state.account_id, fields)
@@ -44,7 +48,7 @@ const modeltrace = new ModelTrace({ store, accountPool, runner, usageBridgeConfi
 const usagePoller = process.env.ES2API_USAGE_MODE === 'pull' ? createUsagePoller({ vm2, modeltrace, store }) : null
 accountPool.beforeRemoveAccount = async accountId => modeltrace.cancelAccountAndWait(accountId)
 const gateway = createPoolGateway({ accountPool, store, secret: managementToken, baseUrl: vm2BaseUrl, apiKey: process.env.VM2API_API_KEY })
-const server = createIntegrationServer({ store, accountPool, modeltrace, managementToken, gateway })
+const server = createIntegrationServer({ store, accountPool, modeltrace, managementToken, gateway, vm2 })
 const upgrade = createPoolUpgrade({ accountPool, store, secret: managementToken, baseUrl: vm2BaseUrl, apiKey: process.env.VM2API_API_KEY })
 server.on('upgrade', upgrade)
 const host = process.env.ES2API_BIND_HOST || '127.0.0.1'

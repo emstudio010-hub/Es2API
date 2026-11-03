@@ -16,16 +16,18 @@ Es2API 将 **Sub2API 的用户、分组、Key、计费和管理界面**，与 **
 - [相对上游增加了什么](docs/FEATURES.md)
 - [VM2API 分支、来源与架构](docs/UPSTREAM_AND_ARCHITECTURE.md)
 - [ModelTrace 算法、调度与限制](docs/MODELTRACE.md)
+- [一账号一工作区及自动 IP 分配](docs/ACCOUNT_WORKSPACES.md) · [真实 Codex CLI 后端（预览）](docs/CODEX_CLI_BACKEND.md)
 - [变更记录](CHANGELOG.md) · [已知限制](docs/KNOWN_LIMITATIONS.md) · [源码构建](docs/BUILD.md)
 
 ## 增加了什么
 
 | 方向 | Es2API 的新增与适配 |
 | --- | --- |
-| 账号池 | 共享/租赁模式、分组、导入、暂停、重试、槽位同步、失败和删除状态 |
+| 账号池 | OAuth 管理与账号池分离；一个新 OAuth 一个工作区，独立实例、IP 与运行设置 |
 | OAuth 导入 | JSON 导入和浏览器授权入口，校验 state，兑换后直接进入账号池 |
-| 执行槽生命周期 | 创建空槽 → 导入凭据 → 启动 → 健康确认；失败保留可追踪状态 |
-| 固定出口 | 创建时选择出口，时区和身份配置随出口派生；账号池不提供运行中换 IP |
+| 执行槽生命周期 | 创建、导入、健康确认、异步启动/停止/恢复；删除未确认时保留数据 |
+| Codex CLI | 可选真实容器内 CLI 0.155.1，Responses/Chat 纯文本适配、单并发、请求级 HOME 与取消 |
+| 固定出口 | 创建时自动独占分配空闲 IP 或手选出口，时区和身份随出口派生，绑定后固定 |
 | 槽位归属 | 核对规范槽 ID、所属账号、创建代次；拒绝误绑定和删除其他账号槽位 |
 | 用户调用 | 将账号池分组发布到原生 OpenAI 用户分组，复用用户 Key、余额、权限和计费 |
 | 会话隔离 | 按用户 Key、分组、槽、账号实例及代次绑定；跨边界响应引用被拒绝 |
@@ -62,9 +64,9 @@ flowchart LR
 从 [Releases](https://github.com/emstudio010-hub/Es2API/releases) 下载 `.tar.gz` 及 `.sha256`，在服务器执行：
 
 ```bash
-sha256sum -c Es2API-linux-x64-20261102.tar.gz.sha256
-tar -xzf Es2API-linux-x64-20261102.tar.gz
-cd Es2API-linux-x64-20261102
+sha256sum -c Es2API-linux-x64-20261104.tar.gz.sha256
+tar -xzf Es2API-linux-x64-20261104.tar.gz
+cd Es2API-linux-x64-20261104
 sudo ./es2api.sh init
 sudo ./es2api.sh run
 ```
@@ -90,9 +92,9 @@ sudo journalctl -u es2api -f
 ## 第一次使用
 
 1. 登录后由部署所有者审阅正常界面的合规承诺。
-2. 在执行面准备可用出口；在账号池导入你有权使用的 ChatGPT OAuth 账号，并在创建时选择出口。
+2. 在「执行 IP 资源」导入可用代理；从账号管理导入你有权使用的 ChatGPT OAuth，默认自动分配空闲 IP，可选 Kernel 或 Codex CLI 后端。
 3. 等待账号槽位进入就绪状态，异常时查看账号错误和生命周期状态。
-4. 需要对用户开放时，在账号池「管理分组 → 开放用户调用」选择原生 OpenAI 用户分组。
+4. 进入对应账号池工作区，在发布入口选择原生 OpenAI 用户分组；实例操作完成后需在运行设置中手动启用调度。
 5. 使用该原生分组的用户 Key；账号池负责执行槽租约，控制面保留原生权限和计费。
 6. 在「模型智商控制台」检查 readiness，再自行保存检测策略。检测会产生真实供应商请求和用量。
 

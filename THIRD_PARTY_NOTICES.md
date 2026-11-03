@@ -8,6 +8,8 @@ Es2API 是衍生整合项目。公开源码不改变上游项目的权利、许�
 | Sub2API | [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)，`37067e8e340e9440d173a92b4faa05e8ce58368f` | 用户、分组、Key、计费与管理台 | `sub2api/LICENSE`，LGPL-3.0 |
 | CPA Codex Candy Eval | [haowang02/cpa-plugin-codex-candy-eval](https://github.com/haowang02/cpa-plugin-codex-candy-eval)，`4f8367642cc1e629c4ee15a975e5e0fc53c4ac16` | 固定检测器、候选模型与挑战数据 | `integration/resources/modeltrace/cpa-v2/` 原许可证 |
 | LM Detector | [Ikaleio/lm-detector](https://github.com/Ikaleio/lm-detector)，`654c8334bb53951aaf04cbd61252d163649e1369` | ModelTrace 指纹算法来源 | 同目录原许可证与 `PROVENANCE.md` |
+| Codex CLI | [openai/codex](https://github.com/openai/codex)，`0.155.1` | 可选真实 CLI 文本执行后端 | 安装 payload 的 `vm2api/share/codex-cli/linux-x64/LICENSE`，Apache-2.0 |
+| bubblewrap | 同一 Codex 官方平台包附带；对应官方 tag 的 vendored source | CLI 的 Linux 沙箱 | payload 中的 `COPYING-bubblewrap`（LGPL-2.0）及 `source/bubblewrap/`、`SOURCE.json`；源码逐文件按固定 Git blob SHA 校验 |
 
 VM2API 的 API kernel 可从源码构建；部分槽位程序与封装 CLI 为上游发布的预编译 payload，按 `vm2api/deploy/payload.json` 固定大小和 SHA256 下载。它们不因此变为 Es2API 原创或全部可从本仓库重建的组件，使用/再分发仍受各自许可约束。
 

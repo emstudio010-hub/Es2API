@@ -7,7 +7,7 @@ import type { IntegrationGroup } from '@/api/admin/integrationAccounts'
 import type { AdminGroup } from '@/types'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 
-defineProps<{ groups: IntegrationGroup[] }>()
+const props = defineProps<{ groups: IntegrationGroup[] }>()
 const { t } = useI18n()
 type Publication = { group_id: string; native_account_id: number; native_group_ids: number[]; published: boolean }
 const nativeGroups = ref<AdminGroup[]>([]), publications = ref<Publication[]>([])
@@ -19,7 +19,7 @@ let disposed = false
 async function load() {
   const [groups, links] = await Promise.all([getAll('openai'), integrationRequest<Publication[]>('/publications', { signal: controller.signal })])
   if (disposed) return
-  nativeGroups.value = groups; publications.value = links
+  nativeGroups.value = groups; publications.value = links.filter(link => props.groups.some(group => group.id === link.group_id))
 }
 async function publish() {
   if (pending.value || !groupId.value || !nativeGroupId.value) return

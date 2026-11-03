@@ -126,6 +126,36 @@ export class Vm2Client {
     })
   }
 
+  async ensureSlotProxy(vmId) {
+    await this.ensureSession()
+    try {
+      return await this.request(`/api/panel/vms/${encodeURIComponent(vmId)}/allocate-proxy`, { method: 'POST', body: {}, timeoutMs: this.lifecycleTimeoutMs })
+    } catch (error) {
+      if (error.status === 409) throw Object.assign(new Error('没有可用的独占出口，请先导入未占用的 IP 资源，再重试该账号。已有固定出口不会自动更换。'), { status: 409, code: 'dedicated_proxy_unavailable' })
+      throw error
+    }
+  }
+
+  async listExitResources() {
+    await this.ensureSession()
+    const payload = await this.request('/api/panel/proxies')
+    const rows = (payload.data || payload).proxies || []
+    // Allowlist fields: never return URLs, raw imports, passwords or probe errors.
+    return rows.filter(p => p.kind !== 'local' && !String(p.id).startsWith('px-local')).map(p => ({
+      id: p.id, label: p.label || '', host: p.host, port: p.port, status: p.status, enabled: p.enabled,
+      bound_vm_ids: p.bound_vm_ids || (p.bound_vm_id ? [p.bound_vm_id] : []),
+      available: p.enabled && !['dead', 'fail'].includes(p.status) && !p.blocked_reason && !(p.bound_count || p.bound_vm_id || p.bound_vm_ids?.length) && !p.owner_user_id,
+      timezone: p.geo?.timezone || null,
+    }))
+  }
+
+  async importExitResources(text) {
+    await this.ensureSession()
+    const payload = await this.request('/api/panel/proxies/import', { method: 'POST', body: { text } })
+    const result = payload.data || payload
+    return { added: Number(result.added || 0), skipped: Number(result.skipped || 0) }
+  }
+
   async startSlot(vmId, idempotencyKey) {
     await this.ensureSession()
     const payload = await this.request(VM2_PROTOCOL_PATHS.start(vmId), { method: 'POST', body: {}, idempotencyKey, timeoutMs: this.lifecycleTimeoutMs })
@@ -137,6 +167,14 @@ export class Vm2Client {
   async stopSlot(vmId, idempotencyKey) {
     await this.ensureSession()
     return this.request(VM2_PROTOCOL_PATHS.stop(vmId), { method: 'POST', body: {}, idempotencyKey, timeoutMs: this.lifecycleTimeoutMs })
+  }
+
+  async recoverSlot(vmId, idempotencyKey) {
+    await this.ensureSession()
+    const payload = await this.request(`/api/panel/vms/${encodeURIComponent(vmId)}/recover`, { method: 'POST', body: {}, idempotencyKey, timeoutMs: this.lifecycleTimeoutMs })
+    const report = payload.data || payload
+    if (report.ok !== true) throw Object.assign(new Error('实例恢复未完成，请同步状态后检查运行环境'), { status: 502, code: 'vm2_recovery_incomplete' })
+    return payload
   }
 
   async getSlot(vmId) {

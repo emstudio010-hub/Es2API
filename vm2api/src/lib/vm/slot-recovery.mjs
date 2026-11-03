@@ -14,6 +14,9 @@ import { containerLogs, inspectContainerOrNull } from '../cluster/docker-remote.
 import { slotEgressNames } from '../cluster/remote-slot.mjs'
 import { kernelFaults, rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
+import { codexCliHealth } from '../transport/codex-cli-client.mjs'
+import { isCodexCliVm } from './codex-cli-config.mjs'
+import { clearStoppedCodexCliRequests, holdCodexCliMaintenance } from '../transport/codex-cli-state.mjs'
 import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
 import {
   egressListening,
@@ -238,6 +241,10 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
   const label = '推理内核'
   const exec = slotExec(projectRoot, vm)
   if (engine === 'codex') {
+    if (isCodexCliVm(vm)) {
+      const health = await codexCliHealth(exec)
+      return check('kernel', 'Codex CLI', health.ok ? 'ok' : 'error', health.code, health.ok ? '容器内 CLI 可启动，真实推理尚需调用验收' : '容器内 CLI 未就绪，请检查 payload 与容器')
+    }
     const health = await probes.codexHealth(exec)
     const pub = toPublicKernelHealth(health, 'codex')
     if (pub.reachable) return check('kernel', label, 'ok', null, 'Codex 内核在线')
@@ -362,7 +369,7 @@ export async function diagnoseSlotServices(
  * The POST /start boot: bind (or allocate) the exit, adopt its timezone, start
  * the container and its inference runtime, then record the running intent.
  */
-export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null, ops = {} }) {
+export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null, ops = {}, cliRecovery = false }) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
   try {
@@ -370,15 +377,19 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
   } catch (error) {
     return { ok: false, status: 400, code: error.code, error: error.message }
   }
-  const bound = proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
+  const binding = vm.integration_binding
+  const bound = binding?.proxy_exclusive
+    ? proxyPool.allocateForVm(id, { exclusive: true, allowLocal: false, fixed: true, preferredId: binding.proxy_id || vm.proxy?.id || null })
+    : proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
   if (!bound) {
     return { ok: false, status: 409, code: 'proxy_required', error: 'No SOCKS5 is bound or free for this VM' }
   }
   bindVmProxy(projectRoot, id, bound)
+  if (binding?.proxy_exclusive) patchVmRecord(projectRoot, id, { integration_binding: { ...binding, proxy_id: bound.id } })
   await (fillTimezone || ((vmId) => fillVmTimezoneFromExit(projectRoot, proxyPool, vmId)))(id)
   vm = getVm(projectRoot, id) || vm
   const runtimeBeforeBoot = structuredClone(vm.runtime || {})
-  const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { routing })
+  const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { routing, cliRecovery })
   if (!boot.ok) {
     return {
       ok: false,
@@ -414,6 +425,7 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
 
 const STOP_MESSAGES = { absent: '容器不存在，跳过关机', 'already-stopped': '容器已是停止状态', stopped: '已关机' }
 const STEP_LABELS = {
+  cli_cleanup: '清理已停止的 CLI 请求',
   node_link: '连接节点',
   relay: '重建集群桥',
   stop: '关机',
@@ -471,8 +483,12 @@ export async function recoverSlot({
   const diagnose =
     ops.diagnose || ((current) => diagnoseSlotServices(current, { projectRoot, routing, watchdog, internal }))
   // Held through the settle wait and final check too, so the watchdog cannot bounce the slot under it.
+  let releaseCli = () => {}
+  if (isCodexCliVm(vm)) {
+    try { releaseCli = holdCodexCliMaintenance(id) }
+    catch (error) { return { ok: false, status: error.status || 409, code: error.code, error: error.message } }
+  }
   recovering.add(id)
-  const drained = watchdog?.hold?.(id)
   const started = now()
   const steps = []
   const step = async (stepId, fn) => {
@@ -493,7 +509,7 @@ export async function recoverSlot({
   }
   try {
     // A watchdog restart already past its hold check finishes before this cycle touches the slot.
-    await drained
+    await watchdog?.hold?.(id)
     const nodeId = vmNodeId(vm)
     let proceed = true
     if (nodeId) {
@@ -520,8 +536,14 @@ export async function recoverSlot({
       })
     }
     if (proceed) {
+      if (isCodexCliVm(vm)) proceed = await step('cli_cleanup', async () => {
+        const cleaned = await clearStoppedCodexCliRequests(slotExec(projectRoot, vm))
+        return { ok: true, message: `容器已确认停止，已清理 ${cleaned.cleared} 个临时请求目录` }
+      })
+    }
+    if (proceed) {
       await step('start', async () =>
-        startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone })),
+        startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone, cliRecovery: isCodexCliVm(vm) })),
       )
     }
     // Only an attempted boot earns a fresh budget; a cycle that never reached start fixed nothing.
@@ -547,8 +569,8 @@ export async function recoverSlot({
       },
     }
   } finally {
-    watchdog?.release?.(id)
-    recovering.delete(id)
+    releaseCli()
+    try { watchdog?.release?.(id) } finally { recovering.delete(id) }
   }
 }
 

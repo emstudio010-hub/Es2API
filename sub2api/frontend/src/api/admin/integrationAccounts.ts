@@ -1,7 +1,11 @@
 import { integrationRequest } from './integrationClient'
 
+export interface ExitResource { id: string; label: string; host: string; port: number; status: string; enabled: boolean; available: boolean; bound_vm_ids: string[]; timezone: string | null }
+export const listExitResources = (signal?: AbortSignal) => integrationRequest<ExitResource[]>('/exit-resources', { signal })
+export const importExitResources = (text: string, signal?: AbortSignal) => integrationRequest<{ added: number; skipped: number }>('/exit-resources', { method: 'POST', data: { text }, signal })
+
 export type IntegrationAccountMode = 'pool' | 'lease'
-export type IntegrationAccountStatus = 'provisioning' | 'ready' | 'error' | 'deleting'
+export type IntegrationAccountStatus = 'provisioning' | 'ready' | 'stopped' | 'error' | 'deleting'
 export interface IntegrationGroup {
   id: string
   name: string
@@ -35,6 +39,7 @@ export interface IntegrationAccount {
     ip_policy: 'fixed'
     ip_selection: 'create_only'
     identity_policy: 'ip_derived'
+    execution_backend?: 'kernel' | 'codex-cli'
     timezone: string | null
     locale: string
     max_concurrency: number | null
@@ -43,6 +48,7 @@ export interface IntegrationAccount {
   }
   credential: { has_access_token: boolean; has_refresh_token: boolean; has_id_token: boolean; has_api_key: boolean; fingerprint: string }
   slot: {
+    execution_backend?: 'kernel' | 'codex-cli'
     id?: string | null
     status?: string
     ready: boolean
@@ -72,6 +78,7 @@ export interface IntegrationPage<T> { items: T[]; total: number; page: number; p
 export interface IntegrationAccountFilters { page?: number; page_size?: number; search?: string; status?: string; mode?: string; group_id?: string }
 export interface IntegrationPoolStats { total: number; ready: number; schedulable: number; available: number; busy: number; blocked: number; by_mode: { pool: number; lease: number }; as_of: string }
 export interface IntegrationAccountImport {
+  execution_backend?: 'kernel' | 'codex-cli'
   account_id: string
   name: string
   mode: IntegrationAccountMode
@@ -88,7 +95,7 @@ export interface IntegrationAccountUpdate {
   group_ids?: string[]
   schedulable?: boolean
 }
-export type IntegrationAccountAction = 'sync' | 'retry' | 'retry-delete' | 'delete'
+export type IntegrationAccountAction = 'sync' | 'retry' | 'retry-delete' | 'delete' | 'start' | 'stop' | 'recover'
 const accountPath = (id: string) => `/accounts/${encodeURIComponent(id)}`
 export const listIntegrationAccounts = (params: IntegrationAccountFilters = {}, signal?: AbortSignal) =>
   integrationRequest<IntegrationPage<IntegrationAccount>>('/accounts', { params, signal })

@@ -25,6 +25,9 @@ import { inspectWrapCliDir, materializeWrapCli, wrapCliHomeDir } from './wrap-cl
 import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
+import { isCodexCliVm } from './codex-cli-config.mjs'
+import { ensureCodexCli, cancelCodexCli } from '../transport/codex-cli-client.mjs'
+import { codexCliInMaintenance } from '../transport/codex-cli-state.mjs'
 
 export { runtimeKind }
 
@@ -33,6 +36,7 @@ function unsupportedOnHost(action) {
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
+  if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id) && !opts.cliRecovery) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中' }
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
@@ -46,6 +50,7 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
+  if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id) && !opts.cliRecovery) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中，暂不接受其他开机操作' }
   if (isCodexVm(vm)) {
     if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
     const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
@@ -62,17 +67,21 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
 }
 
 export async function stopSlot(vm) {
+  if (isCodexCliVm(vm)) cancelCodexCli(vm.id)
   if (isCodexVm(vm)) stopCodexKernel(vm.id)
   return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
 export async function destroySlot(vm) {
+  if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id)) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中' }
+  if (isCodexCliVm(vm)) cancelCodexCli(vm.id)
   return slotHost(vm).destroy(vm)
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
 export async function reloadSlot(vm, projectRoot, opts = {}) {
+  if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id)) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中' }
   return slotHost(vm).reload(vm, projectRoot, opts)
 }
 
@@ -108,6 +117,10 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   const routing = opts.routing || {}
   const eager = routing?.inference?.eager_start !== false
   if (isCodexVm(vm)) {
+    if (isCodexCliVm(vm)) {
+      const health = await ensureCodexCli(slotExec(projectRoot, vm), { timeoutMs: opts.timeoutMs })
+      return { ...health, engine: 'codex-cli', ...(!health.ok ? { error: health.code === 'codex_cli_identity_required' ? 'CLI 需要包含 id_token、账号 ID 和访问/刷新令牌的完整 OAuth' : '容器内 CLI 未就绪，请检查 payload、固定出口及执行状态' } : {}) }
+    }
     if (!eager) return { ok: true, skipped: true, reason: 'eager_start_off', engine: 'codex' }
     const write = opts.ops?.writeCodexKernelConfig || writeCodexKernelConfig
     const start = opts.ops?.ensureCodexKernel || ensureCodexKernel

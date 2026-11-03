@@ -713,7 +713,7 @@ export class ProxyPool extends EventEmitter {
    * Restore pool↔VM binding after start/restart.
    * Prefer an existing bind, then the VM's last proxy id, then a free allocate.
    */
-  ensureBoundToVm(vmId, preferredId = null) {
+  ensureBoundToVm(vmId, preferredId = null, options = {}) {
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
@@ -722,21 +722,32 @@ export class ProxyPool extends EventEmitter {
     if (preferredId) {
       const preferred = this.state.proxies.find((p) => p.id === preferredId)
       if (proxyBlockedReason(preferred, this.state.config.ipv6_enabled)) return null
-      const bound = this.bind(preferredId, vmId)
+      const bound = this.bind(preferredId, vmId, options)
       if (bound.ok) return this.getProxyForVm(vmId)
+      if (options.fixed) return null
     }
-    return this.allocateForVm(vmId)
+    return this.allocateForVm(vmId, options)
   }
 
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
-  allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
+  allocateForVm(vmId, { ownerUserId = null, role = 'admin', exclusive = false, allowLocal = true, fixed = false, preferredId = null, reserve = true } = {}) {
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
     const existing = this.state.proxies.find(
-      (p) => p.enabled && !proxyBlockedReason(p, this.state.config.ipv6_enabled) && proxyHasVm(p, vmId),
+      (p) => p.enabled && !['dead', 'fail'].includes(p.status) && !proxyBlockedReason(p, this.state.config.ipv6_enabled) && proxyHasVm(p, vmId),
     )
-    if (existing) return this.publicProxy(existing)
+    if (existing) {
+      if ((!allowLocal && isLocalEgressProxy(existing)) || (exclusive && boundVmIdsOf(existing).some(id => id !== vmId)) || (preferredId && existing.id !== preferredId)) return null
+      return this.publicProxy(existing)
+    }
+    // A fixed account exit must never silently move after a failure or restart.
+    if (this.state.proxies.some(p => proxyHasVm(p, vmId))) return null
+    if (preferredId) {
+      const restored = this.bind(preferredId, vmId, { exclusive, allowLocal })
+      if (restored.ok) return restored.proxy
+      if (fixed) return null
+    }
 
     const limit = this.bindLimit()
     const owner = normalizeOwnerId(ownerUserId)
@@ -745,10 +756,13 @@ export class ProxyPool extends EventEmitter {
       this.ensureLocalForNode(localEgressNodeId(localTarget))
     }
     const candidates = this.state.proxies.filter((p) => {
+      if (!allowLocal && isLocalEgressProxy(p)) return false
       if (isLocalEgressProxy(p) && p.id !== localTarget) return false
       if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
       if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
       if (boundVmIdsOf(p).length >= limit) return false
+      if (exclusive && boundVmIdsOf(p).length) return false
+      if (boundVmIdsOf(p).some(id => id.startsWith('es2-'))) return false
       return proxyOwnerId(p) === owner
     })
     candidates.sort((a, b) => {
@@ -758,11 +772,12 @@ export class ProxyPool extends EventEmitter {
     })
     const pick = candidates[0]
     if (!pick) return null
-    const bound = this.bind(pick.id, vmId, { role })
+    if (!reserve) return this.publicProxy(pick)
+    const bound = this.bind(pick.id, vmId, { role, exclusive, allowLocal })
     return bound.ok ? bound.proxy : null
   }
 
-  bind(proxyId, vmId, { force = false } = {}) {
+  bind(proxyId, vmId, { force = false, exclusive = false, allowLocal = true } = {}) {
     const vm = String(vmId || '').trim()
     if (isLocalEgressId(proxyId) && vm) {
       // Local egress is the slot's own VPS route: a generic px-local request lands
@@ -773,11 +788,16 @@ export class ProxyPool extends EventEmitter {
     }
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
+    if (!allowLocal && isLocalEgressProxy(p)) return { ok: false, error: 'dedicated_proxy_required' }
     // Migration moves a slot onto its node row even while that row is marked down.
-    if (!force && (!p.enabled || p.status === 'dead')) return { ok: false, error: 'proxy_disabled' }
+    if (!force && (!p.enabled || p.status === 'dead' || p.status === 'fail')) return { ok: false, error: 'proxy_disabled' }
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, error: blocked }
     if (!vm) return { ok: false, error: 'vm_id_required' }
+    if (vm.startsWith('es2-') && this.state.proxies.some(x => x.id !== proxyId && proxyHasVm(x, vm))) return { ok: false, error: 'account_exit_locked' }
+    const otherIds = boundVmIdsOf(p).filter(id => id !== vm)
+    if (otherIds.length && (exclusive || otherIds.some(id => id.startsWith('es2-')))) return { ok: false, error: 'proxy_exclusive' }
+    if (!force && !boundVmIdsOf(p).includes(vm) && boundVmIdsOf(p).length >= this.bindLimit()) return { ok: false, error: 'proxy_bind_limit' }
     for (const x of this.state.proxies) {
       if (x.id === proxyId) continue
       const ids = boundVmIdsOf(x)

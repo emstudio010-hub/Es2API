@@ -13,6 +13,7 @@ import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isCodexCliVm, inspectCodexCliPayload } from './codex-cli-config.mjs'
 import { buildWorkerTelemetry } from './worker-telemetry.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import { assertCliHopAllowed, resolveOfficialCcInference } from './slot-engine.mjs'
@@ -1126,6 +1127,11 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
         hostOf,
         projectRoot,
       }),
+      ...(isCodexCliVm(vm) ? (() => {
+        const payload = inspectCodexCliPayload()
+        if (!payload.ok) throw new Error(payload.code)
+        return ['-v', `${hostOf(payload.root)}:/opt/es2api-codex:ro`]
+      })() : []),
       ...machineMounts,
       ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf }),
       '-e',
@@ -1173,27 +1179,30 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
 export function destroyVmRuntime(vm) {
   if (!vm?.id) return { ok: false, error: 'vm required' }
   const name = containerName(vm.id)
-  const info = inspectContainer(name)
+  const before = inspectContainerOutcome(name)
+  if (before.status === 'error') return { ok: false, code: 'container_inspect_failed', error: '无法确认容器状态，已保留实例与凭据' }
+  const info = before.container
   if (!info) {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
     return { ok: true, action: 'absent', runtime: vm.runtime || null }
   }
   const r = sh(['docker', 'rm', '-f', name], { timeout: 60_000 })
-  if (!r.ok && inspectContainer(name)) {
-    return { ok: false, error: r.stderr || 'docker rm failed' }
-  }
+  const after = inspectContainerOutcome(name)
+  if (after.status !== 'missing') return { ok: false, code: 'container_remove_unconfirmed', error: '容器删除尚未确认，已保留实例与凭据' }
   if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
   return { ok: true, action: 'removed', runtime: vm.runtime || null }
 }
 
 export function stopVmRuntime(vm) {
   const name = containerName(vm.id)
-  const info = inspectContainer(name)
+  const before = inspectContainerOutcome(name)
+  if (before.status === 'error') return { ok: false, code: 'container_inspect_failed', error: '无法确认容器状态，未标记为停止' }
+  const info = before.container
   if (!info) {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
     return { ok: true, action: 'absent', runtime: vm.runtime || null }
   }
-  if (!info.running) {
+  if (!info.running && !info.restarting && !info.pid) {
     runtimePatch(vm, info)
     vm.runtime.stopped = true
     return { ok: true, action: 'already-stopped', runtime: vm.runtime }
@@ -1201,7 +1210,9 @@ export function stopVmRuntime(vm) {
   const grace = isKvmRuntime(vm) || info.runtime === 'kvm' ? '30' : '3'
   const r = sh(['docker', 'stop', '-t', grace, name])
   if (!r.ok) return { ok: false, error: r.stderr || 'docker stop failed' }
-  runtimePatch(vm, inspectContainer(name))
+  const after = inspectContainerOutcome(name)
+  if (after.status === 'error' || after.container?.running || after.container?.restarting || after.container?.pid) return { ok: false, code: 'container_stop_unconfirmed', error: '容器尚未确认停止' }
+  runtimePatch(vm, after.container)
   vm.runtime.stopped = true
   vm.runtime.pid = null
   return { ok: true, action: 'stopped', runtime: vm.runtime }

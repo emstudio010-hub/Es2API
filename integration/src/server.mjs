@@ -37,7 +37,7 @@ function send(res, status, payload) {
 
 function success(res, status, data) { return send(res, status, { ok: true, data }) }
 
-export function createIntegrationServer({ store, accountPool, modeltrace, managementToken, gateway, maxBodyBytes = 10 * 1024 * 1024 }) {
+export function createIntegrationServer({ store, accountPool, modeltrace, managementToken, gateway, vm2, maxBodyBytes = 10 * 1024 * 1024 }) {
   if (!store || !accountPool || !modeltrace || !managementToken) throw new TypeError('store, accountPool, modeltrace, and managementToken are required')
   const server = http.createServer(async (req, res) => {
     const requestId = crypto.randomUUID()
@@ -53,6 +53,12 @@ export function createIntegrationServer({ store, accountPool, modeltrace, manage
       if (!sameSecret(bearer, managementToken)) return send(res, 401, { ok: false, error: { code: 'unauthorized', message: '管理认证失败' } })
 
       let match
+      if (req.method === 'GET' && url.pathname === '/api/v1/admin/exit-resources') return success(res, 200, await vm2.listExitResources())
+      if (req.method === 'POST' && url.pathname === '/api/v1/admin/exit-resources') {
+        const body = await readJson(req, maxBodyBytes)
+        if (typeof body.text !== 'string' || !body.text.trim() || body.text.length > 1024 * 1024) throw Object.assign(new Error('请输入不超过 1 MiB 的代理列表'), { status: 400, code: 'invalid_proxy_input' })
+        return success(res, 201, await vm2.importExitResources(body.text))
+      }
       if (req.method === 'GET' && url.pathname === '/api/v1/admin/accounts') {
         return success(res, 200, accountPool.listAccounts(Object.fromEntries(url.searchParams)))
       }
@@ -92,6 +98,9 @@ export function createIntegrationServer({ store, accountPool, modeltrace, manage
       }
       if ((match = url.pathname.match(/^\/api\/v1\/admin\/accounts\/([^/]+)\/sync$/)) && req.method === 'POST') {
         return success(res, 200, await accountPool.syncAccount(decodeURIComponent(match[1])))
+      }
+      if ((match = url.pathname.match(/^\/api\/v1\/admin\/accounts\/([^/]+)\/(start|stop|recover)$/)) && req.method === 'POST') {
+        return success(res, 202, accountPool.queueInstanceOperation(decodeURIComponent(match[1]), match[2]))
       }
       if (req.method === 'GET' && url.pathname === '/api/v1/admin/groups') return success(res, 200, accountPool.listGroups())
       if (req.method === 'POST' && url.pathname === '/api/v1/admin/groups') return success(res, 201, accountPool.createGroup(await readJson(req, maxBodyBytes)))

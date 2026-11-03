@@ -16,3 +16,4 @@ node_modules/
 **/.credentials.json
 **/credentials.json
 __pycache__/
+/vm2api/share/codex-cli/

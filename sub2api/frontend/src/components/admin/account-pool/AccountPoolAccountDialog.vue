@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import { exchangeCode, generateAuthUrl } from '@/api/admin/accounts'
-import { importIntegrationAccount, updateIntegrationAccount, type IntegrationAccount, type IntegrationAccountMode, type IntegrationAccountUpdate, type IntegrationGroup } from '@/api/admin/integrationAccounts'
+import { importIntegrationAccount, updateIntegrationAccount, listExitResources, type ExitResource, type IntegrationAccount, type IntegrationAccountMode, type IntegrationAccountUpdate, type IntegrationGroup } from '@/api/admin/integrationAccounts'
 import { integrationErrorMessage } from '@/api/admin/integrationClient'
 import { parseOAuthCredential } from './credentialInput'
 
@@ -11,7 +11,10 @@ const props = defineProps<{ show: boolean; account?: IntegrationAccount | null; 
 const emit = defineEmits<{ close: [interrupted: boolean]; saved: [account: IntegrationAccount] }>()
 const { t } = useI18n()
 const editing = computed(() => !!props.account)
-const draft = reactive({ id: '', name: '', mode: 'pool' as IntegrationAccountMode, groupIds: [] as string[], concurrency: 2, priority: 50, proxyId: '', schedulable: false })
+const exits = shallowRef<ExitResource[]>([])
+const exitError = shallowRef('')
+const draft = reactive({ id: '', name: '', mode: 'pool' as IntegrationAccountMode, groupIds: [] as string[], concurrency: 2, priority: 50, proxyId: '', schedulable: false, backend: 'kernel' as 'kernel' | 'codex-cli' })
+watch(() => draft.backend, value => { if (value === 'codex-cli') draft.concurrency = 1 })
 const credentialText = shallowRef('')
 const credentialMode = ref<'json' | 'oauth'>('json')
 const pending = shallowRef(false)
@@ -56,8 +59,15 @@ function resetOAuth() {
 function reset() {
   clearSensitiveState()
   const account = props.account
-  Object.assign(draft, { id: account?.id || crypto.randomUUID(), name: account?.name || '', mode: account?.mode || 'pool', groupIds: [...(account?.group_ids || [])], concurrency: account?.concurrency ?? 2, priority: account?.priority ?? 50, proxyId: account?.binding.proxy_id || '', schedulable: account?.schedulable ?? false })
+  Object.assign(draft, { id: account?.id || crypto.randomUUID(), name: account?.name || '', mode: account?.mode || 'pool', groupIds: [...(account?.group_ids || [])], concurrency: account?.concurrency ?? 2, priority: account?.priority ?? 50, proxyId: account?.binding.proxy_id || '', schedulable: account?.schedulable ?? false, backend: account?.binding.execution_backend || 'kernel' })
   error.value = ''
+  exitError.value = ''; exits.value = []
+  if (!account) {
+    const current = generation
+    controller = new AbortController()
+    listExitResources(controller.signal).then(rows => { if (current === generation) exits.value = rows.filter(row => row.available) })
+      .catch(() => { if (current === generation) exitError.value = t('admin.accountPool.ipLoadFailed') })
+  }
 }
 watch(() => [props.show, props.account] as const, ([show]) => { if (show) reset(); else clearSensitiveState() }, { immediate: true })
 function invalidateImportKey() { if (!pending.value) importKey = '' }
@@ -82,8 +92,7 @@ function validateDraft() {
   if (!draft.name.trim() || !Number.isInteger(draft.concurrency) || draft.concurrency < 1 || draft.concurrency > 256 || !Number.isInteger(draft.priority) || draft.priority < 0 || draft.priority > 100000) {
     error.value = t('admin.accountPool.invalidValues'); return false
   }
-  if (!/^[a-z0-9][a-z0-9._-]{0,75}$/i.test(draft.id)) { error.value = t('admin.accountPool.invalidAccountId'); return false }
-  if (!props.account && !draft.proxyId.trim()) { error.value = t('admin.accountPool.proxyRequired'); return false }
+  if (!/^[a-z0-9][a-z0-9_-]{0,75}$/i.test(draft.id) || draft.id.toLowerCase().endsWith('-chat')) { error.value = t('admin.accountPool.invalidAccountId'); return false }
   return true
 }
 function buildOAuthCredential(tokenInfo: Record<string, unknown>) {
@@ -101,7 +110,7 @@ async function importCredential(credential: Record<string, unknown>) {
   const signal = controller.signal
   try {
     importKey ||= `account-import-${crypto.randomUUID()}`
-    const saved = await importIntegrationAccount({ account_id: draft.id, name: draft.name.trim(), mode: draft.mode, group_ids: [...draft.groupIds], concurrency: draft.concurrency, priority: draft.priority, proxy_id: draft.proxyId.trim() || null, credential }, importKey, signal)
+    const saved = await importIntegrationAccount({ account_id: draft.id, name: draft.name.trim(), mode: draft.mode, group_ids: [...draft.groupIds], concurrency: draft.concurrency, priority: draft.priority, proxy_id: draft.proxyId.trim() || null, execution_backend: draft.backend, credential }, importKey, signal)
     if (current !== generation || signal.aborted) return
     credentialText.value = ''
     importKey = ''
@@ -110,7 +119,7 @@ async function importCredential(credential: Record<string, unknown>) {
     close()
   } catch (cause) {
     if (current !== generation || signal.aborted) return
-    error.value = t('admin.accountPool.importFailed')
+    error.value = integrationErrorMessage(cause, t('admin.accountPool.importFailed'))
     if (credentialMode.value === 'oauth') oauthError.value = t('admin.accountPool.oauthImportFailed')
   } finally {
     if (current === generation) pending.value = false
@@ -231,25 +240,37 @@ onBeforeUnmount(clearSensitiveState)
           <input v-model="draft.id" class="input mt-1 font-mono" maxlength="76" required :disabled="editing" />
           <span v-if="!editing" class="mt-1 block text-xs text-gray-500">{{ t('admin.accountPool.accountIdHint') }}</span>
         </label>
-        <label class="block text-sm">{{ t('admin.accountPool.mode') }}
+        <label v-if="editing" class="block text-sm">{{ t('admin.accountPool.mode') }}
           <select v-model="draft.mode" class="input mt-1" :disabled="editing" @change="draft.groupIds = []">
             <option value="pool">{{ t('admin.accountPool.pool') }}</option>
             <option value="lease">{{ t('admin.accountPool.lease') }}</option>
           </select>
         </label>
         <label class="block text-sm">{{ t('admin.accountPool.proxyId') }}
-          <input v-model="draft.proxyId" class="input mt-1" maxlength="160" :disabled="editing" :required="!editing" />
+          <input v-if="editing" :value="draft.proxyId || account?.slot?.egress?.proxy_id" class="input mt-1" disabled />
+          <select v-else v-model="draft.proxyId" class="input mt-1">
+            <option value="">{{ t('admin.accountPool.autoIp') }}</option>
+            <option v-for="exit in exits" :key="exit.id" :value="exit.id">{{ exit.label || `${exit.host}:${exit.port}` }}</option>
+          </select>
+          <span v-if="exitError" role="alert" class="mt-1 block text-xs text-red-600">{{ exitError }}</span>
           <span class="mt-1 block text-xs text-gray-500">{{ t(editing ? 'admin.accountPool.proxyLockedHint' : 'admin.accountPool.proxyHint') }}</span>
         </label>
+        <label class="block text-sm">{{ t('admin.accountPool.executionBackend') }}
+          <select v-model="draft.backend" class="input mt-1" :disabled="editing">
+            <option value="kernel">{{ t('admin.accountPool.kernelBackend') }}</option>
+            <option value="codex-cli">{{ t('admin.accountPool.cliBackend') }}</option>
+          </select>
+          <span class="mt-1 block text-xs text-gray-500">{{ t('admin.accountPool.cliBackendHint') }}</span>
+        </label>
         <label class="block text-sm">{{ t('admin.accountPool.concurrency') }}
-          <input v-model.number="draft.concurrency" type="number" class="input mt-1" min="1" max="256" step="1" required />
+          <input v-model.number="draft.concurrency" type="number" class="input mt-1" min="1" :max="draft.backend === 'codex-cli' ? 1 : 256" :disabled="draft.backend === 'codex-cli'" step="1" required />
         </label>
         <label class="block text-sm">{{ t('admin.accountPool.priority') }}
           <input v-model.number="draft.priority" type="number" class="input mt-1" min="0" max="100000" step="1" required />
           <span class="mt-1 block text-xs text-gray-500">{{ t('admin.accountPool.priorityHint') }}</span>
         </label>
       </fieldset>
-      <fieldset :disabled="pending || oauthLoading || (editing && draft.mode === 'lease')" class="space-y-2">
+      <fieldset v-if="editing" :disabled="true" class="space-y-2">
         <legend class="mb-2 text-sm font-medium">{{ t('admin.accountPool.groupBinding') }}</legend>
         <p class="text-xs text-gray-500">{{ t(editing && draft.mode === 'lease' ? 'admin.accountPool.leaseLocked' : draft.mode === 'lease' ? 'admin.accountPool.leaseGroupHint' : 'admin.accountPool.poolGroupHint') }}</p>
         <label v-if="draft.mode === 'lease' && !editing" class="flex items-center gap-2 text-sm">
