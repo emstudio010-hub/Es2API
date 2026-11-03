@@ -9,13 +9,17 @@ import { codexCliJobs } from '../transport/codex-cli-state.mjs'
 
 // Keep intent on disk until explicit start or record deletion. Node restarts,
 // stale request snapshots and quota recovery must not resurrect the process.
-export async function shutdownCodexSlot(vm, projectRoot, action, halt, { credentialLockHeld = false } = {}) {
+export async function shutdownCodexSlot(vm, projectRoot, action, halt, { credentialLockHeld = false, acknowledgedHandoffId = null } = {}) {
   const operation = async () => {
     const file = path.join(projectRoot, 'vms', `${vm.id}.json`)
     let record = JSON.parse(fs.readFileSync(file, 'utf8'))
     if (record.id !== vm.id) throw Object.assign(new Error('执行槽记录归属不匹配'), { code: 'codex_shutdown_identity_mismatch' })
     if (record.codex_shutdown?.action === 'delete' && action !== 'delete') {
-      throw Object.assign(new Error('实例删除尚未完成，请继续删除'), { code: 'codex_delete_pending' })
+      // A rebuild may already have committed its checkpoint and removed the
+      // container/home before proxy cleanup failed. An exact persisted receipt
+      // permits re-confirming exit without downgrading delete intent to stop.
+      if (action === 'stop' && acknowledgedHandoffId && record.credential_handoff?.id === acknowledgedHandoffId) action = 'delete'
+      else throw Object.assign(new Error('实例删除尚未完成，请继续删除'), { code: 'codex_delete_pending' })
     }
     const intent = record.codex_shutdown?.action === action ? record.codex_shutdown
       : { id: crypto.randomUUID(), action, at: new Date().toISOString() }

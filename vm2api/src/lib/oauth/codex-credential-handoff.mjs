@@ -23,7 +23,8 @@ export async function checkpointCodexCredential(projectRoot, vmId, expected, sto
     // Persist the freeze before yielding. Restarts cannot resume rotation/boot.
     atomicWriteJson(file, { ...vm, credential_handoff: handoff, schedulable: false,
       schedule_disabled_reason: 'credential_handoff', updated_at: new Date().toISOString() }, { mode: 0o600 })
-    const halted = await stop(vm, projectRoot, { credentialLockHeld: true })
+    const halted = await stop(vm, projectRoot, { credentialLockHeld: true,
+      acknowledgedHandoffId: expected.acknowledged_handoff_id === handoff.id ? handoff.id : null })
     if (!halted?.ok) throw Object.assign(new Error('实例停止未确认，未读取或交接凭据'), { status: 409, code: 'credential_handoff_stop_unconfirmed' })
     const kernel = await stopCodexKernelForCheckpoint(projectRoot, vmId, codexKernelBinPath())
     if (!kernel.ok) throw Object.assign(new Error('宿主 Kernel 退出未确认，未读取或交接凭据'), { status: 409, code: 'credential_handoff_kernel_unconfirmed' })
