@@ -25,8 +25,8 @@ function equalSecret(a, b) {
   return left.length === right.length && crypto.timingSafeEqual(left, right)
 }
 function fail(res, status, code, message) {
-  if (res.destroyed || res.writableEnded) return
-  if (res.headersSent) { res.destroy(); return }
+  if (res.destroyed || res.writableFinished) return
+  if (res.writableEnded || res.headersSent) { res.destroy(); return }
   res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
   res.end(JSON.stringify({ error: { type: code, code, message } }))
 }
