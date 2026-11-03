@@ -262,6 +262,7 @@ export function persistCodexUsage(
  */
 export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), policy = null } = {}) {
   if (!projectRoot || !vm?.id) return { action: 'keep', reason: null }
+  if (getVm(projectRoot, vm.id)?.credential_handoff || vm.credential_handoff) return { action: 'keep', reason: 'credential_handoff' }
   const ev = evaluateCodexQuotaSchedule(vm, now, policy)
   const file = path.join(projectRoot, 'vms', `${vm.id}.json`)
   const leftover = isLeftoverQuotaScheduleOff(vm)
@@ -473,6 +474,7 @@ export function vmHasClaudeCredential(vm) {
  */
 export function vmHasSchedulableCredential(vm, projectRoot = null) {
   if (!vm) return false
+  if (vm.credential_handoff) return false
   if (!isCodexVm(vm)) {
     if (!vmHasClaudeCredential(vm)) return false
     // An expired access token with a recorded refresh failure is not a live
@@ -510,6 +512,7 @@ export function setVmSchedulable(
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   const src = source === 'manual' || source === 'force' ? source : 'auto'
+  if (schedulable && vm.credential_handoff) return summarizeVm(vm)
   if (src === 'auto' && isManualScheduleLocked(vm)) return summarizeVm(vm)
   if (src === 'manual') vm.schedule_manual = true
   vm.schedulable = !!schedulable
