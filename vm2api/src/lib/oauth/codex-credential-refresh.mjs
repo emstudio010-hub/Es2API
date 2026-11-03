@@ -7,10 +7,14 @@ export function refreshStoredCodexCredential(projectRoot, vmId, {
 } = {}) {
   return withCodexCredentialLock(projectRoot, vmId, async () => {
     const accounts = readCodexAccountsStrict(projectRoot, vmId)
-    const index = previous ? accounts.findIndex(row =>
+    let index = previous ? accounts.findIndex(row =>
       (previous.refresh_token && row.refresh_token === previous.refresh_token)
-      || (previous.access_token && row.access_token === previous.access_token)
-      || (previous.chatgpt_account_id && row.chatgpt_account_id === previous.chatgpt_account_id)) : 0
+      || (previous.access_token && row.access_token === previous.access_token)) : 0
+    // Exact token matches win. Provider workspace ids can be shared by several
+    // legacy rows, so never use an id fallback to choose among multiple rows.
+    if (index < 0 && accounts.length === 1 && previous?.chatgpt_account_id
+      && accounts[0].chatgpt_account_id === previous.chatgpt_account_id
+      && (!previous.email || !accounts[0].email || previous.email === accounts[0].email)) index = 0
     if (!accounts.length || index < 0 || (!previous && accounts.length !== 1)) {
       throw Object.assign(new Error('OAuth 记录已变化或数量不匹配，未开始刷新'), { status: 409, code: 'codex_credential_changed' })
     }
