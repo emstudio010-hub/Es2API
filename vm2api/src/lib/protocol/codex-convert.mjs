@@ -3,7 +3,8 @@
  * Native openai.responses bodies pass through after identity strip.
  * Request/usage shapes follow codex-proxy-rs (system→developer, extract_usage).
  */
-import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFromExtract } from './openai-usage.mjs'
+import { extractOpenaiUsage, openaiAnthropicUsageFromExtract } from './openai-usage.mjs'
+import { createCodexChatStream } from './codex-chat-stream.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -326,6 +327,7 @@ export function toCodexCliResponses(protocol, body) {
 }
 
 export function toCodexResponses(protocol, body, convert = {}) {
+  if (protocol === 'openai.chat' && body?.n != null && body.n !== 1) return { ok: false, code: 'codex_chat_n_unsupported' }
   const stripped = stripCodexIdentity(body)
   if (protocol === 'openai.responses') {
     return {
@@ -348,15 +350,6 @@ export function toCodexResponses(protocol, body, convert = {}) {
 
 export function createChatSseState(id = 'codex') {
   return { id, seq: 0, tools: new Map(), sawTool: false, finished: false }
-}
-
-function chatChunk(id, delta, finish, extra = {}) {
-  return `data: ${JSON.stringify({
-    id,
-    object: 'chat.completion.chunk',
-    choices: [{ index: 0, delta, finish_reason: finish ?? null }],
-    ...extra,
-  })}\n\n`
 }
 
 function bindTool(state, keys, fields = {}) {
@@ -399,74 +392,9 @@ function toolDoneDeltas(slot, full) {
 
 export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   const session = state || createChatSseState(id)
-  if (session.finished) return null
-  const parsed = parseSseData(line)
-  if (parsed.skip) return null
-  if (parsed.done) {
-    session.finished = true
-    return 'data: [DONE]\n\n'
-  }
-  const event = parsed.event || {}
-  const type = event.type || ''
-  if (['response.failed', 'response.incomplete', 'response.cancelled', 'error'].includes(type) ||
-      event.error || event.response?.error || ['failed', 'incomplete', 'cancelled'].includes(event.response?.status)) {
-    const error = event.response?.error || event.error || {
-      type: 'api_error', code: 'upstream_incomplete', message: 'Upstream response did not complete',
-    }
-    const usage = openaiChatUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage))
-    session.finished = true
-    return `data: ${JSON.stringify({ error, ...(usage ? { usage } : {}) })}\n\ndata: [DONE]\n\n`
-  }
-  if (
-    (type === 'response.output_item.added' || type === 'response.output_item.done') &&
-    (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')
-  ) {
-    const item = event.item
-    const slot = bindTool(session, [event.output_index, event.item_id, item.call_id, item.id], {
-      id: item.call_id || item.id,
-      name: item.name,
-    })
-    const calls = toolDoneDeltas(slot, item.arguments ?? item.input)
-    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
-  }
-  if (type === 'response.function_call_arguments.delta' || type === 'response.custom_tool_call_input.delta') {
-    const slot = bindTool(session, [event.output_index, event.item_id])
-    const calls = []
-    const header = toolHeaderDelta(slot)
-    if (header) calls.push(header)
-    if (typeof event.delta === 'string' && event.delta) {
-      slot.args += event.delta
-      calls.push({ index: slot.index, function: { arguments: event.delta } })
-    }
-    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
-  }
-  if (type === 'response.function_call_arguments.done' || type === 'response.custom_tool_call_input.done') {
-    const slot = bindTool(session, [event.output_index, event.item_id], { name: event.name })
-    const calls = toolDoneDeltas(slot, event.arguments ?? event.input)
-    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
-  }
-  if (type.startsWith('response.reasoning_') && typeof event.delta === 'string' && event.delta) {
-    return chatChunk(session.id, { reasoning_content: event.delta })
-  }
-  if (
-    type === 'response.output_text.delta' ||
-    (typeof event.delta === 'string' && event.delta && type !== 'response.completed' && type !== 'response.done')
-  ) {
-    return chatChunk(session.id, { content: event.delta || event.text || '' })
-  }
-  if (type === 'response.completed' || type === 'response.done') {
-    const calls = []
-    for (const [index, item] of (event.response?.output || []).entries()) {
-      if (item?.type !== 'function_call' && item?.type !== 'custom_tool_call') continue
-      const slot = bindTool(session, [index, item.call_id, item.id], { id: item.call_id || item.id, name: item.name })
-      calls.push(...toolDoneDeltas(slot, item.arguments ?? item.input))
-    }
-    const usage = openaiChatUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage))
-    const repaired = calls.length ? chatChunk(session.id, { tool_calls: calls }) : ''
-    session.finished = true
-    return `${repaired}${chatChunk(session.id, {}, session.sawTool ? 'tool_calls' : 'stop', usage ? { usage } : {})}data: [DONE]\n\n`
-  }
-  return null
+  session.chatStream ||= createCodexChatStream({ id: session.id || id, model: session.model || '' })
+  try { return session.chatStream.push(line) }
+  finally { session.finished = session.chatStream.finished; session.complete = session.chatStream.complete }
 }
 
 export function parseSseData(line) {

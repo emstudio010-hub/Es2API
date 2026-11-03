@@ -13,8 +13,8 @@
 解压到独立目录，例如 `/opt/es2api`（systemd 安装路径不支持空格/中文）。不要覆盖正在运行的目录。
 
 ```bash
-tar -xzf Es2API-linux-x64-20261104-r11.tar.gz
-cd Es2API-linux-x64-20261104-r11
+tar -xzf Es2API-linux-x64-20261104-r12.tar.gz
+cd Es2API-linux-x64-20261104-r12
 sudo ./es2api.sh init
 sudo ./es2api.sh run
 ```

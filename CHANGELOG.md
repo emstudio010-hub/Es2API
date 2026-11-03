@@ -1,5 +1,13 @@
 # 变更记录
 
+## 2026.11.04-preview.12 — 流式Chat与WS逐轮租约
+
+- 流式Chat改用独立有界状态，正文/refusal/function参数分别传递并与最终输出核对，稳定唯一id/created/model；缺少终止、前缀冲突或未知可见输出不能成功，保留已知用量。
+- 明确completed才正常stop/tool_calls，已知截断映射length/content_filter；custom流式按当前官方Chat schema明确报不支持，保留非流式Chat/Responses路径，不伪装function，不输出非标准reasoning_content。
+- Kernel和API账号的Chat流在EOF收尾，API账号非流式也用共享Chat适配；Kernel入口明确拒绝n不等于1，CLI允许显式n=1，原始/执行参数能力校验仍保留。
+- WebSocket按每个response.create申请租约，终止帧及其之前消息的本机send回调成功后才释放结果，空闲连接不占并发；每轮重入分组/账号/代次/指纹及引用隔离门，固定原账号，不故障切换。
+- WS每轮15分钟预算；response.cancel/interrupt校验当前目标并转换为VM2的interrupt。确认帧写出或10秒到期关闭连接并记取消，不将确认当执行退出或成功；关闭、超时、协议/写出失败均清理活动租约。
+
 ## 2026.11.04-preview.11 — 非流式Chat与长等待
 
 - Kernel/CLI 共用非流式 Chat Completion 转换，保留文本、refusal、function/custom 工具调用、URL引用和真实用量；工具结束为tool_calls，明确的输出上限/过滤分别为length/content_filter。

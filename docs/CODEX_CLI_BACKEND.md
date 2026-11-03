@@ -78,6 +78,20 @@ URL引用转换并按拼接后的文本偏移修正；不能表达的文件引�
 
 格式依据：[官方Chat Completion响应字段](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
 
+## 流式 Chat 与 WS 每轮租约（preview.12）
+
+Chat SSE使用独立状态，不改变Anthropic/Responses组装共用的工具helper。每流生成稳定唯一id，created固定为本机开始时间；model在首个公开chunk前可由上游元数据确定，此后变更拒绝。正文、refusal、function参数分别累计；done/最终完整输出只补缺失后缀，前缀/类型/身份/输出次序冲突报错，不把拒绝/未知delta写成正文。单事件/累计可见文本及参数上限10Mi个UTF-16码元，最多4096输出项、8192内容块。
+
+最终借助共享非流式适配检查完整输出，再核对已发送正文/refusal和工具参数。只有明确完成才stop/tool_calls；明确max_output_tokens/content_filter分别为length/content_filter，仍不记实际完整推理。早到DONE、缺终止EOF、失败或未知输出不能宣告成功。已知usage在转换失败后仍观察保留，错误帧脱敏，不增加推理重试。API账号非流式Chat也使用共享适配；两条Chat流路径均检查EOF。Kernel的Chat入口在执行前拒绝n不等于1，CLI原始参数允许n=1，仍不支持多choice。
+
+当前官方Chat流工具delta只定义function，没有custom字段；custom输出、引用和其他不能表达的可见输出明确报codex_chat_stream_unsupported，建议使用非流式Chat或Responses，不将custom伪装function。推理进度/summary不暴露为非标准reasoning_content。CLI仍是文本exec，工具路径属于Kernel/API适配，不表示CLI已支持工具执行。Chat custom请求定义及历史工具结果的输入转换仍需补齐。
+
+WS连接保持原账号绑定，但每次response.create在同一隔离事务中重新检查分组、调度容量、账号/槽位/代次/凭据incarnation及previous/item引用，独立申请租约。完成/失败终止帧及所有先前帧本机send回调完成后才释放当轮结果；空闲连接不持并发，下一轮不换账号、不重放。一个连接仅允许一个活动轮次，未完成就发下一轮会关闭并记失败。完成观察检查响应id一致和完整completed输出；HTTP升级或文本/usage不能独立证明成功。
+
+WS逐轮15分钟预算，握手15秒、连接空闲15分钟。response.cancel和原生response.interrupt都只允许取消当前轮次，显式目标需归属本调用者并匹配当前response id；转为VM2实际支持的response.interrupt。取消确认写出或10秒到期后关闭当前连接，并记取消，不把确认当执行已退出。客户端断连/上游关闭/协议错误/背压/发送失败/停服均关闭本地上游并清理活动租约。send回调仅证明本机写出，不证明远端已读；容器取消和退出确认仍属于执行层的独立验收。
+
+格式依据：[官方Chat流事件](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)、[官方Responses流事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)。这些源码改动未经过行为测试或真实账号验收。
+
 ## 验收边界
 
 本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。

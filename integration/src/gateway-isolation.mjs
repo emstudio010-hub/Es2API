@@ -59,7 +59,7 @@ export class GatewayIsolation {
     }
   }
 
-  select(context, group, accountPool) {
+  select(context, group, accountPool, pinnedAccount = null) {
     // Synchronous transaction prevents concurrent first turns from selecting
     // different slots for the same caller/session.
     return this.store.transaction(() => {
@@ -70,7 +70,13 @@ export class GatewayIsolation {
       const firstReference = context.references.length ? this.lookup(context, 'item', context.references[0]) : null
       if (context.references.length && !firstReference) throw denied()
       const binding = prior || session || firstReference
-      const requested = binding?.account_id || (group.strategy === 'per_slot' ? group.lease_account_id : null)
+      if (pinnedAccount) {
+        this.assertAccount(this.store.getAccount(pinnedAccount.id), { account_id: pinnedAccount.id,
+          vm_id: pinnedAccount.vm_id, generation: pinnedAccount.provision_generation, incarnation: incarnation(pinnedAccount) })
+        if (binding) this.assertAccount(pinnedAccount, binding)
+        if (group.strategy === 'per_slot' && group.lease_account_id !== pinnedAccount.id) throw denied()
+      }
+      const requested = pinnedAccount?.id || binding?.account_id || (group.strategy === 'per_slot' ? group.lease_account_id : null)
       if (binding) this.assertAccount(this.store.getAccount(requested), binding)
       // Store.acquireRequest already owns a transaction; select it through its
       // transaction-free implementation while this outer transaction is held.

@@ -77,6 +77,7 @@ import {
 import { clientIp } from '../pool/sticky-router.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
 import { codexBodyToChatCompletion, isCodexChatResponseError } from './codex-chat-response.mjs'
+import { finishChatSse, isCodexChatStreamError } from './codex-chat-stream.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -651,7 +652,7 @@ export async function handleCodexProtocol({
   const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
   const chatSse =
     protocol === 'openai.chat' || protocol === 'openai.completions'
-      ? { id: 'codex', seq: 0, tools: new Map(), sawTool: false }
+      ? { id: 'codex', model: converted.body.model, seq: 0, tools: new Map(), sawTool: false }
       : null
   const pickOpts = {
     stickyRouter,
@@ -881,7 +882,6 @@ export async function handleCodexProtocol({
             },
             onEvent: async (line) => {
               hopEmitted = true
-              if (conversionError) return
               const event = parseSseData(line).event
               cliKeepalive?.observeLine(line)
               if (event) {
@@ -897,6 +897,7 @@ export async function handleCodexProtocol({
               if (seen) streamedUsage = preferUsage(streamedUsage, seen)
               const imageGen = imageGenUsageFromSseLine(line)
               if (imageGen) streamedImageUsage = imageGen
+              if (conversionError) return
               if (!stream) {
                 chunks.push(line)
                 return
@@ -910,12 +911,12 @@ export async function handleCodexProtocol({
                       : responsesSseToChatChunk(line, 'codex', chatSse)
                   if (mapped) res.write(mapped)
                 } catch (error) {
-                  if (error.code !== 'tool_arguments_mismatch') throw error
+                  if (error.code !== 'tool_arguments_mismatch' && !isCodexChatStreamError(error)) throw error
                   conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
                   res.write(
                     protocol === 'anthropic.messages'
                       ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-                      : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                      : `data: ${JSON.stringify({ error: conversionError, ...(error.usage ? { usage: error.usage } : {}) })}\n\ndata: [DONE]\n\n`,
                   )
                 }
                 return
@@ -952,6 +953,17 @@ export async function handleCodexProtocol({
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
           ? Math.max(0, result.firstTokenAt - requestStartedAt)
           : (result?.ttftMs ?? null)
+        if (stream && chatSse && !conversionError && (result?.ok || hopEmitted)) {
+          try { finishChatSse(chatSse) }
+          catch (error) {
+            if (!isCodexChatStreamError(error)) throw error
+            conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+            if (!gone.signal.aborted && !res.destroyed && !res.writableEnded) {
+              if (!res.headersSent) writeSSEHeaders(res)
+              res.write(`data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`)
+            }
+          }
+        }
         if (conversionError) {
           result.ok = false
           result.status = 502
@@ -975,7 +987,7 @@ export async function handleCodexProtocol({
         const responseBody = result?.body?.response || result?.body
         const completedBody = responseBody?.status === 'completed' && !responseBody.error
         const failedBody = !!result?.body?.error || !!responseBody?.error || ['failed', 'incomplete', 'cancelled'].includes(responseBody?.status)
-        logBag.inference_completed = !conversionError && responseTerminal !== 'failed' && !failedBody &&
+        logBag.inference_completed = !conversionError && (!stream || !chatSse || chatSse.complete === true) && responseTerminal !== 'failed' && !failedBody &&
           (responseTerminal === 'completed' || completedBody ||
             (responseTerminal === null && result?.ok === true && result.terminalState === 'verified'))
         // CLI may report real usage before a final delivery/transport failure.

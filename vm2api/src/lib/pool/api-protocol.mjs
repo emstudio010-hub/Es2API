@@ -16,6 +16,8 @@ import {
   responsesSseToChatChunk,
 } from '../protocol/codex-convert.mjs'
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
+import { finishChatSse, isCodexChatStreamError } from '../protocol/codex-chat-stream.mjs'
+import { codexBodyToChatCompletion, isCodexChatResponseError } from '../protocol/codex-chat-response.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
 
@@ -532,6 +534,7 @@ async function runOpenAIResponsesUpstream({
   const chunks = []
   const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
   const chatSse = createChatSseState()
+  chatSse.model = inbound?.model || body?.model || ''
   let conversionError = null
   let committed = false
   let completed = false
@@ -559,9 +562,9 @@ async function runOpenAIResponsesUpstream({
         if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
       }
     } catch (error) {
-      if (error.code !== 'tool_arguments_mismatch') throw error
+      if (error.code !== 'tool_arguments_mismatch' && !isCodexChatStreamError(error)) throw error
       conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-      const payload = JSON.stringify({ error: conversionError })
+      const payload = JSON.stringify({ error: conversionError, ...(error.usage ? { usage: error.usage } : {}) })
       res.write(
         protocol === 'anthropic.messages'
           ? 'event: error\ndata: ' + JSON.stringify({ type: 'error', error: conversionError }) + '\n\n'
@@ -571,13 +574,13 @@ async function runOpenAIResponsesUpstream({
   }
 
   await readLines(upstream, async (line) => {
-    if (conversionError) return
     const raw = String(line || '')
     const event = openAIResponsesSseEvent(raw)
     const failure = openAIResponsesFailure(event)
     if (failure) terminalFailure = failure
     const seen = usageFromSseLine(raw)
     if (seen) streamedUsage = seen
+    if (conversionError) return
     const startsOutput = isOpenAIResponsesCommitEvent(event)
     const completes = event?.type === 'response.completed' || event?.type === 'response.done'
     const wasCommitted = committed
@@ -607,9 +610,11 @@ async function runOpenAIResponsesUpstream({
       outBody =
         protocol === 'anthropic.messages'
           ? codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
-          : assembled
+          : protocol === 'openai.chat'
+            ? codexBodyToChatCompletion(assembled, inbound?.model || body?.model)
+            : assembled
     } catch (error) {
-      if (!isToolArgumentsError(error)) throw error
+      if (!isToolArgumentsError(error) && !isCodexChatResponseError(error)) throw error
       return {
         ...resultBase,
         ok: false,
@@ -629,6 +634,14 @@ async function runOpenAIResponsesUpstream({
       usage: assembled?.usage || streamedUsage || outBody?.usage || null,
       terminalState: complete ? 'verified' : hasBody ? 'incomplete' : 'rejected',
       committed,
+    }
+  }
+  if (clientStream && protocol !== 'openai.responses' && protocol !== 'anthropic.messages' && !conversionError && !terminalFailure && (committed || resultBase.ok)) {
+    try { finishChatSse(chatSse) }
+    catch (error) {
+      if (!isCodexChatStreamError(error)) throw error
+      conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+      if (res.headersSent && !res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`)
     }
   }
   if (terminalFailure)

@@ -25,7 +25,7 @@ const fail = (field) => { throw Object.assign(new Error(`Codex CLI 文本执行�
 
 // Validate raw input too: protocol conversion must not silently erase unsupported fields.
 export function codexCliRequest(body = {}, raw = body) {
-  const supportedFields = new Set(['model', 'input', 'messages', 'instructions', 'reasoning', 'reasoning_effort', 'stream', 'store', 'metadata', 'user', 'stream_options', 'prompt_cache_key', 'prompt_cache_retention', 'session_id', 'conversation_id', 'tools', 'tool_choice', 'parallel_tool_calls'])
+  const supportedFields = new Set(['model', 'input', 'messages', 'instructions', 'reasoning', 'reasoning_effort', 'stream', 'store', 'metadata', 'user', 'stream_options', 'prompt_cache_key', 'prompt_cache_retention', 'session_id', 'conversation_id', 'tools', 'tool_choice', 'parallel_tool_calls', 'n'])
   for (const key of Object.keys(raw)) if (!supportedFields.has(key) && raw[key] != null) fail(key)
   if (raw.messages != null && !Array.isArray(raw.messages)) fail('messages')
   if (raw.prompt_cache_key != null || raw.prompt_cache_retention != null) fail('prompt_cache_key/prompt_cache_retention')
