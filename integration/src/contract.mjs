@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { selectOAuthCredential } from '../../vm2api/src/lib/oauth/credential-import.mjs'
 
 export const ACCOUNT_MODES = Object.freeze({
   POOL: 'pool',
@@ -45,37 +46,7 @@ function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map((v) => String(v).trim()).filter(Boolean))]
 }
 
-function walkCredential(value, seen = new Set()) {
-  if (!value || typeof value !== 'object' || seen.has(value)) return {}
-  seen.add(value)
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      const found = walkCredential(entry, seen)
-      if (found.access_token || found.refresh_token || found.id_token || found.api_key) return found
-    }
-    return {}
-  }
-  const out = {}
-  const keys = Object.keys(value)
-  for (const key of keys) {
-    const normalized = key.toLowerCase().replace(/-/g, '_')
-    const raw = value[key]
-    if (typeof raw === 'string' && raw.trim()) {
-      if (normalized === 'access_token' || normalized === 'accesstoken') out.access_token ||= raw.trim()
-      if (normalized === 'refresh_token' || normalized === 'refreshtoken') out.refresh_token ||= raw.trim()
-      if (normalized === 'id_token' || normalized === 'idtoken') out.id_token ||= raw.trim()
-      if (normalized === 'api_key' || normalized === 'apikey' || normalized === 'openai_api_key') out.api_key ||= raw.trim()
-    }
-  }
-  if (out.access_token || out.refresh_token || out.id_token || out.api_key) return out
-  for (const key of keys) {
-    const found = walkCredential(value[key], seen)
-    if (found.access_token || found.refresh_token || found.id_token || found.api_key) return found
-  }
-  return {}
-}
-
-/** Normalize an imported account without ever logging or returning raw credential values. */
+/** Private credential normalization. Use publicCredentialStatus for API responses. */
 export function normalizeOpenAICredential(input) {
   let source = input
   if (typeof input === 'string') {
@@ -87,7 +58,8 @@ export function normalizeOpenAICredential(input) {
       source = { access_token: text }
     }
   }
-  const tokens = walkCredential(source)
+  const selected = selectOAuthCredential(source)
+  const tokens = selected?.tokens || {}
   if (tokens.api_key) {
     throw new TypeError('VM2 Codex 槽不支持 OpenAI API Key 导入；请提供 ChatGPT OAuth 凭据')
   }
@@ -99,6 +71,7 @@ export function normalizeOpenAICredential(input) {
     refresh_token: tokens.refresh_token || null,
     id_token: tokens.id_token || null,
     api_key: tokens.api_key || null,
+    ...selected.metadata,
   }
 }
 

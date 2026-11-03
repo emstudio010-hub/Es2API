@@ -8,7 +8,7 @@ import sys
 import tarfile
 
 ROOT = Path(__file__).resolve().parent.parent
-NAME = os.environ.get('ES2API_RELEASE_NAME', 'Es2API-linux-x64-20261104-r3')
+NAME = os.environ.get('ES2API_RELEASE_NAME', 'Es2API-linux-x64-20261104-r4')
 STAGE = ROOT / 'build-cache' / os.environ.get('ES2API_STAGE_FOLDER', NAME)
 DIST = ROOT / os.environ.get('ES2API_DIST_FOLDER', 'dist')
 PAYLOAD_ROOT = ROOT / 'build-cache/payload' if (ROOT / 'build-cache/payload').exists() else ROOT / 'runtime/vm2'
@@ -109,12 +109,14 @@ def stage():
     for name in ['package.json', 'package-lock.json']:
         copy(ROOT / 'integration' / name, STAGE / 'source/integration' / name)
     tree(ROOT / 'deploy-linux', STAGE / 'source/deploy-linux')
-    metadata = {'product': 'Es2API', 'version': os.environ.get('ES2API_RELEASE_VERSION', '2026.11.04-preview.3'), 'platform': 'linux', 'arch': 'x64', 'node': '24.22.2', 'payload_release': payload['release'], 'tests_run': False, 'contains_user_data': False, 'entrypoint': './es2api.sh', 'deployment_acceptance': 'not performed', 'google_oauth_requires_configuration': True}
+    metadata = {'product': 'Es2API', 'version': os.environ.get('ES2API_RELEASE_VERSION', '2026.11.04-preview.4'), 'platform': 'linux', 'arch': 'x64', 'node': '24.22.2', 'payload_release': payload['release'], 'tests_run': False, 'contains_user_data': False, 'entrypoint': './es2api.sh', 'deployment_acceptance': 'not performed', 'google_oauth_requires_configuration': True}
     (STAGE / 'release.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     print('Staged allowlisted release: ' + str(STAGE))
 
 def archive():
     # Required compiled artifacts and dependency installs must exist before archiving.
+    if not (STAGE / 'vm2api/src/lib/oauth/credential-import.mjs').is_file():
+        raise RuntimeError('Missing shared OAuth import selector')
     for relative in ['node/bin/node', 'bin/es2api', 'payload/bin/kin-api-kernel', 'integration/node_modules/ws/package.json', 'vm2api/node_modules/ws/package.json', 'vm2api/web/dist/index.html', 'integration/resources/modeltrace/PROVENANCE.md', 'vm2api/share/codex-cli/linux-x64/bin/codex', 'vm2api/share/codex-cli/linux-x64/codex-resources/bwrap', 'vm2api/share/codex-cli/linux-x64/LICENSE', 'vm2api/share/codex-cli/linux-x64/manifest.json']:
         if not (STAGE / relative).is_file():
             raise RuntimeError('Missing distribution component: ' + relative)

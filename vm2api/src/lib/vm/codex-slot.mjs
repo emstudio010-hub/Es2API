@@ -7,6 +7,7 @@ import { atomicWriteJson, readJsonCached } from './vm-file.mjs'
 import { isCodexVm } from '../protocol/codex-route.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, hasSpendableCodexCredits } from '../protocol/codex-usage.mjs'
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
+import { selectOAuthCredential } from '../oauth/credential-import.mjs'
 
 export { isCodexVm }
 
@@ -46,56 +47,9 @@ function looksLikeClaudeSecret(text) {
 }
 
 function extractOauthTokens(value) {
-  let access = ''
-  let refresh = ''
-  let idToken = ''
-  const pending = [value]
-  const seen = new Set()
-  while (pending.length) {
-    const current = pending.pop()
-    if (!current || typeof current !== 'object') continue
-    if (seen.has(current)) continue
-    seen.add(current)
-    if (Array.isArray(current)) {
-      pending.push(...current)
-      continue
-    }
-    for (const [key, nested] of Object.entries(current)) {
-      if (key === 'accessToken' || key === 'access_token') {
-        if (!access) access = firstString(nested)
-        continue
-      }
-      if (key === 'refreshToken' || key === 'refresh_token') {
-        if (!refresh) refresh = firstString(nested)
-        continue
-      }
-      if (key === 'idToken' || key === 'id_token') {
-        if (!idToken) idToken = firstString(nested)
-        continue
-      }
-      if (nested && typeof nested === 'object') pending.push(nested)
-    }
-  }
-  return { access, refresh, idToken }
-}
-
-function collectImportCandidates(doc) {
-  if (!doc || typeof doc !== 'object') return []
-  if (Array.isArray(doc.documents)) {
-    const out = []
-    for (const entry of doc.documents) {
-      if (!entry || typeof entry !== 'object') continue
-      const provider = String(entry.provider || '')
-        .trim()
-        .toLowerCase()
-      if (provider && provider !== 'openai' && provider !== 'codex') continue
-      if (entry.document && typeof entry.document === 'object') out.push(...collectImportCandidates(entry.document))
-    }
-    return out
-  }
-  if (Array.isArray(doc.accounts)) return doc.accounts.filter((item) => item && typeof item === 'object')
-  if (Array.isArray(doc)) return doc.filter((item) => item && typeof item === 'object')
-  return [doc]
+  const selected = selectOAuthCredential(value)
+  return { access: selected?.tokens.access_token || '', refresh: selected?.tokens.refresh_token || '',
+    idToken: selected?.tokens.id_token || '', selected }
 }
 
 function isOpenaiApiKeyOnly(doc) {
@@ -106,38 +60,25 @@ function isOpenaiApiKeyOnly(doc) {
   return !tokens.access && !tokens.refresh
 }
 
-function accountFromTokens(source, access, refresh, idToken) {
-  const nested =
-    source && typeof source === 'object' && !Array.isArray(source)
-      ? source.credentials && typeof source.credentials === 'object'
-        ? source.credentials
-        : source
-      : {}
-  const chatgptAccountId = firstString(
-    source?.chatgpt_account_id,
-    nested.chatgpt_account_id,
-    source?.account_id,
-    nested.account_id,
-    source?.accountId,
-    nested.accountId,
-  )
-  const email = firstString(source?.email, nested.email)
-  const expiresAt = Number(source?.expires_at || nested.expires_at || 0)
-  const rpm = Number(source?.rpm ?? nested.rpm)
-  const conc = Number(source?.max_concurrency ?? nested.max_concurrency)
+function accountFromTokens(source, access, refresh, idToken, selected = null) {
+  const selection = selected || selectOAuthCredential(source)
+  const hints = selection?.metadata || {}
+  const records = selection?.records || []
+  const rpm = Number(records.find(row => row.rpm != null)?.rpm)
+  const conc = Number(records.find(row => row.max_concurrency != null)?.max_concurrency)
   const account = enrichCodexAccountIdentity({
     access_token: access,
     refresh_token: refresh,
     id_token: idToken,
-    expires_at: Number.isFinite(expiresAt) ? expiresAt : 0,
-    chatgpt_account_id: chatgptAccountId,
-    email: email || null,
+    expires_at: hints.expires_at || 0,
+    chatgpt_account_id: hints.chatgpt_account_id || '',
+    email: hints.email || null,
     rpm: Number.isFinite(rpm) && rpm > 0 ? rpm : 0,
     max_concurrency: Number.isFinite(conc) && conc > 0 ? conc : 0,
   })
   // Older kernel exports used the email as their account id. Other ids are not emails.
-  const legacyId = firstString(nested.id)
-  if (!account.email && /^[^\s@]+@[^\s@]+$/.test(legacyId)) account.email = legacyId
+  const legacyId = firstString(records[0]?.id)
+  if (!account.email && legacyId.length <= 254 && /^[^\s@\x00-\x1f\x7f]+@[^\s@\x00-\x1f\x7f]+$/.test(legacyId)) account.email = legacyId
   return { ...account, id: account.email || account.chatgpt_account_id || 'codex' }
 }
 
@@ -176,8 +117,6 @@ export function parseCodexCredentialInput(input, opts = {}) {
   if (mode === 'access_token' || mode === 'refresh_token') {
     if (typeof input === 'string') return parseTokenList(input, mode)
     const tokens = extractOauthTokens(input)
-    const access = mode === 'access_token' ? tokens.access : ''
-    const refresh = mode === 'refresh_token' ? tokens.refresh : tokens.refresh
     if (mode === 'access_token' && !tokens.access) {
       return { ok: false, error: 'missing_token', message: '请粘贴 Access Token' }
     }
@@ -191,6 +130,7 @@ export function parseCodexCredentialInput(input, opts = {}) {
         tokens.access,
         tokens.refresh,
         tokens.idToken,
+        tokens.selected,
       ),
     }
   }
@@ -219,10 +159,8 @@ export function parseCodexCredentialInput(input, opts = {}) {
       message: 'OPENAI_API_KEY 客户端配置不是 OAuth 账号。请导入 auth.json / AT / RT。',
     }
   }
-  const candidates = collectImportCandidates(doc)
-  for (const candidate of candidates) {
-    const tokens = extractOauthTokens(candidate)
-    if (!tokens.access && !tokens.refresh) continue
+  const tokens = extractOauthTokens(doc)
+  if (tokens.access || tokens.refresh) {
     if (looksLikeClaudeSecret(tokens.access) || looksLikeClaudeSecret(tokens.refresh)) {
       return {
         ok: false,
@@ -230,7 +168,7 @@ export function parseCodexCredentialInput(input, opts = {}) {
         message: '不能导入 Claude 凭证。GPT 槽需要 ChatGPT/Codex OAuth。',
       }
     }
-    return { ok: true, account: accountFromTokens(candidate, tokens.access, tokens.refresh, tokens.idToken) }
+    return { ok: true, account: accountFromTokens(doc, tokens.access, tokens.refresh, tokens.idToken, tokens.selected) }
   }
   return {
     ok: false,

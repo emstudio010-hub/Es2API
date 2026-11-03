@@ -14,6 +14,16 @@
 
 ## 账号导入闭环
 
+### OAuth 记录与元数据（preview.4）
+
+控制面和执行面共同使用 `vm2api/src/lib/oauth/credential-import.mjs` 的纯解析函数。运行 integration 时需要保留仓库中同级的 vm2api 源码目录；Linux 分发包已经包含该文件。
+
+单次导入按文档顺序选取第一条含 access_token/refresh_token 的记录（API Key 仍拒绝），所有令牌必须在同一对象内。支持平铺、tokens/credentials 等嵌套、accounts 数组和 CPR documents 导出；多账号文件仍只导入一条，不执行批量导入。documents 中仅读取 OpenAI/Codex 文档。数组、账号集合和无关对象的元数据不传递到子账号，缺失令牌不会从其他账号补全。
+
+只保留选中记录及其透明包装层的 `chatgpt_account_id`、`email`、`expires_at`；选中令牌对象中的 account_id/accountId，以及 auth.json 中 tokens 旁的该字段，作为供应商 ID 别名。credentials 包装层的管理 account_id 和任意 id 不能作为供应商 ID。字段有长度/格式限制；无效可选元数据忽略。绝对期限支持 Unix 秒、毫秒、带时区 ISO 文本（含 expired 别名），统一成秒；没有基准时间的 expires_in 不推算。嵌套深度最多64，遍历对象最多10000。
+
+这些字段是导入提示，不代表已认证的供应商身份。元数据随凭据加密保存，不进入 publicCredentialStatus；凭据指纹仍只使用原有四个令牌字段，不改旧数据库指纹，不重写或迁移已有账号。相同账号刷新后的新令牌目前仍可能形成不同指纹，不能宣称已经实现供应商稳定身份去重。
+
 1. 控制面验证并保存账号，生成稳定的 `account_id`。
 2. `AccountLifecycle.provision()` 调用 VM2 `/api/panel/vms/create`，固定 `runtime_type=docker`、`platform=openai`、`kind=codex`，并以 `start=false` 创建空槽。
 3. 创建成功后才调用 `/api/panel/vms/import` 导入 ChatGPT OAuth 凭据；不接受 OpenAI API Key 作为账号凭据。

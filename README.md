@@ -24,7 +24,7 @@ Es2API 将 **Sub2API 的用户、分组、Key、计费和管理界面**，与 **
 | 方向 | Es2API 的新增与适配 |
 | --- | --- |
 | 账号池 | OAuth 管理与账号池分离；一个新 OAuth 一个工作区，独立实例、IP 与运行设置 |
-| OAuth 导入 | JSON 导入和浏览器授权入口，校验 state，兑换后直接进入账号池 |
+| OAuth 导入 | JSON 导入和浏览器授权入口；同记录保留身份和期限，避免跨账号拼接；校验 state 后进入账号池 |
 | 执行槽生命周期 | 创建、导入、健康确认、异步启动/停止/恢复；删除未确认时保留数据 |
 | Codex CLI | 可选真实容器内 CLI 0.155.1，Responses/Chat 纯文本适配、单并发、请求级 HOME 与取消 |
 | 固定出口 | 创建时自动独占分配空闲 IP 或手选出口，时区和身份随出口派生，绑定后固定 |
@@ -64,9 +64,9 @@ flowchart LR
 从 [Releases](https://github.com/emstudio010-hub/Es2API/releases) 下载 `.tar.gz` 及 `.sha256`，在服务器执行：
 
 ```bash
-sha256sum -c Es2API-linux-x64-20261104-r3.tar.gz.sha256
-tar -xzf Es2API-linux-x64-20261104-r3.tar.gz
-cd Es2API-linux-x64-20261104-r3
+sha256sum -c Es2API-linux-x64-20261104-r4.tar.gz.sha256
+tar -xzf Es2API-linux-x64-20261104-r4.tar.gz
+cd Es2API-linux-x64-20261104-r4
 sudo ./es2api.sh init
 sudo ./es2api.sh run
 ```
