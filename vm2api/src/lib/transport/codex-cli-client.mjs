@@ -19,6 +19,7 @@ import { codexCliInstructionConfig } from './codex-cli-request-config.mjs'
 import { readCodexCliExitReceipt, waitCodexCliExitReceipt } from './codex-cli-receipt.mjs'
 import { claimCodexCliRequest, hasCodexCliClaim } from './codex-cli-claim.mjs'
 import { withCodexSlotActivity } from '../vm/codex-slot-coordination.mjs'
+import { codexCliLaunchArgs } from './codex-cli-launch.mjs'
 
 const runFile = promisify(execFile)
 const TIMEOUT_MS = 300000
@@ -119,8 +120,12 @@ export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
   } catch (error) { if (error.code !== 'ENOENT') return { ok: false, reachable: false, code: 'codex_cli_state_unreadable', status: 503 } }
   try {
     const result = await runFile('docker', slotExecArgv(exec.vm, [CODEX_CLI_CONTAINER_BIN, '--version'], { user: slotHost(exec.vm).execUser(exec.vm) }), { timeout: timeoutMs, maxBuffer: 4096, windowsHide: true })
-    const ok = result.stdout.trim() === `codex-cli ${CODEX_CLI_VERSION}`
-    return { ok, reachable: ok, status: ok ? 200 : 503, code: ok ? null : 'codex_cli_version_mismatch', ...(ok ? { version: CODEX_CLI_VERSION } : {}), backend: 'codex-cli' }
+    if (result.stdout.trim() !== `codex-cli ${CODEX_CLI_VERSION}`) return { ok: false, reachable: false, status: 503, code: 'codex_cli_version_mismatch' }
+    // features list parses the same launch policy without creating a turn or
+    // sending inference. A version-only check misses bootstrap config errors.
+    const bootstrap = await runFile('docker', slotExecArgv(exec.vm, [CODEX_CLI_CONTAINER_BIN, ...codexCliLaunchArgs(), 'features', 'list'], { user: slotHost(exec.vm).execUser(exec.vm) }), { timeout: timeoutMs, maxBuffer: 32768, windowsHide: true })
+    const ok = /^unbounded_connection_retries\s+\S+(?:\s+\S+)*\s+false\s*$/m.test(bootstrap.stdout)
+    return { ok, reachable: ok, status: ok ? 200 : 503, code: ok ? null : 'codex_cli_launch_config_invalid', ...(ok ? { version: CODEX_CLI_VERSION } : {}), backend: 'codex-cli' }
   } catch { return { ok: false, reachable: false, code: 'codex_cli_not_ready', status: 503 } }
 }
 
@@ -154,7 +159,7 @@ export async function refreshCliCredential(projectRoot, vm, { force = false, dea
 
 // This supervisor lives inside the slot. It kills the entire CLI process group on
 // timeout, cancellation, or loss of the host heartbeat (including host crashes).
-const RUNNER = String.raw`import os,sys,time,signal,subprocess,threading,json
+const RUNNER = String.raw`import os,sys,time,signal,subprocess,threading,json,tempfile,shutil
 root=sys.argv[1]
 limit=float(sys.argv[2])/1000
 nonce=sys.argv[3]
@@ -178,11 +183,24 @@ def live_group(pgid):
         except (FileNotFoundError,ProcessLookupError): continue
     return alive
 
+# Codex's in-process app-server needs native Linux filesystem operations.
+# The Windows bind mount remains the control/receipt channel only. Runtime
+# config/auth live in this account container's private, noexec /tmp tmpfs.
+local=None
 try:
-    proc=subprocess.Popen(sys.argv[4:],start_new_session=True)
+    local=tempfile.mkdtemp(prefix='es2api-cli-',dir='/tmp')
+    for name in ['home','work','config','cache']: os.mkdir(local+'/'+name,0o700)
+    for name in ['config.toml','auth.json']:
+        shutil.copyfile(root+'/home/'+name,local+'/home/'+name)
+        os.chmod(local+'/home/'+name,0o400 if name=='config.toml' else 0o600)
+    argv=[local+arg[len(root):] if arg==root or arg.startswith(root+'/') else arg for arg in sys.argv[4:]]
+    env=os.environ.copy()
+    env.update({'CODEX_HOME':local+'/home','HOME':local,'XDG_CONFIG_HOME':local+'/config','XDG_CACHE_HOME':local+'/cache'})
+    proc=subprocess.Popen(argv,start_new_session=True,cwd=local+'/work',env=env)
 except OSError:
     # No child process exists. Mark the request confirmed rather than leaving
     # an unrecoverable-looking request directory after an exec setup failure.
+    if local is not None: shutil.rmtree(local)
     receipt(126,'not_started',None)
     sys.exit(126)
 ended=threading.Event()
@@ -220,6 +238,8 @@ finally:
     while watcher.is_alive() or live_group(proc.pid):
         if time.monotonic()>=until: sys.exit(125)
         time.sleep(.1)
+    # No receipt on cleanup failure: preserve the claim until explicit recovery.
+    shutil.rmtree(local)
     if rc is not None: receipt(rc if rc>=0 else 128-rc,'exited',proc.pid)
 sys.exit(rc if rc>=0 else 128-rc)
 `
@@ -316,9 +336,7 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     if (remaining <= 0) return errorResult(504, 'codex_cli_timeout', 'CLI 执行预算已用尽，未启动推理')
     // CODEX_HOME contains only our generated config and short-lived auth copy.
     // --ignore-user-config would discard the request's developer instructions.
-    const argv = [CODEX_CLI_CONTAINER_BIN, 'exec', '--json', '--ephemeral', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only', '-C', `${guest}/work`, '-m', request.model]
-    for (const feature of ['shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_host', 'browser_use', 'browser_use_external', 'computer_use', 'image_generation', 'memories', 'hooks', 'in_app_browser', 'in_app_local_automation', 'in_app_chat', 'workspace_dependencies', 'goals']) argv.push('--disable', feature)
-    for (const config of ['web_search="disabled"', 'cli_auth_credentials_store="file"', 'model_provider="openai"', 'model_providers.openai.request_max_retries=0', 'model_providers.openai.stream_max_retries=0', 'model_providers.openai.supports_websockets=false', 'mcp_servers={}', 'analytics.enabled=false', 'feedback.enabled=false']) argv.push('-c', config)
+    const argv = [CODEX_CLI_CONTAINER_BIN, ...codexCliLaunchArgs(), 'exec', '--json', '--ephemeral', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only', '-C', `${guest}/work`, '-m', request.model]
     if (request.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(request.effort)}`)
     argv.push('-')
     const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(remaining), receiptNonce, ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })

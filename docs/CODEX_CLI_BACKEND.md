@@ -193,3 +193,12 @@ ping/pong是WS控制帧，nonce匹配才证明链路回应，不用于模型完�
 ## 同机控制进程协调（preview.19）
 
 凭据、运行控制与完整恢复使用同一Linux flock控制作用域；Kernel/CLI宿主请求持共享活动锁，停止确认等待跨进程finalizer排空。争用失败保留原状态，不按PID/TTL清除claim或重放调用。所有控制进程需同时升级，锁文件不得删除。详见 [实例协调](SLOT_COORDINATION.md)。仅静态核对，未进行多进程、崩溃或真实账号行为验收。
+
+
+## 启动配置与临时运行目录（preview.20）
+
+使用唯一自定义 provider es2api_codex，固定 ChatGPT Codex Responses 地址及 requires_openai_auth；禁止覆盖内置openai。请求/流重试0，禁用unbounded_connection_retries。健康检查用相同launch参数解析features list，不能证明账号/模型供应商可用。
+
+Windows挂载目录可能使CLI内置app-server初始化失败。监督器把请求配置和无refresh token的认证副本放到容器自身/tmp下0700临时目录，CODEX_HOME/HOME/XDG和工作目录都指向该目录。控制/心跳/退出回执仍在挂载目录；进程组排空且临时目录清理成功才写回执，失败保留claim等待恢复。/tmp保持32MiB noexec/nosuid tmpfs，不扩大权限；崩溃残留随容器停止清除，不能从宿主Docker客户端关闭推断已清理。
+
+专用OAuth的gpt-6-luna一次调用未成功：HTTP502/exit1，无正文和有效usage。仅无凭据、关闭loopback端点的离线诊断验证本地启动与清理修复，未追加真实推理。
