@@ -1,13 +1,26 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { codexKernelOwnerLockPath, withCodexKernelBootstrap, claimCodexKernelOwner } from '../vm/codex-slot-coordination.mjs'
 
 // A detached kernel can survive a Node restart. Match executable, exact config
 // argv, uid and /proc start ticks before signalling; a socket is not exit proof.
-export async function stopCodexKernelForCheckpoint(projectRoot, vmId, binary) {
-  if (process.platform !== 'linux' || !binary) return { ok: false }
-  const config = path.resolve(projectRoot, 'vms', vmId, 'run', 'codex-kernel.json')
-  let executable
-  try { executable = fs.realpathSync(binary) } catch { return { ok: false } }
+export function codexKernelProcessRecords(projectRoot, vmId, binary, ownerBinary) {
+  return kernelScope(projectRoot, vmId, binary, ownerBinary).owned()
+}
+
+function kernelScope(projectRoot, vmId, binary, ownerBinary) {
+  if (process.platform !== 'linux' || !binary) throw new Error('Kernel process scope unavailable')
+  const config = path.join(fs.realpathSync(projectRoot), 'vms', vmId, 'run', 'codex-kernel.json')
+  const executable = fs.realpathSync(binary)
+  const owner = ownerBinary ? fs.realpathSync(ownerBinary) : null
+  const lockPath = codexKernelOwnerLockPath(projectRoot, vmId)
+  function matches(current) {
+    const kernel = current.executable === executable && current.argv.length === 2 && current.argv[1] === config
+    const helper = current.executable === owner && current.argv.length === 5
+      && current.argv[1] === 'codex-owner' && current.argv[2] === executable
+      && current.argv[3] === config && current.argv[4] === lockPath
+    return current.uid === process.getuid() && (kernel || helper)
+  }
   function identity(pid) {
     try {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
@@ -41,7 +54,7 @@ export async function stopCodexKernelForCheckpoint(projectRoot, vmId, binary) {
       if (!argv.includes(config)) continue
       const current = identity(Number(pidText))
       if (!current) continue
-      if (current.uid !== process.getuid() || current.executable !== executable) throw new Error('Kernel process identity mismatch')
+      if (!matches(current)) throw new Error('Kernel process identity mismatch')
       found.push({ pid: Number(pidText), ...current })
     }
     return found
@@ -51,7 +64,7 @@ export async function stopCodexKernelForCheckpoint(projectRoot, vmId, binary) {
       const current = identity(record.pid)
       if (!current) continue
       if (current.ticks !== record.ticks || current.uid !== record.uid || current.executable !== record.executable
-        || !current.argv.includes(config)) throw new Error('Kernel process identity changed')
+        || !matches(current)) throw new Error('Kernel process identity changed')
       try { process.kill(record.pid, name) } catch (error) { if (error.code !== 'ESRCH') throw error }
     }
   }
@@ -63,10 +76,25 @@ export async function stopCodexKernelForCheckpoint(projectRoot, vmId, binary) {
     }
     return !owned().length
   }
+  return { owned, signal, waitGone }
+}
+
+// Caller owns slot control (shutdown) or has drained activity (refresh/recycle).
+// Bootstrap is taken last; an admitted reader must never wait for control.
+export async function stopCodexKernelForCheckpoint(projectRoot, vmId, binary, ownerBinary) {
   try {
-    signal(owned(), 'SIGTERM')
-    if (await waitGone(3000)) return { ok: true }
-    signal(owned(), 'SIGKILL')
-    return { ok: await waitGone(1000) }
+    return await withCodexKernelBootstrap(projectRoot, vmId, async () => {
+      const { owned, signal, waitGone } = kernelScope(projectRoot, vmId, binary, ownerBinary)
+      signal(owned(), 'SIGTERM')
+      if (!await waitGone(3000)) {
+        signal(owned(), 'SIGKILL')
+        if (!await waitGone(1000)) return { ok: false }
+      }
+      // A helper inherited the lock before exec and may not yet have visible
+      // argv. A zero-process scan alone cannot prove that spawn interval ended.
+      const owner = claimCodexKernelOwner(projectRoot, vmId)
+      owner.release()
+      return { ok: true }
+    })
   } catch { return { ok: false } }
 }

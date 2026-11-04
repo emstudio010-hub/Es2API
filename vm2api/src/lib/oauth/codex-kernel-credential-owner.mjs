@@ -20,15 +20,15 @@ export async function stopConfiguredCodexKernel(projectRoot, vmId) {
     if (!fs.statSync(config).isFile()) throw new Error('Kernel config is not a regular file')
     configured = true
   } catch (error) { if (error.code !== 'ENOENT') throw error }
-  const { codexKernelBinPath, stopCodexKernel, finishCodexRecycle } = await import('../transport/codex-kernel-supervisor.mjs')
+  const { codexKernelBinPath, codexKernelOwnerBinPath, codexKernelMayBeRunning, stopCodexKernel, finishCodexRecycle } = await import('../transport/codex-kernel-supervisor.mjs')
   // A spawn admitted before shutdown may not have exec'ed the kernel yet. Its
   // tracked child must exit too; /proc argv scanning alone can miss that phase.
-  const child = stopCodexKernel(vmId)
+  const child = stopCodexKernel(vmId, projectRoot)
   if (child && !(await finishCodexRecycle(child, null)).exited) throw Object.assign(new Error('Kernel 子进程退出未确认'), {
     status: 409, code: 'codex_kernel_refresh_stop_unconfirmed',
   })
-  if (configured) {
-    const stopped = await stopCodexKernelForCheckpoint(projectRoot, vmId, codexKernelBinPath())
+  if (configured || codexKernelMayBeRunning(vmId, projectRoot)) {
+    const stopped = await stopCodexKernelForCheckpoint(projectRoot, vmId, codexKernelBinPath(), codexKernelOwnerBinPath())
     if (!stopped.ok) throw Object.assign(new Error('Kernel 退出未确认，未开始凭据刷新或覆盖'), {
       status: 409, code: 'codex_kernel_refresh_stop_unconfirmed',
     })

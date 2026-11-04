@@ -8,7 +8,7 @@ import { readCodexAccountsStrict, isCodexVm } from '../vm/codex-slot.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { stopCodexKernelForCheckpoint } from '../transport/codex-kernel-stop.mjs'
-import { codexKernelBinPath } from '../transport/codex-kernel-supervisor.mjs'
+import { codexKernelBinPath, codexKernelOwnerBinPath } from '../transport/codex-kernel-supervisor.mjs'
 
 export async function checkpointCodexCredential(projectRoot, vmId, expected, stop) {
   return withCodexCredentialLock(projectRoot, vmId, async () => {
@@ -26,7 +26,7 @@ export async function checkpointCodexCredential(projectRoot, vmId, expected, sto
     const halted = await stop(vm, projectRoot, { credentialLockHeld: true,
       acknowledgedHandoffId: expected.acknowledged_handoff_id === handoff.id ? handoff.id : null })
     if (!halted?.ok) throw Object.assign(new Error('实例停止未确认，未读取或交接凭据'), { status: 409, code: 'credential_handoff_stop_unconfirmed' })
-    const kernel = await stopCodexKernelForCheckpoint(projectRoot, vmId, codexKernelBinPath())
+    const kernel = await stopCodexKernelForCheckpoint(projectRoot, vmId, codexKernelBinPath(), codexKernelOwnerBinPath())
     if (!kernel.ok) throw Object.assign(new Error('宿主 Kernel 退出未确认，未读取或交接凭据'), { status: 409, code: 'credential_handoff_kernel_unconfirmed' })
     vm = JSON.parse(fs.readFileSync(file, 'utf8'))
     assertCodexIntegrationBinding(vm, expected)

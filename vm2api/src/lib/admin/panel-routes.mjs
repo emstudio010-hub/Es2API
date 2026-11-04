@@ -66,7 +66,7 @@ import {
 } from '../oauth/sub2api-account.mjs'
 import { officialCcHome, readOfficialCcStatus, scheduleOfficialCcBootstrap } from '../oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
-import { ensureCodexKernel, stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
+import { withCodexSlotDrain } from '../vm/codex-slot-coordination.mjs'
 import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
 import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } from '../protocol/model-policy.mjs'
 import {
@@ -3505,70 +3505,63 @@ export function createPanelHandler(ctx) {
           if (prev.codex_shutdown) return json(res, 409, { ok: false, error: { code: 'codex_shutdown_pending', message: '停机或删除尚未解除，不能清除凭据' } })
           prev.id = prev.id || id
           if (isCodexCliVm(prev) && cancelCodexCli(id)) return json(res, 409, { ok: false, error: { code: 'codex_cli_busy', message: 'CLI 正在退出，请等待执行结束后清除凭据' } })
-          const slotDir = path.join(cfg.paths.project, 'vms', id)
-          const removed = []
-          for (const file of [
-            path.join(slotDir, 'codex-credentials.json'),
-            path.join(slotDir, 'cli-home', '.codex', 'auth.json'),
-            path.join(slotDir, 'cli-home', '.claude', 'credentials.json'),
-            path.join(slotDir, 'cli-home', '.claude', '.credentials.json'),
-          ]) {
-            try {
-              if (fs.existsSync(file)) {
-                fs.rmSync(file, { force: true })
-                removed.push(path.relative(cfg.paths.project, file))
-              }
-            } catch {}
-          }
-          const vm =
-            patchVmRecord(cfg.paths.project, id, (record) => {
-              record.email = null
-              record.account_uuid = null
-              record.org_uuid = null
-              record.expires_at = null
-              record.codex = {}
-              record.claude = {}
-              record.worker_credential = null
-              record.refresh_status = null
-              record.refresh_error = null
-              record.restriction_reason = null
-              record.restriction_until = null
-              record.schedulable = false
-              record.schedule_disabled_reason = 'no_credential'
-              return record
-            }) || prev
-          try {
-            invalidateLiveCredentialCache()
-          } catch {}
-          // The kernel still holds the old token in memory: stop it, then bring a
-          // credential-less kernel back so the slot matches an empty slot.
-          const kernel = { stopped: false, restarted: false, error: null }
-          try {
-            kernel.stopped = !!stopCodexKernel(id)
-            if (isCodexVm(vm) && !isCodexCliVm(vm)) {
-              const started = await ensureCodexKernel(slotExec(cfg.paths.project, getVm(cfg.paths.project, id) || vm), {
-                timeoutMs: 8000,
-              })
-              kernel.restarted = !!started?.ok
-              if (!started?.ok) kernel.error = started?.reason || 'codex_kernel_start_failed'
+          const clear = async () => {
+            const slotDir = path.join(cfg.paths.project, 'vms', id)
+            const removed = []
+            for (const file of [
+              path.join(slotDir, 'codex-credentials.json'),
+              path.join(slotDir, 'cli-home', '.codex', 'auth.json'),
+              path.join(slotDir, 'cli-home', '.claude', 'credentials.json'),
+              path.join(slotDir, 'cli-home', '.claude', '.credentials.json'),
+            ]) {
+              try {
+                if (fs.existsSync(file)) {
+                  fs.rmSync(file, { force: true })
+                  removed.push(path.relative(cfg.paths.project, file))
+                }
+              } catch {}
             }
-          } catch (e) {
-            kernel.error = String(e?.message || e).slice(0, 160)
+            const vm =
+              patchVmRecord(cfg.paths.project, id, (record) => {
+                record.email = null
+                record.account_uuid = null
+                record.org_uuid = null
+                record.expires_at = null
+                record.codex = {}
+                record.claude = {}
+                record.worker_credential = null
+                record.refresh_status = null
+                record.refresh_error = null
+                record.restriction_reason = null
+                record.restriction_until = null
+                record.schedulable = false
+                record.schedule_disabled_reason = 'no_credential'
+                return record
+              }) || prev
+            try {
+              invalidateLiveCredentialCache()
+            } catch {}
+            // Codex is drained and its configured kernel has confirmed exit
+            // BEFORE removing credentials. Do not eagerly boot an empty account.
+            const kernel = { stopped: isCodexVm(prev), restarted: false, error: null }
+            try {
+              const repo = ctx.accountQuota?.repo
+              const row = repo && typeof repo.get === 'function' ? repo.get(id) : null
+              if (row && typeof repo.save === 'function') repo.save({ ...row, email: null, name: id })
+            } catch {}
+            const saved = getVm(cfg.paths.project, id) || vm
+            return json(
+              res,
+              200,
+              panel.ok({
+                cleared: { vm_id: id, files: removed, kernel },
+                vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
+              }),
+            )
           }
-          try {
-            const repo = ctx.accountQuota?.repo
-            const row = repo && typeof repo.get === 'function' ? repo.get(id) : null
-            if (row && typeof repo.save === 'function') repo.save({ ...row, email: null, name: id })
-          } catch {}
-          const saved = getVm(cfg.paths.project, id) || vm
-          return json(
-            res,
-            200,
-            panel.ok({
-              cleared: { vm_id: id, files: removed, kernel },
-              vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
-            }),
-          )
+          return isCodexVm(prev) ? withCodexCredentialLock(cfg.paths.project, id, () =>
+            withCodexKernelCredentialOwner(cfg.paths.project, id, () =>
+              withCodexSlotDrain(cfg.paths.project, id, 'cli', clear))) : clear()
         })
       }
       // POST /api/panel/vms/:id/reset-fingerprint

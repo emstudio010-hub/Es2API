@@ -836,7 +836,7 @@ export async function handleCodexProtocol({
         if (gone.signal.aborted) { logBag.final_state = 'cancelled'; return }
         downstreamKeepalive?.arm()
         const localExit = isLocalEgressProxy(vm.proxy)
-        const written = cli ? null : writeCfg(projectRoot, vm, {
+        const written = cli ? null : await writeCfg(projectRoot, vm, {
           // Same rule as slot start: a node on local egress must leave through
           // that node's forwarder, not the control plane's deployment proxy.
           proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),

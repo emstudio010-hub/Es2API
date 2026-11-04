@@ -10,13 +10,19 @@ import { boundProxyUrl, isLocalEgressProxy, localEgressProxyUrl } from '../vm/eg
 import { vmNodeId } from '../cluster/placement.mjs'
 import { assertProxyAllowed } from '../vm/proxy-policy.mjs'
 import { maxRequestBytes } from '../core/config.mjs'
-import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { codexKernelHealth, codexKernelPaths, codexSocketPath } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
-import { codexKernelIdentity, hasCodexKernelLease, withCodexKernelActivity } from './codex-kernel-activity.mjs'
+import { codexKernelIdentity, hasCodexKernelLease, withCodexKernelActivity, withCodexKernelPause } from './codex-kernel-activity.mjs'
+import { withCodexKernelBootstrap, withCodexKernelConfigWrite, claimCodexKernelOwner, codexKernelOwnerLockPath } from '../vm/codex-slot-coordination.mjs'
+import { codexKernelProcessRecords } from './codex-kernel-stop.mjs'
 
 const starts = new Map()
+const failedSpawns = new WeakSet()
+
+function trackedKey(projectRoot, vmId) {
+  return `${fs.realpathSync(projectRoot)}\n${vmId}`
+}
 
 // The kernel exits only through config.proxy_url; inherited proxy variables would give it a second, unseen exit.
 function kernelEnv(env = process.env) {
@@ -45,6 +51,11 @@ export function codexKernelBinPath() {
   return existingBin(path.resolve('bin/kin-codex-kernel'))
 }
 
+export function codexKernelOwnerBinPath() {
+  return existingBin(process.env.KIN_API_KERNEL_BIN)
+    || existingBin(path.join(path.dirname(codexKernelBinPath()), 'kin-api-kernel'))
+}
+
 /** Per-hop policy keeps settings live without interrupting another request's kernel. */
 export function codexKernelRequestOptions(routing = {}) {
   const codex = normalizeCodexRouting(routing.codex)
@@ -56,8 +67,30 @@ export function codexKernelRequestOptions(routing = {}) {
   }
 }
 
-export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxyRequired, routing } = {}) {
+export function writeCodexKernelConfig(projectRoot, vm, options = {}) {
   if (!projectRoot || !vm?.id) return null
+  return withCodexKernelConfigWrite(projectRoot, vm.id, () => writeConfig(projectRoot, vm, options))
+}
+
+// Rename only complete, fsynced files. A crash must never leave a truncated
+// token/config that a detached kernel or a later controller can consume.
+function atomicPrivateWrite(filename, contents) {
+  const temporary = `${filename}.${crypto.randomUUID()}.tmp`
+  let fd
+  try {
+    fd = fs.openSync(temporary, 'wx', 0o600)
+    fs.writeFileSync(fd, contents)
+    fs.fsyncSync(fd)
+    fs.closeSync(fd); fd = undefined
+    fs.renameSync(temporary, filename)
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
+    try { fs.unlinkSync(temporary) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  }
+}
+
+function writeConfig(projectRoot, vm, { token, proxyUrl, proxyRequired, routing } = {}) {
+  projectRoot = fs.realpathSync(projectRoot)
   assertCodexCredentialNotHandingOff(projectRoot, vm.id)
   assertProxyAllowed(vm.proxy)
   if (proxyUrl) assertProxyAllowed({ url: proxyUrl })
@@ -72,10 +105,10 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
   if (!secret) {
     try {
       secret = fs.readFileSync(tokenPath, 'utf8').trim()
-    } catch {}
+    } catch (error) { if (error.code !== 'ENOENT') throw error }
   }
   if (!secret) secret = crypto.randomBytes(24).toString('hex')
-  fs.writeFileSync(tokenPath, secret + '\n', { mode: 0o600 })
+  atomicPrivateWrite(tokenPath, secret + '\n')
   const local = isLocalEgressProxy(vm?.proxy)
   // Only a slot on this host treats local egress as the deployment proxy.
   // A node slot is handed that node's forwarder; replacing it would exit from here.
@@ -93,7 +126,7 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
   // Official installation identity is a random UUID, never a VM or hardware fingerprint.
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deviceId)) {
     deviceId = crypto.randomUUID()
-    fs.writeFileSync(installationPath, `${deviceId}\n`, { mode: 0o600 })
+    atomicPrivateWrite(installationPath, `${deviceId}\n`)
   }
   const config = {
     vm_id: vm.id,
@@ -107,11 +140,13 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     ...codexKernelRequestOptions(routing),
     test_endpoints: process.env.KIN_CODEX_TEST_ENDPOINTS === '1',
   }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
+  atomicPrivateWrite(configPath, JSON.stringify(config, null, 2) + '\n')
   return { runDir, socketPath, configPath, credentialPath, tokenPath, installationId: deviceId }
 }
 
 export function shouldRecycleCodexKernel({ wanted, stamped, inFlight } = {}) {
+  // Legacy predicate retained for callers; it is NOT authority to stop a
+  // process. The supervisor below requires an exclusive global drain instead.
   return wanted > 0 && stamped > 0 && wanted !== stamped && inFlight <= 1
 }
 
@@ -129,7 +164,7 @@ function readLimitStamp(configPath) {
 
 function writeLimitStamp(configPath, bytes) {
   if (!configPath || !(bytes > 0)) return
-  fs.writeFileSync(limitStampPath(configPath), `${bytes}\n`, { mode: 0o600 })
+  atomicPrivateWrite(limitStampPath(configPath), `${bytes}\n`)
 }
 
 function configRequestBytes(configPath) {
@@ -141,7 +176,7 @@ function configRequestBytes(configPath) {
 }
 
 function childHasExited(child) {
-  return !child || child.exitCode != null || child.signalCode != null
+  return !child || failedSpawns.has(child) || child.exitCode != null || child.signalCode != null
 }
 
 function waitForChildExit(child, timeoutMs) {
@@ -186,81 +221,115 @@ export async function finishCodexRecycle(child, socketPath, { termMs = 2000, kil
 export async function ensureCodexKernel(exec, { timeoutMs = 8000, kernelLease } = {}) {
   try {
     const { projectRoot, vmId } = codexKernelIdentity(exec)
-    if (kernelLease && hasCodexKernelLease(projectRoot, vmId, kernelLease)) return await ensureCodexKernelActive(exec, { timeoutMs })
-    return await withCodexKernelActivity(projectRoot, vmId, () => ensureCodexKernelActive(exec, { timeoutMs }))
+    const ensure = (stopped = false) => withCodexKernelBootstrap(projectRoot, vmId,
+      () => ensureCodexKernelActive(exec, { timeoutMs, stopped }))
+    if (kernelLease && hasCodexKernelLease(projectRoot, vmId, kernelLease)) return await ensure()
+    const ready = await withCodexKernelActivity(projectRoot, vmId, () => ensure())
+    if (ready.reason !== 'kernel_recycle_required') return ready
+    // Release our OWN shared activity before draining. Upgrading it while
+    // waiting for other controllers would deadlock or interrupt their requests.
+    return await withCodexKernelPause(projectRoot, vmId, async () => {
+      const { stopConfiguredCodexKernel } = await import('../oauth/codex-kernel-credential-owner.mjs')
+      await stopConfiguredCodexKernel(projectRoot, vmId)
+      return ensure(true)
+    })
   } catch (error) {
     return { ok: false, reason: error.code || 'kernel_identity_unavailable' }
   }
 }
 
-async function ensureCodexKernelActive(exec, { timeoutMs }) {
-  const bin = codexKernelBinPath()
+async function ensureCodexKernelActive(exec, { timeoutMs, stopped = false }) {
+  const binPath = codexKernelBinPath()
+  const bin = binPath ? fs.realpathSync(binPath) : ''
   if (!bin) return { ok: false, reason: 'bin_missing' }
+  const ownerPath = codexKernelOwnerBinPath()
+  const ownerBin = ownerPath ? fs.realpathSync(ownerPath) : ''
+  if (!ownerBin) return { ok: false, reason: 'kernel_owner_bin_missing' }
   const paths = codexKernelPaths(exec)
   if (!paths.configPath) return { ok: false, reason: 'config_missing' }
+  paths.configPath = fs.realpathSync(paths.configPath)
   const projectRoot = exec.homeDir ? path.dirname(path.dirname(path.dirname(exec.homeDir)))
     : path.dirname(path.dirname(path.dirname(path.dirname(paths.configPath))))
   try { assertCodexCredentialNotHandingOff(projectRoot, exec.vmId || exec.vm?.id) }
   catch { return { ok: false, reason: 'credential_handoff_or_record_unavailable' } }
+  const key = trackedKey(projectRoot, exec.vmId || exec.vm?.id)
   const wanted = configRequestBytes(paths.configPath)
   const stamped = readLimitStamp(paths.configPath)
-  const inFlight = openAIRuntimeSignals(exec.vmId).inFlight
-  // Only the request that holds this seat may recycle. A timeout is not an
-  // exit: leave the socket and the tracked child in place.
-  if (shouldRecycleCodexKernel({ wanted, stamped, inFlight })) {
-    const child = stopCodexKernel(exec.vmId)
-    if (child) {
-      const gone = await finishCodexRecycle(child, paths.socketPath)
-      if (!gone.exited) {
-        starts.set(exec.vmId, child)
-        return { ok: false, reason: 'recycle_timeout' }
-      }
-    }
-  }
+  if (!(wanted > 0)) return { ok: false, reason: 'kernel_config_invalid' }
+  if (!stopped && wanted !== stamped) return { ok: false, reason: 'kernel_recycle_required' }
   const live = await waitForHealth(exec, Math.min(800, Math.max(200, Number(timeoutMs) || 800)))
   if (live.ok) return { ok: true, reused: true, health: live.health }
-  const current = starts.get(exec.vmId)
-  if (!childHasExited(current) && !current.killed) return waitForHealth(exec, timeoutMs)
+  const current = starts.get(key)
+  if (!childHasExited(current)) return current.killed
+    ? { ok: false, reason: 'kernel_exit_pending' } : waitForHealth(exec, timeoutMs, current)
+  // An unhealthy socket is not proof that another controller's detached
+  // kernel exited. Keep its socket in place and require a coordinated stop.
   try {
-    if (paths.socketPath) fs.unlinkSync(paths.socketPath)
-  } catch {}
-  try { assertCodexCredentialNotHandingOff(projectRoot, exec.vmId || exec.vm?.id) }
-  catch { return { ok: false, reason: 'credential_handoff_or_record_unavailable' } }
-  const child = spawn(bin, [paths.configPath], {
-    env: kernelEnv(),
-    stdio: ['ignore', 'ignore', 'pipe'],
-    detached: true,
-  })
-  // Classify a bounded transient buffer; never persist raw kernel output.
-  let diagnostic = ''
-  let reported = ''
-  child.stderr?.on('data', chunk => {
-    diagnostic = (diagnostic + chunk.toString('utf8')).slice(-8192)
-    const kind = /SOCKS.*(auth|credential)|authentication failed/i.test(diagnostic) ? 'proxy_auth'
-      : /SOCKS|proxy connect|proxy handshake/i.test(diagnostic) ? 'proxy_connect'
-        : /TLS|certificate|handshake/i.test(diagnostic) ? 'tls_handshake'
-          : /connection reset|ECONNRESET|broken pipe/i.test(diagnostic) ? 'connection_reset'
-            : /timeout|timed out|ETIMEDOUT/i.test(diagnostic) ? 'transport_timeout'
-              : /connection refused|ECONNREFUSED/i.test(diagnostic) ? 'connection_refused' : ''
-    if (kind && kind !== reported) {
-      reported = kind
-      console.warn(JSON.stringify({ event: 'codex_kernel_transport', vm_id: exec.vmId, category: kind, at: new Date().toISOString() }))
-    }
-  })
-  child.once('exit', (code, signal) => {
-    diagnostic = ''
-    console.warn(JSON.stringify({ event: 'codex_kernel_exit', vm_id: exec.vmId, code, signal, at: new Date().toISOString() }))
-  })
-  child.unref()
-  starts.set(exec.vmId, child)
-  writeLimitStamp(paths.configPath, wanted)
-  return waitForHealth(exec, timeoutMs)
+    if (codexKernelProcessRecords(projectRoot, exec.vmId || exec.vm?.id, bin, ownerBin).length) return { ok: false, reason: 'kernel_process_unhealthy' }
+  } catch { return { ok: false, reason: 'kernel_process_identity_unavailable' } }
+  // Transfer the SAME flock via fd3; it remains owned even if Node dies in the
+  // child's pre-main/exec interval. Only its native owner/child release it.
+  const owner = claimCodexKernelOwner(projectRoot, exec.vmId || exec.vm?.id)
+  try {
+    try {
+      if (paths.socketPath) fs.unlinkSync(paths.socketPath)
+    } catch {}
+    try { assertCodexCredentialNotHandingOff(projectRoot, exec.vmId || exec.vm?.id) }
+    catch { return { ok: false, reason: 'credential_handoff_or_record_unavailable' } }
+    const child = spawn(ownerBin, ['codex-owner', bin, paths.configPath,
+      codexKernelOwnerLockPath(projectRoot, exec.vmId || exec.vm?.id)], {
+      env: kernelEnv(),
+      stdio: ['ignore', 'ignore', 'pipe', owner.descriptor],
+      detached: true,
+    })
+    // Classify a bounded transient buffer; never persist raw kernel output.
+    let diagnostic = ''
+    let reported = ''
+    child.on('error', () => {
+      // ChildProcess may also emit error for a failed signal. Only a failed
+      // spawn (no PID) proves absence; keep tracking any existing process.
+      if (child.pid) return
+      failedSpawns.add(child)
+      diagnostic = ''
+      if (starts.get(key) === child) starts.delete(key)
+    })
+    child.stderr?.on('data', chunk => {
+      diagnostic = (diagnostic + chunk.toString('utf8')).slice(-8192)
+      const kind = /SOCKS.*(auth|credential)|authentication failed/i.test(diagnostic) ? 'proxy_auth'
+        : /SOCKS|proxy connect|proxy handshake/i.test(diagnostic) ? 'proxy_connect'
+          : /TLS|certificate|handshake/i.test(diagnostic) ? 'tls_handshake'
+            : /connection reset|ECONNRESET|broken pipe/i.test(diagnostic) ? 'connection_reset'
+              : /timeout|timed out|ETIMEDOUT/i.test(diagnostic) ? 'transport_timeout'
+                : /connection refused|ECONNREFUSED/i.test(diagnostic) ? 'connection_refused' : ''
+      if (kind && kind !== reported) {
+        reported = kind
+        console.warn(JSON.stringify({ event: 'codex_kernel_transport', vm_id: exec.vmId, category: kind, at: new Date().toISOString() }))
+      }
+    })
+    child.once('exit', (code, signal) => {
+      diagnostic = ''
+      if (starts.get(key) === child) starts.delete(key)
+      console.warn(JSON.stringify({ event: 'codex_kernel_exit', vm_id: exec.vmId, code, signal, at: new Date().toISOString() }))
+    })
+    child.unref()
+    starts.set(key, child)
+    // Wait for exec confirmation before stamping or accepting health. Failed
+    // spawn emits error rather than exit and must never crash the controller.
+    const spawned = await new Promise(resolve => {
+      child.once('spawn', () => resolve(true))
+      child.once('error', () => resolve(false))
+    })
+    if (!spawned) return { ok: false, reason: 'kernel_spawn_failed' }
+    writeLimitStamp(paths.configPath, wanted)
+    return waitForHealth(exec, timeoutMs, child)
+  } finally { owner.release() }
 }
 
-async function waitForHealth(exec, timeoutMs) {
+async function waitForHealth(exec, timeoutMs, child) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   let last = { ok: false, reason: 'not_ready' }
   while (Date.now() < deadline) {
+    if (child && childHasExited(child)) return { ok: false, reason: failedSpawns.has(child) ? 'kernel_spawn_failed' : 'kernel_exited_before_ready' }
     last = await codexKernelHealth(exec, { timeoutMs: 500 }).catch((error) => ({
       ok: false,
       reason: 'health_error',
@@ -272,22 +341,36 @@ async function waitForHealth(exec, timeoutMs) {
   return { ok: false, reason: 'health_timeout', health: last }
 }
 
-export function stopCodexKernel(vmId) {
-  const child = starts.get(vmId)
+export function stopCodexKernel(vmId, projectRoot) {
+  if (!projectRoot) return null
+  const child = starts.get(trackedKey(projectRoot, vmId))
   if (child) {
     try {
       child.kill('SIGTERM')
     } catch {}
-    starts.delete(vmId)
+    // Keep ownership until exit/error is observed, including spawn/exec time.
   }
   return child || null
 }
 
 /** A child this process spawned for the VM that has not exited (it may still be starting or hung). */
-export function codexKernelTracked(vmId) {
-  return !childHasExited(starts.get(vmId))
+export function codexKernelTracked(vmId, projectRoot) {
+  return !!projectRoot && !childHasExited(starts.get(trackedKey(projectRoot, vmId)))
+}
+
+/** Conservative diagnostic: absent socket/local child alone never means idle. */
+export function codexKernelMayBeRunning(vmId, projectRoot) {
+  try {
+    if (codexKernelTracked(vmId, projectRoot)) return true
+    if (codexKernelProcessRecords(projectRoot, vmId, codexKernelBinPath(), codexKernelOwnerBinPath()).length) return true
+    const owner = claimCodexKernelOwner(projectRoot, vmId)
+    owner.release()
+    return false
+  } catch { return true }
 }
 
 export function stopAllCodexKernels() {
-  for (const vmId of [...starts.keys()]) stopCodexKernel(vmId)
+  for (const child of starts.values()) {
+    try { child.kill('SIGTERM') } catch {}
+  }
 }

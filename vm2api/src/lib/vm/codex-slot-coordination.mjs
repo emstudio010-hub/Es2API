@@ -23,7 +23,7 @@ function identity(projectRoot, vmId) {
 // description until release; there is no holder daemon, PID lease or stale-lock
 // expiry. Never unlink these files (including during home/container cleanup).
 function acquire(root, vmId, resource, shared = false) {
-  if (!['control', 'kernel', 'cli'].includes(resource)) throw unavailable()
+  if (!['control', 'kernel', 'cli', 'kernel-bootstrap', 'kernel-owner'].includes(resource)) throw unavailable()
   const directory = path.join(root, '.codex-coordination')
   try { fs.mkdirSync(directory, { mode: 0o700 }) }
   catch (error) { if (error.code !== 'EEXIST') throw error }
@@ -46,7 +46,9 @@ function openLock(directory, vmId, resource, shared) {
     const current = fs.lstatSync(filename)
     if (current.isSymbolicLink() || current.dev !== info.dev || current.ino !== info.ino) throw unavailable()
     let released = false
-    return () => { if (!released) { released = true; fs.closeSync(descriptor) } }
+    const release = () => { if (!released) { released = true; fs.closeSync(descriptor) } }
+    release.descriptor = descriptor
+    return release
   } catch (error) { fs.closeSync(descriptor); throw error }
 }
 
@@ -80,6 +82,52 @@ export async function withCodexSlotActivity(projectRoot, vmId, resource, operati
   finally { admission() }
   try { return await operation() }
   finally { release() }
+}
+
+async function waitBootstrap(root, vmId) {
+  const until = Date.now() + 15000
+  while (true) {
+    try { return lock(root, vmId, 'kernel-bootstrap', false) }
+    catch (error) {
+      if (error.code !== 'codex_slot_coordination_busy' || Date.now() >= until) throw error
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+}
+
+// Admission excludes maintenance. Only lock acquisition yields: once admitted,
+// write token/installation/config synchronously. Blocking this event loop while
+// another bootstrap awaits health would prevent it from ever releasing.
+export async function withCodexKernelConfigWrite(projectRoot, vmId, operation) {
+  const { root, key } = identity(projectRoot, vmId)
+  const admission = controls.getStore()?.get(key)?.active ? () => {} : lock(root, vmId, 'control', true)
+  let release
+  try {
+    release = await waitBootstrap(root, vmId)
+    return operation()
+  } finally { release?.(); admission() }
+}
+
+// Caller already holds activity or exclusive control. Never take admission
+// here: a draining writer may own it while waiting for this reader to finish.
+export async function withCodexKernelBootstrap(projectRoot, vmId, operation) {
+  const { root } = identity(projectRoot, vmId)
+  const release = await waitBootstrap(root, vmId)
+  try { return await operation() }
+  finally { release() }
+}
+
+export function codexKernelOwnerLockPath(projectRoot, vmId) {
+  const { root } = identity(projectRoot, vmId)
+  return path.join(root, '.codex-coordination', `${vmId}.kernel-owner.lock`)
+}
+
+// Pass descriptor as child fd 3. Closing the Node copy after spawn transfers
+// the SAME flock to the native owner, including its pre-main/exec interval.
+export function claimCodexKernelOwner(projectRoot, vmId) {
+  const { root } = identity(projectRoot, vmId)
+  const release = lock(root, vmId, 'kernel-owner', false)
+  return { descriptor: release.descriptor, release }
 }
 
 // Caller owns control across beforeDrain, drain and the protected mutation.

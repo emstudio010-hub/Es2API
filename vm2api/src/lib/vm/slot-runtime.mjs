@@ -169,7 +169,7 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
     // slot's local egress is the node's own route, reached through the
     // control-plane forwarder; an empty URL would leave from here instead.
     const proxyUrl = localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm)
-    write(projectRoot, vm, {
+    await write(projectRoot, vm, {
       proxyUrl,
       proxyRequired: !localExit || !!proxyUrl,
       routing,

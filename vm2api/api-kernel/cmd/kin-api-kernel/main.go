@@ -12,11 +12,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dofastted/kin-gateway/api-kernel/internal/codexowner"
 	"github.com/dofastted/kin-gateway/api-kernel/internal/pool"
 	"github.com/dofastted/kin-gateway/api-kernel/internal/server"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "codex-owner" {
+		os.Exit(codexowner.Run(os.Args[2:]))
+	}
 	socket := flag.String("socket", "", "unix socket path")
 	token := flag.String("token", "", "internal token")
 	flag.Parse()

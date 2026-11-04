@@ -18,7 +18,7 @@ import { codexCliHealth } from '../transport/codex-cli-client.mjs'
 import { isCodexCliVm } from './codex-cli-config.mjs'
 import { clearStoppedCodexCliRequests, holdCodexCliMaintenance } from '../transport/codex-cli-state.mjs'
 import { withCodexSlotControl } from './codex-slot-coordination.mjs'
-import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
+import { codexKernelMayBeRunning } from '../transport/codex-kernel-supervisor.mjs'
 import {
   egressListening,
   ensureProxyEgress,
@@ -131,7 +131,7 @@ const DEFAULT_PROBES = Object.freeze({
     const info = await inspectContainerOrNull(slotHost(vm).dockerApi(), slotEgressNames(vm.id).egress)
     return { exists: !!info, running: info?.State?.Running === true, status: info?.State?.Status || null }
   },
-  codexTracked: (vmId) => codexKernelTracked(vmId),
+  codexTracked: (vmId, projectRoot) => codexKernelMayBeRunning(vmId, projectRoot),
   cluster,
 })
 
@@ -250,10 +250,10 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
     const health = await probes.codexHealth(exec)
     const pub = toPublicKernelHealth(health, 'codex')
     if (pub.reachable) return check('kernel', label, 'ok', null, 'Codex 内核在线')
-    // Idle needs evidence: nothing listens on the socket and this Node holds no live child.
-    // Codex kernels start per request, and a Node restart leaves none behind.
+    // Idle requires no socket, exact owned process, local child or inherited
+    // lifecycle lock. A detached owner can survive the controller's restart.
     const nothingListening = Number(health?.status) === 0 && CODEX_NOT_LISTENING.has(health?.code)
-    if (nothingListening && !probes.codexTracked(vm.id)) {
+    if (nothingListening && !probes.codexTracked(vm.id, projectRoot)) {
       return check('kernel', label, 'warn', 'codex_kernel_idle', 'Codex 内核当前未运行，下一次请求会自动拉起')
     }
     // A timeout, an HTTP error, or a tracked child that does not answer is a fault, not idle.
