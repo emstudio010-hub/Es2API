@@ -58,6 +58,7 @@ import {
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
 import { isCodexChatInputError } from './codex-chat-input.mjs'
 import { isApiPolicyInputError } from '../pool/api-policy-tools.mjs'
+import { writeDownstream } from '../transport/stream-flow.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
@@ -1122,63 +1123,73 @@ export function createHandleProtocol(deps) {
             writeSSEHeaders,
           },
         })
+        // The api backend forwards the converted body untouched: its session is the outbound one.
+        logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
+        logBag.account_id = result?.accountId || null
+        logBag.final_account_id = result?.accountId || null
+        logBag.upstream_status = result?.status ?? null
+        logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, { cacheTtl })
+        logBag.upstream_model = result?.model || null
+        // API transport still stamps the first data: line; subtract t0 for queue wait only.
+        logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
+          ? Math.max(0, result.firstTokenAt - logCtx.t0)
+          : (result?.ttftMs ?? null)
+        logBag.final_state = result?.terminalState || null
+        logBag.inference_completed = result?.ok === true && result?.terminalState === 'verified'
+        attachPricing(logBag, {
+          managedKey,
+          rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+          bill: !!(result?.ok && managedKey),
+        })
+        if (clientStream) {
+          if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
+          if (!res.headersSent) {
+            const mapped = mapProtocolClientError(result, logBag, 'api_pool_exhausted')
+            if (!isClientCancelledResult(result)) stats.errors++
+            return sendMapped(res, mapped)
+          }
+          if (!result?.ok) {
+            stats.errors++
+            logBag.error_code = result?.body?.error?.code || 'api_upstream_incomplete'
+            if (result?.downstreamFailure) { res.destroy(); return }
+            if (!result.clientStreamTerminated) {
+              const error = result?.body?.error || { type: 'api_error', code: 'api_upstream_incomplete', message: 'API stream did not complete' }
+              const chunk = protocol === 'openai.chat' || protocol === 'openai.completions'
+                ? `data: ${JSON.stringify({ error })}\n\ndata: [DONE]\n\n`
+                : `\nevent: error\ndata: ${JSON.stringify({ type: 'error', error })}\n\n`
+              try { await writeDownstream(res, chunk, { signal: clientAbort.signal }) }
+              catch { res.destroy(); return }
+            }
+          }
+          if (result?.ok && protocol !== 'anthropic.messages' && !result.clientStreamTerminated) {
+            try { await writeDownstream(res, 'data: [DONE]\n\n', { signal: clientAbort.signal }) }
+            catch { logBag.inference_completed = false; res.destroy(); return }
+          }
+          return res.end()
+        }
+        if (!result?.ok || isIncompleteAssistantMessage(result)) {
+          if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
+          const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
+          const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
+          stats.errors++
+          return sendMapped(res, mapped)
+        }
+        let output
+        // OpenAI upstream already shaped this exact client protocol. Converting
+        // it as an Anthropic message again loses tools, text, refusal and usage.
+        if (result.clientBodyProtocol === protocol) return json(res, 200, hidePersonaUsageOnMessage(result.body, personaHideTokens))
+        const clientBody = hidePersonaUsageOnMessage(result.body, personaHideTokens)
+        if (protocol === 'anthropic.messages') output = clientBody
+        else if (protocol === 'openai.chat') output = fromClaudeToOpenAIChat(clientBody, inbound.model)
+        else if (protocol === 'openai.completions') output = fromClaudeToOpenAICompletions(clientBody, inbound.model)
+        else output = fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode)
+        return json(res, 200, output)
       } finally {
         clientAbort.settle()
         if (managedKey) {
-          try {
-            apiKeyStore.release(managedKey)
-          } catch {}
+          try { apiKeyStore.release(managedKey) } catch {}
         }
       }
-      // The api backend forwards the converted body untouched: its session is the outbound one.
-      logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
-      logBag.account_id = result?.accountId || null
-      logBag.final_account_id = result?.accountId || null
-      logBag.upstream_status = result?.status ?? null
-      logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, { cacheTtl })
-      logBag.upstream_model = result?.model || null
-      // API transport still stamps the first data: line; subtract t0 for queue wait only.
-      logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
-        ? Math.max(0, result.firstTokenAt - logCtx.t0)
-        : (result?.ttftMs ?? null)
-      logBag.final_state = result?.terminalState || null
-      logBag.inference_completed = result?.ok === true && result?.terminalState === 'verified'
-      attachPricing(logBag, {
-        managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
-        bill: !!(result?.ok && managedKey),
-      })
-      if (clientStream) {
-        if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
-        if (!res.headersSent) {
-          const mapped = mapProtocolClientError(result, logBag, 'api_pool_exhausted')
-          if (!isClientCancelledResult(result)) stats.errors++
-          return sendMapped(res, mapped)
-        }
-        if (!result?.ok) {
-          stats.errors++
-          logBag.error_code = result?.body?.error?.code || 'api_upstream_incomplete'
-        }
-        if (result?.ok && protocol !== 'anthropic.messages' && !result.clientStreamTerminated) res.write('data: [DONE]\n\n')
-        return res.end()
-      }
-      if (!result?.ok || isIncompleteAssistantMessage(result)) {
-        if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
-        const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
-        const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
-        stats.errors++
-        return sendMapped(res, mapped)
-      }
-      let output
-      // OpenAI upstream already shaped this exact client protocol. Converting
-      // it as an Anthropic message again loses tools, text, refusal and usage.
-      if (result.clientBodyProtocol === protocol) return json(res, 200, hidePersonaUsageOnMessage(result.body, personaHideTokens))
-      const clientBody = hidePersonaUsageOnMessage(result.body, personaHideTokens)
-      if (protocol === 'anthropic.messages') output = clientBody
-      else if (protocol === 'openai.chat') output = fromClaudeToOpenAIChat(clientBody, inbound.model)
-      else if (protocol === 'openai.completions') output = fromClaudeToOpenAICompletions(clientBody, inbound.model)
-      else output = fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode)
-      return json(res, 200, output)
     }
 
     const canonicalBody = officialMessagesBody(ctx.body)

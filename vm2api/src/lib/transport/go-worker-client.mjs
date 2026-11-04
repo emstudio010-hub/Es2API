@@ -33,6 +33,7 @@ import {
   isWrapConnectionError,
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
+import { createSseBuffer, readSseLines, STREAM_PENDING_BYTES, STREAM_LINE_BYTES, isStreamFlowError } from './stream-flow.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -739,6 +740,7 @@ export async function streamGoWorker({
   // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
   const startedAt = Date.now()
   let ttftMs = null
+  let observedUsage = null
   const requestId = randomUUID()
   const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
@@ -783,7 +785,6 @@ export async function streamGoWorker({
         threadBetas: prepared.thread,
       })
     }
-    let buffer = ''
     let lastError = null
     let dataBuf = ''
     let sseUsage = null
@@ -791,7 +792,7 @@ export async function streamGoWorker({
     let sseStop = null
     let sseRateHeaders = {}
     const assembler = createClaudeMessageAssembler()
-    const pendingLines = []
+    const pendingLines = createSseBuffer({ maxBytes: STREAM_PENDING_BYTES, maxLines: 8192 })
     const takeSseEvent = () => {
       try {
         const event = JSON.parse(dataBuf)
@@ -806,9 +807,9 @@ export async function streamGoWorker({
       committed = true
       if (typeof onCommit === 'function') onCommit()
       if (onEvent) {
-        for (const queued of pendingLines) await onEvent(queued)
+        for (const queued of pendingLines.take()) await onEvent(queued)
       }
-      pendingLines.length = 0
+      else pendingLines.take()
     }
     const emitLine = async (line) => {
       if (!committed) {
@@ -827,7 +828,7 @@ export async function streamGoWorker({
       if (event.type === 'message_stop') sawMessageStop = true
       if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
-      if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
+      if (evUsage) { sseUsage = mergeUsage(sseUsage, evUsage); observedUsage = sseUsage }
       if (event.message?.model) sseModel = event.message.model
       const stop = event.message?.stop_reason || event.delta?.stop_reason
       if (stop) sseStop = stop
@@ -856,12 +857,7 @@ export async function streamGoWorker({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
-      for await (const chunk of response) {
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
-        let newline
-        while ((newline = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newline).replace(/\r$/, '')
-          buffer = buffer.slice(newline + 1)
+      await readSseLines(response, async line => {
           // CLI diagnostics share the internal stream, never the caller's SSE.
           if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
           if (outboundHeadersFrame) {
@@ -882,7 +878,7 @@ export async function streamGoWorker({
               }
             }
             if (line === '') outboundHeadersFrame = false
-            continue
+            return
           }
           if (line) {
             sawChunk = true
@@ -892,6 +888,7 @@ export async function streamGoWorker({
           if (line.startsWith('data:')) {
             const piece = line.slice(5).trim()
             if (piece && piece !== '[DONE]') {
+              if (Buffer.byteLength(dataBuf) + Buffer.byteLength(piece) + 1 > STREAM_LINE_BYTES) throw Object.assign(new Error('stream_line_limit'), { code: 'stream_line_limit' })
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               const event = observeSseEvent(takeSseEvent())
               if (isDownstreamCommitEvent(event)) await flushCommit()
@@ -904,18 +901,13 @@ export async function streamGoWorker({
               if (isDownstreamCommitEvent(event)) await flushCommit()
             }
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
+            if (Buffer.byteLength(dataBuf) + Buffer.byteLength(line) + 1 > STREAM_LINE_BYTES) throw Object.assign(new Error('stream_line_limit'), { code: 'stream_line_limit' })
             dataBuf = `${dataBuf}\n${line}`
             const event = observeSseEvent(takeSseEvent())
             if (isDownstreamCommitEvent(event)) await flushCommit()
           }
           await emitLine(line)
-        }
-        if (sawChunk && !outboundHeadersFrame && buffer) lastChunkAt = Date.now()
-      }
-      if (buffer && !outboundHeadersFrame) {
-        applyClaudeSSELineToMessage(buffer, assembler)
-        await emitLine(buffer)
-      }
+      }, { signal, onChunk: () => { if (sawChunk && !outboundHeadersFrame) lastChunkAt = Date.now() } })
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
         if (isDownstreamCommitEvent(event)) await flushCommit()
@@ -958,11 +950,12 @@ export async function streamGoWorker({
         ttftMs,
         firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
         committed,
+        usage: observedUsage,
       })
     }
     return {
       ok: false,
-      status: 0,
+      status: isStreamFlowError(error) ? error.status || 502 : 0,
       via: 'go-worker-stream',
       body: {
         type: 'error',
@@ -976,8 +969,9 @@ export async function streamGoWorker({
       ttftMs,
       firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
       committed,
+      usage: observedUsage,
       terminalState: committed ? 'incomplete' : 'transport_error',
-      transportError: true,
+      transportError: !isStreamFlowError(error),
     }
   } finally {
     stopCancel()

@@ -150,6 +150,22 @@ function strict、parallel_tool_calls、service_tier和可表达的结构化输�
 
 依据 [官方Chat输入/非流式输出](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) 与 [官方Chat流schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events) 核对。流式custom仍明确拒绝，不新造delta字段。API完成日志依赖实际完整终止状态；已知length/content_filter截断可交付Chat，但不算完整推理。保活、EOF、[DONE]或正文中出现response.completed字样均不能单独证明完成。没有行为或真实账号验收。
 
+## 输出背压与缓冲边界（preview.17）
+
+- Codex Kernel/CLI及API流式输出等待HTTP背压解除；取消、close、error结束等待，单次写入等待最多30秒。Codex下游失败关闭连接并阻止成功、重试或账号冷却；实际执行退出仍由原监督器/回执决定。
+- 共用有界UTF8行读取器：每跳64MiB、单行8MiB、262144行；预输出元数据最多1MiB/8192行，含空行/注释。非流式Codex与API Responses暂存也有字节/行上限，超过后明确失败，不截断冒充完整响应。CLI原有4MiB总输出上限保留。
+- Kernel连续解码跨块UTF8，末尾未换行片段进入相同解析/观察流程；读取失败/取消保留已经观察的usage，流量限制不触发内部重试或切换。
+- API读取/写入异常返回明确未完成状态并清理未读上游；保留已知usage。Anthropic流要求真实message_stop且无error，避免正文包含终止字样或realtime EOF被当成功。已提交响应按协议补错误终止，不重复补已有终止。
+- API客户端取消监听和密钥并发占用延长到协议收尾finally，收尾写入同样响应取消；不把本地drain当远端接收、供应商完成或执行排空。
+
+共同阈值在transport/stream-flow.mjs；writeDownstream只保留当前一次写入，不建立额外无界输出队列，等待时移除完成/断开/错误/取消监听与计时器。CLI仍由既有4MiB读取上限限制其JSONL交付队列，未在本版改为CLI管道暂停。Kernel及API使用顺序await将HTTP背压传到上游读取。
+
+64MiB是包含SSE帧/重复终态的累计线量，不是最终正文大小；8MiB限制单行/组装中的事件片段，预正文元数据1MiB/8192行防止只有注释和生命周期帧持续堆积。UTF8连续解码不会按网络块直接toString造成字符切断。非流式响应也有限制；超过阈值返回明确失败，无自动重试/账号切换，不生成成功终态。
+
+API上游读取失败保留已知用量并销毁未读流，协议层在仍可写且未发送终止时补错误帧；慢客户端等待30秒超时后关闭连接。API错误没有已知usage时不编造；记录用量不等于计费策略已重写。原生Anthropic明确message_stop且无error才能标成功。
+
+这些是实现边界，未做行为或真实端点验收；本地drain不能证明远端收到、内核执行退出或账号隔离。WS保活/发送背压、跨进程维护和真实取消恢复仍缺验收。
+
 ## 验收边界
 
 本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。

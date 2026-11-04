@@ -80,6 +80,7 @@ import { clientIp } from '../pool/sticky-router.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
 import { codexBodyToChatCompletion, isCodexChatResponseError } from './codex-chat-response.mjs'
 import { finishChatSse, isCodexChatStreamError } from './codex-chat-stream.mjs'
+import { createSseBuffer, writeDownstream, isStreamFlowError } from '../transport/stream-flow.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -179,6 +180,7 @@ export function isRetryableSameCodexAccount(
   { headersSent = false, conversionError = null, signal = null } = {},
 ) {
   if (!result || result.ok === true || result.committed === true || headersSent || conversionError) return false
+  if (isStreamFlowError(result?.body?.error)) return false
   if (signal?.aborted) return false
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
@@ -326,6 +328,7 @@ function logCodexUsage(logBag, usage, serviceTier) {
 export function isRetryableCodexTransport(result) {
   if (!result || result.ok === true) return false
   if (result.committed === true) return false
+  if (isStreamFlowError(result?.body?.error)) return false
   const code = String(result.body?.error?.code || result.error_code || '')
   const msg = String(result.body?.error?.message || result.error || '')
   const status = Number(result.status) || 0
@@ -343,6 +346,7 @@ export function isRetryableCodexTransport(result) {
  */
 export function codexFailureHold(result, now = Date.now()) {
   if (!result || result.ok === true || result.committed === true) return null
+  if (isStreamFlowError(result?.body?.error)) return null
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
   const message = String(result.body?.error?.message || result.error || '')
@@ -688,6 +692,16 @@ export async function handleCodexProtocol({
   let switches = 0
   let counted = false
   let downstreamKeepalive = null
+  let downstreamFailure = null
+  const writeClient = async chunk => {
+    try { await writeDownstream(res, chunk, { signal: gone.signal }) }
+    catch (error) {
+      if (isStreamFlowError(error)) downstreamFailure ||= error
+      downstreamKeepalive?.stop()
+      res.destroy()
+      throw error
+    }
+  }
   let failureSent = false
   const sendStreamFailure = (status, body) => {
     downstreamKeepalive?.stop()
@@ -858,7 +872,7 @@ export async function handleCodexProtocol({
         hops += 1
         logBag.vm_id = vm.id
         logBag.attempt_count = hops
-        const chunks = []
+        const chunks = createSseBuffer()
         const nameSseEvent = createResponsesSseEventNamer()
         let responseServiceTier = null
         let responseTerminal = null
@@ -935,7 +949,7 @@ export async function handleCodexProtocol({
               if (seen) streamedUsage = preferUsage(streamedUsage, seen)
               const imageGen = imageGenUsageFromSseLine(line)
               if (imageGen) streamedImageUsage = imageGen
-              if (conversionError) return
+              if (conversionError || downstreamFailure) return
               if (!stream) {
                 chunks.push(line)
                 return
@@ -948,12 +962,12 @@ export async function handleCodexProtocol({
                     protocol === 'anthropic.messages'
                       ? responsesSseToAnthropicEvents(line, anthropicSse)
                       : responsesSseToChatChunk(line, 'codex', chatSse)
-                  if (mapped) res.write(mapped)
+                  if (mapped) await writeClient(mapped)
                 } catch (error) {
                   if (error.code !== 'tool_arguments_mismatch' && !isCodexChatStreamError(error)) throw error
                   conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
                   downstreamKeepalive?.stop()
-                  res.write(
+                  await writeClient(
                     protocol === 'anthropic.messages'
                       ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
                       : `data: ${JSON.stringify({ error: conversionError, ...(error.usage ? { usage: error.usage } : {}) })}\n\ndata: [DONE]\n\n`,
@@ -962,7 +976,7 @@ export async function handleCodexProtocol({
                 return
               }
               const named = nameSseEvent(line)
-              if (named) res.write(named)
+              if (named) await writeClient(named)
             },
           })
         let result = await runHop()
@@ -1002,7 +1016,7 @@ export async function handleCodexProtocol({
             downstreamKeepalive?.stop()
             if (!gone.signal.aborted && !res.destroyed && !res.writableEnded) {
               if (!res.headersSent) writeSSEHeaders(res)
-              res.write(`data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`)
+              await writeClient(`data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`)
             }
           }
         }
@@ -1011,6 +1025,10 @@ export async function handleCodexProtocol({
           result.status = 502
           result.terminalState = 'incomplete'
           result.body = { error: conversionError }
+        }
+        if (downstreamFailure) {
+          result = { ...result, ok: false, status: downstreamFailure.status || 502, terminalState: 'incomplete',
+            body: { error: { type: 'api_error', code: downstreamFailure.code, message: 'Downstream delivery did not complete' } } }
         }
         ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
         if (result?.transport_retried) logBag.transport_retried = true
@@ -1023,18 +1041,18 @@ export async function handleCodexProtocol({
         const usage = preferUsage(hopUsage, streamedUsage)
         // Responses SSE is not a Claude assistant message, so the stream client
         // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
-        const delivered = !conversionError && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
+        const delivered = !conversionError && !downstreamFailure && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
         // Billing's delivered fallback also accepts partial token usage. The
         // automatic quality monitor requires an actual completed inference.
         const responseBody = result?.body?.response || result?.body
         const completedBody = responseBody?.status === 'completed' && !responseBody.error
         const failedBody = !!result?.body?.error || !!responseBody?.error || ['failed', 'incomplete', 'cancelled'].includes(responseBody?.status)
-        logBag.inference_completed = !conversionError && (!stream || !chatSse || chatSse.complete === true) && responseTerminal !== 'failed' && !failedBody &&
+        logBag.inference_completed = !conversionError && !downstreamFailure && !isStreamFlowError(result?.body?.error) && (!stream || !chatSse || chatSse.complete === true) && responseTerminal !== 'failed' && !failedBody &&
           (responseTerminal === 'completed' || completedBody ||
             (responseTerminal === null && result?.ok === true && result.terminalState === 'verified'))
-        // CLI may report real usage before a final delivery/transport failure.
+        // A hop may report real usage before a final delivery/transport failure.
         // Keep it observable without classifying the inference as completed.
-        if (cli && !delivered) {
+        if (!delivered) {
           if (usage) logCodexUsage(logBag, usage, null)
           logBag.final_state = result?.terminalState || 'failed'
           logBag.upstream_model = converted.body.model
@@ -1050,7 +1068,7 @@ export async function handleCodexProtocol({
           let body
           if (!stream) {
             try {
-              const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
+              const assembled = assembleCodexBodyFromSse(chunks.take(), result.body || {})
               if (responseTerminal !== 'failed' && !assembled.error && assembled.status === 'completed') logBag.inference_completed = true
               body =
                 protocol === 'anthropic.messages'
@@ -1093,7 +1111,7 @@ export async function handleCodexProtocol({
           if (!res.writableEnded && !res.destroyed) return res.end()
           return
         }
-        if (!cli && isCodexFailoverError(result)) {
+        if (!cli && !isStreamFlowError(result?.body?.error) && isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
           leaveSticky()
           switches += 1
