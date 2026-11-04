@@ -18,6 +18,7 @@ import { codexCliJobs as active, codexCliInMaintenance } from './codex-cli-state
 import { codexCliInstructionConfig } from './codex-cli-request-config.mjs'
 import { readCodexCliExitReceipt, waitCodexCliExitReceipt } from './codex-cli-receipt.mjs'
 import { claimCodexCliRequest, hasCodexCliClaim } from './codex-cli-claim.mjs'
+import { withCodexSlotActivity } from '../vm/codex-slot-coordination.mjs'
 
 const runFile = promisify(execFile)
 const TIMEOUT_MS = 300000
@@ -229,7 +230,14 @@ export function cancelCodexCli(vmId) {
   return !!job
 }
 
-export async function streamCodexCli({ exec, signal, body, rawBody, onEvent } = {}) {
+export async function streamCodexCli(options = {}) {
+  const { exec } = options
+  if (!supported(exec)) return errorResult(503, 'codex_cli_requires_local_dedicated_docker', 'Codex CLI 需要本机 Docker 与固定非直连出口')
+  try { return await withCodexSlotActivity(projectOf(exec), exec.vm.id, 'cli', () => streamCodexCliActive(options)) }
+  catch { return errorResult(503, 'codex_cli_coordination_unavailable', 'CLI 实例正在维护或共享锁不可用，请稍后重试') }
+}
+
+async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {}) {
   const started = Date.now()
   const deadline = started + TIMEOUT_MS
   let request

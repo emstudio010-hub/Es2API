@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { withVmLock, isValidVmId } from '../vm/vm-file.mjs'
+import { isValidVmId } from '../vm/vm-file.mjs'
+import { withCodexSlotControl } from '../vm/codex-slot-coordination.mjs'
 
 export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown = false } = {}) {
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
@@ -19,7 +20,7 @@ export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShu
 // is stopped and confirmed before a handoff snapshot is read under this lock.
 export function withCodexCredentialLock(projectRoot, vmId, operation, { allowHandoff = false, allowShutdown = false } = {}) {
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
-  return withVmLock(`codex-credentials:${path.resolve(projectRoot)}:${vmId}`, () => {
+  return withCodexSlotControl(projectRoot, vmId, () => {
     if (!allowHandoff) assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown })
     return operation()
   })

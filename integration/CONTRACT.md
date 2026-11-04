@@ -162,3 +162,8 @@ gateway_bindings 仅保存 Key/分组/会话/响应 ID 的哈希、账号/槽 ID
 Responses JSON/SSE 只观察 response ID 进行归属登记，不更改回传正文。WebSocket 改用 ws 逐帧 JSON 桥接，在第一个 response.create 时选槽，一连接持一租约；后续 response.create 与 response.cancel 检查归属，禁止二进制和未知控制消息。上游握手/首帧等待 15 秒，空闲 15 分钟关闭；单帧 10MB、发送积压 8MB 上限，错误不自动重发推理。
 
 旧请求产生的响应 ID 没有新隔离索引，升级后无法用这些 ID 继续；请发完整会话上下文并开始新会话。VM2 独立入口继续遵循其原生 Key/槽权限；以上新增调用者命名空间只覆盖 Sub2API 发布入口，完整管理员/master Key 仍有原本的跨槽管理能力。
+
+
+## 同机控制进程协调（preview.19）
+
+凭据、运行控制与完整恢复使用同一Linux flock控制作用域；Kernel/CLI宿主请求持共享活动锁，停止确认等待跨进程finalizer排空。争用失败保留原状态，不按PID/TTL清除claim或重放调用。所有控制进程需同时升级，锁文件不得删除。详见 [实例协调](../docs/SLOT_COORDINATION.md)。仅静态核对，未进行多进程、崩溃或真实账号行为验收。

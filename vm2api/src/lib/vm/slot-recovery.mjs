@@ -17,6 +17,7 @@ import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { codexCliHealth } from '../transport/codex-cli-client.mjs'
 import { isCodexCliVm } from './codex-cli-config.mjs'
 import { clearStoppedCodexCliRequests, holdCodexCliMaintenance } from '../transport/codex-cli-state.mjs'
+import { withCodexSlotControl } from './codex-slot-coordination.mjs'
 import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
 import {
   egressListening,
@@ -477,7 +478,15 @@ const recovering = new Set()
  * an unconfirmed shutdown must not be picked up by automatic recovery.
  * Afterwards the watchdog budget is reset and the slot re-diagnosed.
  */
-export async function recoverSlot({
+export async function recoverSlot(args) {
+  const vm = getVm(args.projectRoot, args.id)
+  if (!vm || !isCodexVm(vm)) return recoverSlotActive(args)
+  try { return await withCodexSlotControl(args.projectRoot, args.id, () => recoverSlotActive(args)) }
+  catch (error) { return { ok: false, status: error.status || 409,
+    code: error.code || 'codex_slot_coordination_unavailable', error: '实例正在维护或共享锁不可用，请稍后重试' } }
+}
+
+async function recoverSlotActive({
   projectRoot,
   id,
   proxyPool,

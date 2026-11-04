@@ -6,6 +6,7 @@ import { withCodexCredentialLock } from '../oauth/codex-credential-lock.mjs'
 import { stopConfiguredCodexKernel } from '../oauth/codex-kernel-credential-owner.mjs'
 import { withCodexKernelPause } from '../transport/codex-kernel-activity.mjs'
 import { codexCliJobs } from '../transport/codex-cli-state.mjs'
+import { withCodexSlotControl, withCodexSlotDrain } from './codex-slot-coordination.mjs'
 
 // Keep intent on disk until explicit start or record deletion. Node restarts,
 // stale request snapshots and quota recovery must not resurrect the process.
@@ -35,14 +36,16 @@ export async function shutdownCodexSlot(vm, projectRoot, action, halt, { credent
       const deadline = Date.now() + 5000
       while (codexCliJobs.has(vm.id) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50))
       if (codexCliJobs.has(vm.id)) throw Object.assign(new Error('CLI 请求尚未释放，已保留目录和出口'), { code: 'codex_cli_busy' })
-      record = JSON.parse(fs.readFileSync(file, 'utf8'))
-      if (record.codex_shutdown?.id !== intent.id || record.codex_shutdown.action !== action) {
-        throw Object.assign(new Error('实例停机上下文已变化'), { code: 'codex_shutdown_changed' })
-      }
-      atomicWriteJson(file, { ...record, codex_shutdown: { ...intent, confirmed: true },
-        status: action === 'delete' ? 'deleting' : 'stopped', schedulable: false,
-        ...(vm.runtime ? { runtime: vm.runtime } : {}), updated_at: new Date().toISOString() }, { mode: 0o600 })
-      return result
+      return withCodexSlotDrain(projectRoot, vm.id, 'cli', async () => {
+        record = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (record.codex_shutdown?.id !== intent.id || record.codex_shutdown.action !== action) {
+          throw Object.assign(new Error('实例停机上下文已变化'), { code: 'codex_shutdown_changed' })
+        }
+        atomicWriteJson(file, { ...record, codex_shutdown: { ...intent, confirmed: true },
+          status: action === 'delete' ? 'deleting' : 'stopped', schedulable: false,
+          ...(vm.runtime ? { runtime: vm.runtime } : {}), updated_at: new Date().toISOString() }, { mode: 0o600 })
+        return result
+      })
     }, { beforeDrain: async () => {
       await stopConfiguredCodexKernel(projectRoot, vm.id)
       result = await halt()
@@ -51,7 +54,8 @@ export async function shutdownCodexSlot(vm, projectRoot, action, halt, { credent
   }
   try {
     if (!projectRoot) throw Object.assign(new Error('缺少执行槽根目录，无法确认停机'), { code: 'codex_project_root_required' })
-    return await (credentialLockHeld ? operation() : withCodexCredentialLock(projectRoot, vm.id, operation, { allowHandoff: true, allowShutdown: true }))
+    return await withCodexSlotControl(projectRoot, vm.id, () => credentialLockHeld ? operation()
+      : withCodexCredentialLock(projectRoot, vm.id, operation, { allowHandoff: true, allowShutdown: true }))
   } catch (error) {
     return { ok: false, code: error.code || 'codex_shutdown_unconfirmed', error: '实例退出尚未确认，账号记录、凭据和固定出口已保留；请重试原操作' }
   }

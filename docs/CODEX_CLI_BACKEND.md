@@ -188,3 +188,8 @@ ping/pong是WS控制帧，nonce匹配才证明链路回应，不用于模型完�
 本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。
 
 参考：[官方非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[官方 CLI 命令](https://learn.chatgpt.com/docs/developer-commands?surface=cli)、[官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。本实现核对固定0.155.1源码提交 `be2951ea34f0d295ed0becf97079f92fa5f6950e` 的exec CLI、配置loader及developer指令合并逻辑；当前官方文档不能代替该固定版本的实际调用验收。
+
+
+## 同机控制进程协调（preview.19）
+
+凭据、运行控制与完整恢复使用同一Linux flock控制作用域；Kernel/CLI宿主请求持共享活动锁，停止确认等待跨进程finalizer排空。争用失败保留原状态，不按PID/TTL清除claim或重放调用。所有控制进程需同时升级，锁文件不得删除。详见 [实例协调](SLOT_COORDINATION.md)。仅静态核对，未进行多进程、崩溃或真实账号行为验收。

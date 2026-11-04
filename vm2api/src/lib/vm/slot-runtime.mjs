@@ -29,6 +29,7 @@ import { isCodexCliVm } from './codex-cli-config.mjs'
 import { ensureCodexCli, cancelCodexCli } from '../transport/codex-cli-client.mjs'
 import { codexCliInMaintenance } from '../transport/codex-cli-state.mjs'
 import { shutdownCodexSlot } from './codex-shutdown.mjs'
+import { withCodexSlotControl, withCodexSlotDrain } from './codex-slot-coordination.mjs'
 
 export { runtimeKind }
 
@@ -36,11 +37,27 @@ function unsupportedOnHost(action) {
   return { ok: false, code: 'remote_unsupported', error: `集群节点上的槽位不支持：${action}` }
 }
 
+function controlSlot(vm, projectRoot, operation) {
+  if (!isCodexVm(vm)) return operation()
+  return withCodexSlotControl(projectRoot, vm.id, operation).catch(error => ({ ok: false,
+    code: error.code || 'codex_slot_coordination_unavailable', error: '实例正在维护或共享锁不可用，请稍后重试' }))
+}
+
+function idleSlot(vm, projectRoot, operation) {
+  if (!isCodexVm(vm)) return operation()
+  return withCodexSlotDrain(projectRoot, vm.id, 'kernel', () =>
+    withCodexSlotDrain(projectRoot, vm.id, 'cli', operation))
+}
+
 export function startSlot(vm, projectRoot, opts = {}) {
+  return controlSlot(vm, projectRoot, () => startSlotActive(vm, projectRoot, opts))
+}
+
+function startSlotActive(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.codex_shutdown || vm.codex_shutdown)) return { ok: false, code: 'codex_shutdown_pending', error: '停机或删除流程尚未解除，请从账号池显式启动' }
   if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.credential_handoff || vm.credential_handoff)) return { ok: false, code: 'codex_credential_handoff_pending', error: '凭据正在交接，请完成重建后启动' }
   if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id) && !opts.cliRecovery) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中' }
-  return slotHost(vm).start(vm, projectRoot, opts)
+  return idleSlot(vm, projectRoot, () => slotHost(vm).start(vm, projectRoot, opts))
 }
 
 /**
@@ -53,6 +70,10 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
+  return controlSlot(vm, projectRoot, () => startSlotReadyActive(vm, projectRoot, opts))
+}
+
+async function startSlotReadyActive(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.codex_shutdown || vm.codex_shutdown)) return { ok: false, code: 'codex_shutdown_pending', error: '停机或删除流程尚未解除，请从账号池显式启动' }
   if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.credential_handoff || vm.credential_handoff)) return { ok: false, code: 'codex_credential_handoff_pending', error: '凭据正在交接，请完成重建后启动' }
   if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id) && !opts.cliRecovery) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中，暂不接受其他开机操作' }
@@ -88,12 +109,20 @@ export async function destroySlot(vm, projectRoot = placementProjectRoot(), opts
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
 export async function reloadSlot(vm, projectRoot, opts = {}) {
+  return controlSlot(vm, projectRoot, () => reloadSlotActive(vm, projectRoot, opts))
+}
+
+async function reloadSlotActive(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm) && (getVm(projectRoot, vm.id)?.codex_shutdown || vm.codex_shutdown)) return { ok: false, code: 'codex_shutdown_pending', error: '实例正处于停机或删除流程' }
   if (isCodexCliVm(vm) && codexCliInMaintenance(vm.id)) return { ok: false, code: 'codex_cli_maintenance', error: 'CLI 实例正在恢复中' }
-  return slotHost(vm).reload(vm, projectRoot, opts)
+  return idleSlot(vm, projectRoot, () => slotHost(vm).reload(vm, projectRoot, opts))
 }
 
 export async function reloadSlotReady(vm, projectRoot, opts = {}) {
+  return controlSlot(vm, projectRoot, () => reloadSlotReadyActive(vm, projectRoot, opts))
+}
+
+async function reloadSlotReadyActive(vm, projectRoot, opts = {}) {
   const boot = await reloadSlot(vm, projectRoot, opts)
   if (!boot?.ok) return boot
   persistVmRuntime(projectRoot, vm.id, boot.runtime)

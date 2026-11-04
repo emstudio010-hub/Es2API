@@ -1,5 +1,6 @@
 import path from 'node:path'
 import { isValidVmId } from '../vm/vm-file.mjs'
+import { withCodexSlotActivity, withCodexSlotDrain } from '../vm/codex-slot-coordination.mjs'
 
 // Shared by the host transport and credential writer. Readers remain concurrent;
 // a pending writer blocks new readers and drains the existing socket requests.
@@ -36,7 +37,7 @@ export async function withCodexKernelActivity(projectRoot, vmId, operation) {
   if (state.paused) throw busy()
   const lease = Object.freeze({})
   state.readers.add(lease)
-  try { return await operation(lease) }
+  try { return await withCodexSlotActivity(projectRoot, vmId, 'kernel', () => operation(lease)) }
   finally {
     state.readers.delete(lease)
     if (!state.readers.size) state.drained?.()
@@ -49,15 +50,16 @@ export async function withCodexKernelPause(projectRoot, vmId, operation, { timeo
   state.paused = true
   let timer
   try {
-    // Explicit stop/delete may cancel the owned processes after blocking new
-    // readers. Token refresh leaves this unset and never interrupts readers.
-    if (beforeDrain) await beforeDrain()
-    if (state.readers.size) await new Promise((resolve, reject) => {
-      state.drained = resolve
-      timer = setTimeout(() => reject(busy()), Math.max(1, Math.min(15000, Number(timeoutMs) || 15000)))
-    })
-    clearTimeout(timer)
-    return await operation()
+    // The filesystem admission lock excludes readers in other controllers;
+    // beforeDrain may stop on explicit shutdown, never on token refresh.
+    return await withCodexSlotDrain(projectRoot, vmId, 'kernel', async () => {
+      if (state.readers.size) await new Promise((resolve, reject) => {
+        state.drained = resolve
+        timer = setTimeout(() => reject(busy()), Math.max(1, Math.min(15000, Number(timeoutMs) || 15000)))
+      })
+      clearTimeout(timer)
+      return await operation()
+    }, { timeoutMs, beforeDrain })
   } finally {
     clearTimeout(timer)
     state.drained = null
