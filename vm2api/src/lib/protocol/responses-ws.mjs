@@ -416,6 +416,15 @@ function createProtocolRes(onChunk) {
     }
     return write.call(this, chunk, ...args)
   }
+  const end = res.end
+  res.end = function boundedEnd(chunk, ...args) {
+    const size = chunk == null || typeof chunk === 'function' ? 0 : Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk))
+    if (this.writableLength + size > WS_PENDING_BYTES) {
+      this.destroy(Object.assign(new Error('WebSocket protocol response buffer limit'), { code: 'websocket_bridge_limit' }))
+      return this
+    }
+    return end.call(this, chunk, ...args)
+  }
   return res
 }
 
