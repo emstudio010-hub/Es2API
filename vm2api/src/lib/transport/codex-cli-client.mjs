@@ -20,6 +20,7 @@ import { readCodexCliExitReceipt, waitCodexCliExitReceipt } from './codex-cli-re
 import { claimCodexCliRequest, hasCodexCliClaim } from './codex-cli-claim.mjs'
 import { withCodexSlotActivity } from '../vm/codex-slot-coordination.mjs'
 import { codexCliLaunchArgs } from './codex-cli-launch.mjs'
+import { isCodexCliMetadataWarning, classifyCodexCliDiagnostic, codexCliFailureMessage } from './codex-cli-diagnostics.mjs'
 
 const runFile = promisify(execFile)
 const TIMEOUT_MS = 300000
@@ -292,6 +293,7 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
   const guest = `/home/kincli/.es2api-requests/${id}`
   let failure = null, child, heartbeat, timeout, hardTimeout, cancelTimeout, emitted = false, firstTokenAt = null
   let completed = false, usage = null, text = '', closed = false, terminalAttempted = false, exitReceipt = null
+  let diagnostic = '', diagnosticCode = null, metadataWarningObserved = false
   const responseId = `resp_cli_${crypto.randomUUID().replaceAll('-', '')}`
   const messageId = `msg_${crypto.randomUUID().replaceAll('-', '')}`
   let sequence = 0
@@ -343,7 +345,10 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     child.stdin.on('error', () => {})
     child.stdin.end(request.prompt)
-    child.stderr.resume() // Never persist raw CLI diagnostics or upstream error bodies.
+    child.stderr.on('data', chunk => {
+      diagnostic = (diagnostic + chunk.toString('utf8')).slice(-8192)
+      diagnosticCode = classifyCodexCliDiagnostic(diagnostic) || diagnosticCode
+    }) // Transient only; stderr and upstream bodies are never persisted.
     heartbeat = setInterval(() => { try { const now = new Date(); fs.utimesSync(path.join(dir, 'heartbeat'), now, now) } catch {} }, 3000)
     timeout = setTimeout(() => cancel('codex_cli_timeout'), remaining)
     hardTimeout = setTimeout(() => { cancel('codex_cli_timeout'); clearInterval(heartbeat); child.kill() }, remaining + 30000)
@@ -368,7 +373,20 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
         return
       }
       if (failure) return
-      if (event.type === 'turn.failed' || event.type === 'error') { cancel('codex_cli_turn_failed'); return }
+      if (event.type === 'turn.failed' || event.type === 'error') {
+        cancel(classifyCodexCliDiagnostic(event.error?.message || event.message) || diagnosticCode || 'codex_cli_turn_failed')
+        return
+      }
+      if (isCodexCliMetadataWarning(event, request.model)) {
+        if (completed) { cancel('codex_cli_invalid_jsonl'); return }
+        if (!metadataWarningObserved) console.warn(JSON.stringify({ event: 'codex_cli_metadata_fallback', vm_id: exec.vmId, at: new Date().toISOString() }))
+        metadataWarningObserved = true
+        return
+      }
+      if (event.item?.type === 'error') {
+        cancel(classifyCodexCliDiagnostic(event.item.message) || 'codex_cli_turn_failed')
+        return
+      }
       if (event.item && !['agent_message', 'reasoning'].includes(event.item.type)) { cancel('codex_cli_tool_execution_unsupported'); return }
       if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
         if (typeof event.item.text !== 'string' || completed) { cancel('codex_cli_invalid_jsonl'); return }
@@ -397,6 +415,7 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     pending += decoder.end()
     await queue
     if (pending.trim()) await eventLine(pending)
+    if (failure === 'codex_cli_turn_failed' && diagnosticCode) failure = diagnosticCode
     exitReceipt = await waitCodexCliExitReceipt(dir, receiptNonce)
     if (!failure) {
       let outcome = null
@@ -407,9 +426,9 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
       ]).get(outcome) || 'codex_cli_supervisor_state_invalid'
     }
     if (!failure && !exitReceipt) failure = 'codex_cli_exit_unconfirmed'
-    if (!failure && (exit !== 0 || exitReceipt.phase !== 'exited' || exitReceipt.exit_code !== 0 || !completed || !text || !usage)) failure = 'codex_cli_incomplete'
+    if (!failure && (exit !== 0 || exitReceipt.phase !== 'exited' || exitReceipt.exit_code !== 0 || !completed || !text || !usage)) failure = diagnosticCode || 'codex_cli_incomplete'
     if (failure) {
-      const result = errorResult(['client_cancelled', 'codex_cli_cancelled'].includes(failure) ? 499 : failure === 'codex_cli_timeout' ? 504 : 502, failure, 'Codex CLI 执行未完成，请在实例中检查状态；本次未自动重试')
+      const result = errorResult(['client_cancelled', 'codex_cli_cancelled'].includes(failure) ? 499 : failure === 'codex_cli_timeout' ? 504 : 502, failure, codexCliFailureMessage(failure))
       await emitFailure(result)
       return { ...result, committed: emitted, usage, firstTokenAt, executionExitConfirmed: !!exitReceipt }
     }
@@ -429,6 +448,8 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     await emitFailure(result)
     return { ...result, committed: emitted, usage, firstTokenAt, ttftMs: firstTokenAt == null ? null : firstTokenAt - started }
   } finally {
+    diagnostic = ''
+    diagnosticCode = null
     clearInterval(heartbeat); clearTimeout(timeout); clearTimeout(hardTimeout); clearTimeout(cancelTimeout)
     signal?.removeEventListener('abort', abort)
     active.delete(exec.vmId)
