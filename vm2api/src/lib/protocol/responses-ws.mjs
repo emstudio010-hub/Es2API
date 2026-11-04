@@ -5,12 +5,15 @@
  * Each `response.create` goes through handleProtocol (auth, scope, schedule,
  * billing, logs). Downstream sees JSON frames, never SSE.
  */
-import { EventEmitter } from 'node:events'
 import http from 'node:http'
-import { Readable } from 'node:stream'
+import { Readable, Writable } from 'node:stream'
+import { finished } from 'node:stream/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { WebSocket, WebSocketServer } from 'ws'
 import { computedUpstreamTransport, inferenceWebsocketEnabled } from './codex-route.mjs'
 import { DEFAULT_MAX_REQUEST_BYTES, inboundBodyLimit } from '../core/config.mjs'
+import { createWebSocketSender, startWebSocketHeartbeat, WS_MESSAGE_BYTES, WS_PENDING_BYTES } from '../transport/websocket-flow.mjs'
+import { STREAM_BODY_BYTES, STREAM_LINE_BYTES, STREAM_MAX_LINES } from '../transport/stream-flow.mjs'
 
 export const RESPONSES_WS_QUEUE_LIMIT = 32
 export const RESPONSES_WS_REPLAY_MAX_ITEMS = 32
@@ -254,6 +257,8 @@ function contentTypeOf(headers = {}) {
 
 export function createSseJsonBridge() {
   let buf = ''
+  const decoder = new StringDecoder('utf8')
+  let bytes = 0, frameBytes = 0, dataBytes = 0, lineCount = 0
   const dataLines = []
   const frames = []
   let terminal = null
@@ -264,33 +269,44 @@ export function createSseJsonBridge() {
     if (!dataLines.length) return null
     const data = dataLines.join('\n')
     dataLines.length = 0
+    dataBytes = 0
     return data
   }
 
   function ingestParsed(parsed) {
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+    const invalid = () => { throw Object.assign(new Error('Invalid Responses event'), { code: 'websocket_bridge_protocol' }) }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || typeof parsed.type !== 'string') invalid()
     const type = parsed.type
-    const id = parsed.response?.id
+    if (terminal) invalid()
+    if (parsed.response?.id != null && parsed.response_id != null && parsed.response.id !== parsed.response_id) invalid()
+    const id = parsed.response?.id ?? parsed.response_id
+    if (id != null && (typeof id !== 'string' || !id || id.length > 512 || (responseId && responseId !== id))) invalid()
     if (typeof id === 'string' && id) responseId = id
     if (Array.isArray(parsed.response?.output)) output = parsed.response.output
-    if (type === 'response.completed') terminal = 'completed'
+    if (type === 'response.completed' || type === 'response.done') {
+      if (parsed.response?.status !== 'completed' || !responseId || parsed.response?.id !== responseId || !Array.isArray(parsed.response?.output) || parsed.response?.error) invalid()
+      terminal = 'completed'
+    }
     else if (type === 'response.failed') terminal = 'failed'
     else if (type === 'response.incomplete') terminal = 'incomplete'
     else if (type === 'error') terminal = 'error'
+    const size = Buffer.byteLength(JSON.stringify(parsed))
+    if (frames.length >= 256 || frameBytes + size > WS_PENDING_BYTES) throw Object.assign(new Error('WebSocket bridge buffer limit'), { code: 'websocket_bridge_limit' })
+    frameBytes += size
     frames.push(parsed)
   }
 
   function flushEvent() {
     const data = takeData()
     if (data == null || data === '[DONE]') return
-    try {
-      ingestParsed(JSON.parse(data))
-    } catch {
-      // Kernel / hop garbage is not turned into a successful completed frame.
-    }
+    let parsed
+    try { parsed = JSON.parse(data) }
+    catch { throw Object.assign(new Error('Invalid SSE JSON'), { code: 'websocket_bridge_protocol' }) }
+    ingestParsed(parsed)
   }
 
   function pushLine(line) {
+    if (++lineCount > STREAM_MAX_LINES || Buffer.byteLength(line) > STREAM_LINE_BYTES) throw Object.assign(new Error('WebSocket bridge line limit'), { code: 'websocket_bridge_limit' })
     const raw = line.endsWith('\r') ? line.slice(0, -1) : line
     if (raw === '') {
       flushEvent()
@@ -300,17 +316,27 @@ export function createSseJsonBridge() {
       flushEvent()
       return
     }
-    if (raw.startsWith('data:')) dataLines.push(raw.slice(5).replace(/^ /, ''))
+    if (raw.startsWith('data:')) {
+      const data = raw.slice(5).replace(/^ /, '')
+      dataBytes += Buffer.byteLength(data) + 1
+      if (dataBytes > STREAM_LINE_BYTES) throw Object.assign(new Error('WebSocket bridge event limit'), { code: 'websocket_bridge_limit' })
+      dataLines.push(data)
+    }
   }
 
   return {
     push(chunk) {
-      buf += String(chunk ?? '')
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk ?? ''))
+      bytes += value.length
+      if (bytes > STREAM_BODY_BYTES) throw Object.assign(new Error('WebSocket bridge response limit'), { code: 'websocket_bridge_limit' })
+      buf += decoder.write(value)
       const parts = buf.split('\n')
       buf = parts.pop() ?? ''
       for (const line of parts) pushLine(line)
+      if (Buffer.byteLength(buf) > STREAM_LINE_BYTES) throw Object.assign(new Error('WebSocket bridge line limit'), { code: 'websocket_bridge_limit' })
     },
     finish() {
+      buf += decoder.end()
       if (buf) {
         pushLine(buf)
         buf = ''
@@ -320,6 +346,7 @@ export function createSseJsonBridge() {
     get frames() {
       return frames
     },
+    takeFrames() { const ready = frames.splice(0); frameBytes = 0; return ready },
     get terminal() {
       return terminal
     },
@@ -360,13 +387,17 @@ function createProtocolReq(upgradeReq, body) {
   return req
 }
 
-function createProtocolRes() {
-  const res = new EventEmitter()
+function createProtocolRes(onChunk) {
+  const res = new Writable({
+    highWaterMark: 64 * 1024,
+    write(chunk, _encoding, callback) {
+      if (chunk.length > WS_PENDING_BYTES) { callback(Object.assign(new Error('WebSocket protocol response buffer limit'), { code: 'websocket_bridge_limit' })); return }
+      this.headersSent = true
+      Promise.resolve().then(() => onChunk(chunk)).then(() => callback(), error => callback(error))
+    },
+  })
   res.statusCode = 200
   res.headersSent = false
-  res.writableEnded = false
-  res.destroyed = false
-  res.closed = false
   res._headers = {}
   res.writeHead = function writeHead(status, headers) {
     this.statusCode = status
@@ -376,35 +407,16 @@ function createProtocolRes() {
   res.setHeader = function setHeader(name, value) {
     this._headers[String(name).toLowerCase()] = value
   }
-  res.write = function write(chunk, encoding, cb) {
-    const text = chunk == null ? '' : Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
-    this.emit('chunk', text)
-    const done = typeof encoding === 'function' ? encoding : cb
-    if (typeof done === 'function') done()
-    return true
-  }
-  res.end = function end(chunk, encoding, cb) {
-    if (chunk && typeof chunk !== 'function') this.write(chunk)
-    this.writableEnded = true
-    this.closed = true
-    this.emit('finish')
-    this.emit('close')
-    const done = typeof chunk === 'function' ? chunk : typeof encoding === 'function' ? encoding : cb
-    if (typeof done === 'function') done()
-  }
-  res.destroy = function destroy() {
-    if (this.destroyed) return
-    this.destroyed = true
-    this.closed = true
-    this.emit('close')
+  const write = res.write
+  res.write = function boundedWrite(chunk, ...args) {
+    const size = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk ?? ''))
+    if (this.writableLength + size > WS_PENDING_BYTES) {
+      this.destroy(Object.assign(new Error('WebSocket protocol response buffer limit'), { code: 'websocket_bridge_limit' }))
+      return false
+    }
+    return write.call(this, chunk, ...args)
   }
   return res
-}
-
-function sendFrame(ws, event) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false
-  ws.send(JSON.stringify(event))
-  return true
 }
 
 function httpErrorToFrame(status, raw) {
@@ -454,7 +466,7 @@ export function createResponsesWsHandler({
   getRouting,
   maxBodyBytes = DEFAULT_MAX_REQUEST_BYTES,
 } = {}) {
-  const wss = new WebSocketServer({ noServer: true, maxPayload: maxBodyBytes })
+  const wss = new WebSocketServer({ noServer: true, maxPayload: Math.min(maxBodyBytes, WS_MESSAGE_BYTES), perMessageDeflate: false })
 
   function handshakeRes(socket) {
     return {
@@ -504,14 +516,31 @@ export function createResponsesWsHandler({
     let busy = false
     let closed = false
     let currentReq = null
+    let currentRes = null
     let activeResponseId = null
     let activeHopCompleted = false
+    let interruptTimer = null
+    let sender, stopHeartbeat
 
     const abortCurrent = () => {
       try {
         currentReq?.abort?.()
       } catch {}
     }
+    const stop = () => {
+      if (closed) return
+      closed = true; queue.length = 0; queuedBytes = 0
+      clearTimeout(interruptTimer)
+      stopHeartbeat?.(); sender?.close()
+      abortCurrent(); currentRes?.destroy()
+      ws.terminate()
+    }
+    sender = createWebSocketSender(ws, { onFailure: stop })
+    stopHeartbeat = startWebSocketHeartbeat(ws, { onFailure: stop, isBackpressured: () => sender.pressured })
+    const sendFrame = (_ws, event) => sender.send(JSON.stringify(event))
+    const sendAsync = event => new Promise((resolve, reject) => {
+      sender.send(JSON.stringify(event), error => error ? reject(error) : resolve())
+    })
 
     const pump = async () => {
       if (busy) return
@@ -565,51 +594,54 @@ export function createResponsesWsHandler({
           const req = createProtocolReq(upgradeReq, hopBody)
           currentReq = req
           let hopClientAborted = false
-          const res = createProtocolRes()
           const bridge = createSseJsonBridge()
-          let jsonBody = ''
-          const flushBridge = () => {
-            for (const frame of bridge.frames) sendFrame(ws, frame)
-            bridge.frames.length = 0
+          const jsonDecoder = new StringDecoder('utf8')
+          let jsonBody = '', jsonBytes = 0
+          const flushBridge = async () => {
             const snap = bridge.snapshot()
             if (snap?.id) activeResponseId = snap.id
+            for (const frame of bridge.takeFrames()) await sendAsync(frame)
             if (bridge.terminal === 'completed') activeHopCompleted = true
           }
           req.once('aborted', () => {
-            if (bridge.terminal === 'completed' || activeHopCompleted) return
+            if (activeHopCompleted) return
             hopClientAborted = true
           })
-          res.on('chunk', (text) => {
+          const res = createProtocolRes(async chunk => {
             if (contentTypeOf(res._headers).includes('application/json')) {
-              jsonBody += text
+              jsonBytes += chunk.length
+              if (jsonBytes > STREAM_LINE_BYTES) throw Object.assign(new Error('WebSocket JSON error body limit'), { code: 'websocket_bridge_limit' })
+              jsonBody += jsonDecoder.write(chunk)
               return
             }
-            bridge.push(text)
-            flushBridge()
+            bridge.push(chunk)
+            await flushBridge()
           })
+          currentRes = res
+          res.once('error', stop)
+          const responseFinished = finished(res, { cleanup: true }).then(() => null, error => error)
           try {
             await handleProtocol(req, res, 'openai.responses', '/v1/responses')
+            if (!res.writableEnded && !res.destroyed) res.end()
+            const writeError = await responseFinished
+            if (writeError) throw writeError
+            if (closed) return
+            bridge.finish()
+            await flushBridge()
+            await sender.whenIdle()
           } catch (error) {
             console.warn('[responses-ws] request failed', error?.code || error?.name || 'unknown_error')
-            if (!res.writableEnded) res.end()
-            sendFrame(
-              ws,
-              responsesWsErrorFrame({
-                status: 500,
-                type: 'api_error',
-                code: 'api_error',
-                message: 'Responses request failed',
-              }),
-            )
-            continue
+            stop()
+            await responseFinished
+            return
           } finally {
             currentReq = null
+            currentRes = null
           }
           if (closed) return
-          bridge.finish()
-          flushBridge()
-          if (hopClientAborted && bridge.terminal !== 'completed') continue
+          if (hopClientAborted) { stop(); return }
           if (contentTypeOf(res._headers).includes('application/json')) {
+            jsonBody += jsonDecoder.end()
             sendFrame(ws, httpErrorToFrame(res.statusCode, jsonBody))
             continue
           }
@@ -634,17 +666,14 @@ export function createResponsesWsHandler({
       } finally {
         busy = false
         currentReq = null
+        currentRes = null
       }
     }
 
     ws.on('message', (data, isBinary) => {
       if (closed) return
       if (isBinary) {
-        closed = true
-        try {
-          ws.close(1003, 'Responses WebSocket accepts text frames only')
-        } catch {}
-        abortCurrent()
+        stop()
         return
       }
       const raw = String(data)
@@ -670,16 +699,20 @@ export function createResponsesWsHandler({
         const targetId = interruptTargetResponseId(clientMessage.value)
         const shouldAbort =
           currentReq && !activeHopCompleted && (!targetId || (activeResponseId && targetId === activeResponseId))
-        if (shouldAbort) abortCurrent()
+        if (shouldAbort) {
+          abortCurrent()
+          if (!interruptTimer) {
+            interruptTimer = setTimeout(stop, 10000)
+            interruptTimer.unref()
+          }
+        }
         sendFrame(ws, responseInterruptAcceptedFrame(clientMessage.value))
         return
       }
       const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
       const bytes = Buffer.byteLength(raw)
       if (bytes + queuedBytes > inboundBodyLimit(routing, maxBodyBytes)) {
-        closed = true
-        ws.close(1009, 'Responses WebSocket receive buffer exceeds request body limit')
-        abortCurrent()
+        stop()
         return
       }
       if (queue.length >= RESPONSES_WS_QUEUE_LIMIT) {
@@ -690,38 +723,18 @@ export function createResponsesWsHandler({
             message: 'Responses WebSocket receive queue is full',
           }),
         )
-        closed = true
-        try {
-          ws.close(1008, 'Responses WebSocket receive queue is full')
-        } catch {}
-        abortCurrent()
+        stop()
         return
       }
       queue.push(raw)
       queuedBytes += bytes
       pump().catch((error) => {
         console.warn('[responses-ws] connection failed', error?.code || error?.name || 'unknown_error')
-        sendFrame(
-          ws,
-          responsesWsErrorFrame({
-            status: 500,
-            type: 'api_error',
-            code: 'api_error',
-            message: 'Responses connection failed',
-          }),
-        )
+        stop()
       })
     })
-    ws.on('close', () => {
-      closed = true
-      queue.length = 0
-      queuedBytes = 0
-      abortCurrent()
-    })
-    ws.on('error', () => {
-      closed = true
-      abortCurrent()
-    })
+    ws.on('close', stop)
+    ws.on('error', stop)
   }
 
   function handleUpgrade(req, socket, head) {

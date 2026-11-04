@@ -1,9 +1,10 @@
 import crypto from 'node:crypto'
 import WebSocket, { WebSocketServer } from 'ws'
 import { createResponseTurnObserver } from './gateway-ws-turn.mjs'
+import { createWebSocketSender, startWebSocketHeartbeat, WS_MESSAGE_BYTES } from '../../vm2api/src/lib/transport/websocket-flow.mjs'
 
 export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, isolation, gatewayToken, equalSecret }) {
-  const server = new WebSocketServer({ noServer: true, maxPayload: 10 * 1024 * 1024, perMessageDeflate: false })
+  const server = new WebSocketServer({ noServer: true, maxPayload: WS_MESSAGE_BYTES, perMessageDeflate: false })
   const connections = new Map()
   const upgrade = (req, socket, head) => {
     const route = new URL(req.url || '/', 'http://localhost').pathname.match(/^\/gateway\/([a-zA-Z0-9._:-]{1,160})\/v1\/responses$/)
@@ -15,6 +16,7 @@ export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, i
     try { isolation.context(req, group.id) } catch { return reject('401 Unauthorized') }
     server.handleUpgrade(req, socket, head, downstream => {
       let upstream, pinnedAccount, context, turn = null, closed = false, connecting = false
+      let downstreamSender, upstreamSender, stopDownHeartbeat, stopUpHeartbeat
       let lastActivity = Date.now()
       const fallback = crypto.randomUUID()
       const claimedIdentities = new Set()
@@ -28,23 +30,39 @@ export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, i
       const stop = (code = 1011, errorCode = 'gateway_ws_transport') => {
         if (closed) return
         closed = true; clearTimeout(deadline); clearInterval(idle); connections.delete(downstream)
+        stopDownHeartbeat?.(); stopUpHeartbeat?.()
+        downstreamSender?.close(); upstreamSender?.close()
         // Close the local execution transport before releasing the active lease.
         // Server-side cancellation confirmation remains an execution concern.
         upstream?.terminate()
         release({ success: false, error_code: errorCode })
         if (downstream.readyState === WebSocket.OPEN) downstream.close(code, 'Execution connection closed')
         else downstream.terminate()
+        const forceClose = setTimeout(() => downstream.terminate(), 5000)
+        forceClose.unref(); downstream.once('close', () => clearTimeout(forceClose))
       }
       const deadline = setTimeout(() => stop(1008, 'gateway_ws_handshake_timeout'), 15000)
       deadline.unref()
       const idle = setInterval(() => { if (Date.now() - lastActivity > 15 * 60 * 1000) stop(1001, 'gateway_ws_idle_timeout') }, 30000)
       idle.unref()
       connections.set(downstream, stop)
+      downstreamSender = createWebSocketSender(downstream, {
+        onFailure: error => stop(1011, `gateway_${error.code}`),
+        onPressure: paused => {
+          if (closed || upstream?.readyState !== WebSocket.OPEN) return
+          if (paused) upstream.pause()
+          else upstream.resume()
+        },
+      })
+      stopDownHeartbeat = startWebSocketHeartbeat(downstream, {
+        onFailure: () => stop(1001, 'gateway_ws_downstream_heartbeat_timeout'),
+        isBackpressured: () => downstreamSender.pressured,
+      })
       const send = (target, data, done = () => {}) => {
-        if (closed || target?.readyState !== WebSocket.OPEN || target.bufferedAmount > 8 * 1024 * 1024) { stop(); return false }
-        try { target.send(data, { binary: false }, error => { if (error) stop(); else if (!closed) done() }) }
-        catch { stop(); return false }
-        return true
+        if (closed || target?.readyState !== WebSocket.OPEN) { stop(); return false }
+        const sender = target === downstream ? downstreamSender : upstreamSender
+        if (!sender) { stop(); return false }
+        return sender.send(data, error => { if (error) stop(1011, `gateway_${error.code}`); else if (!closed) done() })
       }
       const finishTurn = current => {
         if (closed || turn !== current || !current.terminal || current.pendingWrites) return
@@ -99,7 +117,7 @@ export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, i
             if (claimedIdentities.has(digest) || claimedIdentities.size >= 4096) throw new Error('Response identity cannot be reused')
             isolation.claimResponse(next, lease.account, id)
             claimedIdentities.add(digest)
-          } }), pendingWrites: 0, terminal: null, cancelled: false, timer: null }
+          } }), pendingWrites: 0, terminal: null, cancelled: false, timer: null, receivedBytes: 0, receivedMessages: 0 }
           const current = turn
           current.timer = setTimeout(() => stop(1001, 'gateway_ws_turn_timeout'), 15 * 60 * 1000)
           current.timer.unref()
@@ -112,17 +130,25 @@ export function isolatedUpgrade({ accountPool, store, secret, baseUrl, apiKey, i
           const headers = { authorization: `Bearer ${apiKey}`, 'x-kin-vm': lease.account.vm_id,
             ...isolation.upstreamHeaders(next, lease.account) }
           for (const key of ['priority', 'fast', 'ultrafast', 'openai-beta']) if (typeof req.headers[key] === 'string') headers[key] = req.headers[key]
-          upstream = new WebSocket(target, { headers, handshakeTimeout: 15000, maxPayload: 10 * 1024 * 1024, perMessageDeflate: false, followRedirects: false })
+          upstream = new WebSocket(target, { headers, handshakeTimeout: 15000, maxPayload: WS_MESSAGE_BYTES, perMessageDeflate: false, followRedirects: false })
+          upstreamSender = createWebSocketSender(upstream, { onFailure: error => stop(1011, `gateway_${error.code}`) })
           upstream.on('error', () => stop())
           upstream.on('close', () => stop(1000, 'gateway_ws_upstream_closed'))
           upstream.on('open', () => {
             if (closed) { upstream.terminate(); return }
+            stopUpHeartbeat = startWebSocketHeartbeat(upstream, {
+              onFailure: () => stop(1001, 'gateway_ws_upstream_heartbeat_timeout'),
+              isBackpressured: () => upstreamSender.pressured,
+            })
+            if (downstreamSender.pressured) upstream.pause()
             clearTimeout(deadline); connecting = false; send(upstream, payload)
           })
           upstream.on('message', (data, isBinary) => {
             lastActivity = Date.now()
             const active = turn
             if (isBinary || !active) { stop(1008, 'gateway_ws_protocol'); return }
+            active.receivedBytes += data.length
+            if (active.receivedBytes > 64 * 1024 * 1024 || ++active.receivedMessages > 262144) { stop(1009, 'gateway_ws_response_limit'); return }
             try {
               const event = parse(data)
               active.terminal = active.observer.push(event)
