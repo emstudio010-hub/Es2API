@@ -1,4 +1,5 @@
-import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
+import { StringDecoder } from 'node:string_decoder'
+import { canonicalApiPolicyBody, apiPolicyToAnthropic, isApiPolicyInputError } from './api-policy-tools.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
@@ -104,8 +105,9 @@ function mergeCallerProtocolHeaders(base = {}, caller = {}, configured = {}, mod
 
 async function readLines(stream, onLine) {
   let buf = ''
+  const decoder = new StringDecoder('utf8')
   for await (const chunk of stream) {
-    buf += chunk.toString('utf8')
+    buf += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
     let idx
     while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx)
@@ -113,6 +115,7 @@ async function readLines(stream, onLine) {
       await onLine(line)
     }
   }
+  buf += decoder.end()
   if (buf) await onLine(buf)
 }
 
@@ -216,14 +219,17 @@ export async function runApiInference({
   cacheTtl,
   converters,
   requestContext = null,
+  apiToolPolicy = false,
 } = {}) {
   const rejectInput = code => ({ ok: false, status: 400, via: 'api-kernel', terminalState: 'rejected',
     body: { error: { type: 'invalid_request_error', code, message: 'This API bridge cannot preserve the requested choices or tool input.' } } })
-  // Neither bridge produces multiple choices. Reject before scheduler/provider
-  // work; the Anthropic intermediate cannot preserve Chat custom raw strings.
+  // Neither bridge produces multiple choices. Custom Chat requires the typed
+  // representation created before the normal policy chain, never raw bypass.
   if (['openai.chat', 'openai.completions'].includes(protocol) && inbound?.n != null && inbound.n !== 1) return rejectInput('api_bridge_n_unsupported')
-  if (protocol === 'openai.chat' && hasCustomChatTools(inbound)) return rejectInput('api_bridge_custom_tool_unsupported')
-  const canonical = officialMessagesBody(convertedBody)
+  if (protocol === 'openai.chat' && hasCustomChatTools(inbound) && !apiToolPolicy) return rejectInput('api_bridge_policy_tools_required')
+  let canonical
+  try { canonical = canonicalApiPolicyBody(convertedBody, { allowInternalTools: apiToolPolicy && ['openai.chat', 'openai.responses'].includes(protocol) }) }
+  catch (error) { if (!isApiPolicyInputError(error)) throw error; return rejectInput(error.code) }
   const model = canonical.model
   const picked = scheduler.pick(model)
   if (!picked.ok) {
@@ -259,9 +265,9 @@ export async function runApiInference({
   try {
     body = isOpenAI
       ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
-      : { ...canonical, model: picked.upstream_model, stream: true }
+      : { ...apiPolicyToAnthropic(canonical), model: picked.upstream_model, stream: true }
   } catch (error) {
-    if (!isCodexChatInputError(error)) throw error
+    if (!isCodexChatInputError(error) && !isApiPolicyInputError(error)) throw error
     return rejectInput(error.code)
   }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
@@ -551,6 +557,7 @@ async function runOpenAIResponsesUpstream({
   let conversionError = null
   let committed = false
   let completed = false
+  let upstreamCompleted = false
   let sawTerminal = false
   let ttftMs = null
   let streamedUsage = null
@@ -562,7 +569,6 @@ async function runOpenAIResponsesUpstream({
     if (!res.headersSent) converters.writeSSEHeaders(res)
     if (protocol === 'openai.responses') {
       res.write(raw.endsWith('\n') ? raw : raw + '\n')
-      if (/response\.(completed|done)/.test(raw)) completed = true
       return
     }
     try {
@@ -595,13 +601,18 @@ async function runOpenAIResponsesUpstream({
     if (seen) streamedUsage = seen
     if (conversionError) return
     const startsOutput = isOpenAIResponsesCommitEvent(event)
-    const completes = event?.type === 'response.completed' || event?.type === 'response.done'
+    const completes = (['response.completed', 'response.done'].includes(event?.type) && event?.response?.status === 'completed') ||
+      (event?.type === 'response.incomplete' && event?.response?.status === 'incomplete')
+    if (completes) {
+      sawTerminal = true
+      upstreamCompleted = event.response.status === 'completed' && !event.response.error
+      if (protocol === 'openai.responses') completed = true
+    }
     const wasCommitted = committed
     if ((startsOutput || completes) && ttftMs == null) ttftMs = Date.now() - started
     if (!committed && (startsOutput || completes)) committed = true
     if (!clientStream) {
       chunks.push(raw)
-      if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
       return
     }
     if (!wasCommitted) {
@@ -621,7 +632,7 @@ async function runOpenAIResponsesUpstream({
     try {
       assembled = assembleCodexBodyFromSse(chunks, {})
       outBody =
-        protocol === 'anthropic.messages'
+        protocol === 'anthropic.messages' || protocol === 'openai.completions'
           ? codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
           : protocol === 'openai.chat'
             ? codexBodyToChatCompletion(assembled, inbound?.model || body?.model)
@@ -638,14 +649,17 @@ async function runOpenAIResponsesUpstream({
         usage: streamedUsage,
       }
     }
-    const hasBody = !!(assembled && (assembled.output || assembled.id || outBody))
-    const complete = resultBase.ok && sawTerminal && hasBody
+    const hasBody = !!(assembled && typeof assembled.id === 'string' && assembled.id && Array.isArray(assembled.output))
+    const partialChat = protocol === 'openai.chat' && assembled.status === 'incomplete' &&
+      ['max_output_tokens', 'content_filter'].includes(assembled.incomplete_details?.reason)
+    const complete = resultBase.ok && sawTerminal && hasBody && (upstreamCompleted || partialChat)
     return {
       ...resultBase,
       ok: complete,
       body: outBody,
+      clientBodyProtocol: ['openai.chat', 'openai.responses'].includes(protocol) ? protocol : null,
       usage: assembled?.usage || streamedUsage || outBody?.usage || null,
-      terminalState: complete ? 'verified' : hasBody ? 'incomplete' : 'rejected',
+      terminalState: complete && upstreamCompleted ? 'verified' : hasBody ? 'incomplete' : 'rejected',
       committed,
     }
   }
@@ -673,9 +687,10 @@ async function runOpenAIResponsesUpstream({
 
   return {
     ...resultBase,
-    ok: resultBase.ok && (deliveryMode !== 'verified' || completed || committed),
+    ok: resultBase.ok && sawTerminal && completed && (upstreamCompleted || (protocol === 'openai.chat' && chatSse.chatStream?.finished)),
     usage: streamedUsage,
-    terminalState: completed ? 'verified' : committed ? 'incomplete' : 'rejected',
+    terminalState: completed && upstreamCompleted ? 'verified' : committed ? 'incomplete' : 'rejected',
+    clientStreamTerminated: protocol === 'openai.chat' && chatSse.chatStream?.finished === true,
     committed,
     ttftMs,
   }

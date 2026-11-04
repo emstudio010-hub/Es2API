@@ -1,5 +1,14 @@
 # 变更记录
 
+## 2026.11.04-preview.16 — API工具策略与路由
+
+- API类别密钥调用GPT模型进入API端点调度，不再提前进入OAuth/Codex账号池；原平台/分组/租户和密钥限流门仍执行。
+- Chat及Responses工具输入经明确的内部类型进入现有before_upstream、协议拦截、身份及提示词链，保留custom原始字符串、grammar/text格式、选择、function原始arguments和工具结果；输出只从策略处理后的内容构建，不另传原始请求。
+- OpenAI端点恢复对应Responses工具类型；Anthropic端点明确拒绝custom，function原文须可解析成对象。API Responses对旧响应引用、加密reasoning、未知输入/宿主工具等不能表达的内容明确报错，Chat未知音频/文件等不静默丢弃。
+- 已生成的非流式Chat/Responses结果直接按该协议返回，修正外层再次当Anthropic转换导致内容/工具丢失；保留客户端用量隐藏处理，规范function strict不丢失。
+- SSE逐块使用UTF8解码器，避免网络块边界损坏工具原文；完成状态须有类型与状态一致的终止帧，截断不算完整推理，Chat正常终止不重复写[DONE]。
+
+
 ## 2026.11.04-preview.15 — Codex 排队与就绪保活
 
 - Codex 流式请求在排队、账号权限检查和 CLI/Kernel 就绪阶段复用请求级保活；共享排队延迟与间隔配置，非流式不发送 SSE。

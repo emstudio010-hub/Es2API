@@ -16,6 +16,8 @@ import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from
 import { openaiContentToClaudeContent } from './images.mjs'
 import { remapCodexTools } from './codex-tools.mjs'
 import { CLAUDE_WEB_SEARCH_TOOL, isWebSearchTool } from './web-search.mjs'
+import { chatToCodexResponses } from './codex-chat-input.mjs'
+import { API_CUSTOM_TOOL, API_CUSTOM_USE, API_FUNCTION_USE, apiPolicyInputError } from '../pool/api-policy-tools.mjs'
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
 
@@ -72,12 +74,20 @@ export function isClaudeMessagesShape(body) {
 }
 
 /** OpenAI tools → Claude tools. Server search maps to web_search_20250305; function tools stay client tools. */
-export function openaiToolsToClaude(tools) {
+export function openaiToolsToClaude(tools, { preserveApiTools = false } = {}) {
   if (!Array.isArray(tools) || !tools.length) return undefined
   const seenSearch = new Set()
   const out = []
-  for (const t of remapCodexTools(tools)) {
+  for (const t of preserveApiTools ? tools : remapCodexTools(tools)) {
     if (!t) continue
+    if (preserveApiTools && t.type === 'custom') {
+      const custom = t.custom || t
+      out.push({ type: API_CUSTOM_TOOL, name: custom.name,
+        ...(custom.description != null ? { description: custom.description } : {}),
+        ...(custom.format != null ? { format: custom.format } : {}),
+      })
+      continue
+    }
     if (isWebSearchTool(t)) {
       if (seenSearch.has('web_search')) continue
       seenSearch.add('web_search')
@@ -181,7 +191,7 @@ export function openaiToolChoiceToClaude(toolChoice) {
 }
 
 /** Convert OpenAI-style messages including tool / tool_calls to Claude blocks */
-function openaiMessagesToClaude(messages) {
+function openaiMessagesToClaude(messages, { preserveApiTools = false } = {}) {
   const systemParts = []
   const out = []
 
@@ -215,8 +225,18 @@ function openaiMessagesToClaude(messages) {
       const content = []
       const text = contentToText(m.content)
       if (text) content.push({ type: 'text', text })
+      if (preserveApiTools && m.refusal) content.push({ type: 'refusal', refusal: m.refusal })
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
+          if (preserveApiTools) {
+            const custom = tc.type === 'custom'
+            const raw = tc.function?.arguments ?? tc.arguments ?? '{}'
+            content.push({ type: custom ? API_CUSTOM_USE : API_FUNCTION_USE,
+              id: tc.id || tc.call_id, name: custom ? tc.custom.name : tc.function?.name || tc.name,
+              input: custom ? tc.custom.input : typeof raw === 'string' ? raw : JSON.stringify(raw),
+            })
+            continue
+          }
           let input = {}
           try {
             input =
@@ -240,7 +260,10 @@ function openaiMessagesToClaude(messages) {
     }
 
     // user (text + optional images) — always blocks so cache stamps share a hang point
-    const content = openaiContentToClaudeContent(m.content)
+    const userContent = preserveApiTools && Array.isArray(m.content)
+      ? m.content.map(part => part?.type === 'output_text' ? { ...part, type: 'text' } : part)
+      : m.content
+    const content = openaiContentToClaudeContent(userContent)
     const role = 'user'
     const last = out[out.length - 1]
     if (last?.role === role && Array.isArray(last.content) && Array.isArray(content)) {
@@ -250,7 +273,7 @@ function openaiMessagesToClaude(messages) {
     }
   }
 
-  if (out.length && out[0].role !== 'user') {
+  if (!preserveApiTools && out.length && out[0].role !== 'user') {
     out.unshift({ role: 'user', content: '' })
   }
   return { systemParts, messages: out }
@@ -322,7 +345,21 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
 }
 
 function openaiToClaude(body, opts) {
-  const { systemParts, messages } = openaiMessagesToClaude(body.messages || [])
+  const preserveApiTools = opts.preserve_api_tools === true
+  // Shared validation runs before making an internal policy representation.
+  if (preserveApiTools) {
+    chatToCodexResponses(body)
+    for (const message of body.messages || []) for (const part of Array.isArray(message.content) ? message.content : []) {
+      if (typeof part === 'string') continue
+      if (part?.type === 'image_url' && message.role === 'user') {
+        const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url
+        if (typeof url === 'string' && url) continue
+      }
+      if (['text', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string') continue
+      throw apiPolicyInputError('api_bridge_input_unsupported')
+    }
+  }
+  const { systemParts, messages } = openaiMessagesToClaude(body.messages || [], { preserveApiTools })
   const out = {
     model: mapModel(body.model, { allowMap: opts.model_map !== false }),
     max_tokens: body.max_tokens || body.max_completion_tokens || defaultMaxTokensForModel(body.model),
@@ -333,10 +370,12 @@ function openaiToClaude(body, opts) {
   if (body.top_p != null) out.top_p = body.top_p
   if (body.stop != null) out.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop]
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop_sequences = body.stop_sequences
-  const tools = openaiToolsToClaude(body.tools)
+  const tools = openaiToolsToClaude(body.tools, { preserveApiTools })
   if (tools?.length) out.tools = tools
-  const tc = openaiToolChoiceToClaude(body.tool_choice)
+  const tc = preserveApiTools ? body.tool_choice : openaiToolChoiceToClaude(body.tool_choice)
   if (tc) out.tool_choice = tc
+  if (preserveApiTools && body.parallel_tool_calls != null) out.parallel_tool_calls = body.parallel_tool_calls
+  if (preserveApiTools && body.service_tier != null) out.service_tier = body.service_tier
   const thinking = openaiReasoningToClaudeThinking(body)
   if (thinking) out.thinking = thinking
   applyStructuredOutput(out, body)
@@ -363,6 +402,7 @@ function completionsToClaude(body, opts) {
 }
 
 function responsesToClaude(body, opts) {
+  if (opts.preserve_api_tools === true) return apiResponsesToPolicy(body, opts)
   const systemParts = []
   const messages = []
   if (body.instructions) systemParts.push(String(body.instructions))
@@ -404,6 +444,54 @@ function responsesToClaude(body, opts) {
   applyStructuredOutput(out, body)
   if (body.stream) out.stream = true
   return canonicalizeClaudeMessagesShape(out)
+}
+
+/** Responses input enters the same policy representation as Chat, never a raw bypass. */
+function apiResponsesToPolicy(body, opts) {
+  const invalid = () => { throw apiPolicyInputError('api_bridge_responses_input_unsupported') }
+  if (body.previous_response_id || (body.input != null && typeof body.input !== 'string' && !Array.isArray(body.input))) invalid()
+  const messages = [], calls = new Map()
+  if (body.instructions != null) {
+    if (typeof body.instructions !== 'string') invalid()
+    messages.push({ role: 'developer', content: body.instructions })
+  }
+  for (const item of typeof body.input === 'string' ? [body.input] : body.input || []) {
+    if (typeof item === 'string') { messages.push({ role: 'user', content: item }); continue }
+    if (!item || typeof item !== 'object') invalid()
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const type = item.type === 'function_call' ? 'function' : 'custom'
+      if (typeof item.call_id !== 'string' || !item.call_id || calls.has(item.call_id) || typeof item.name !== 'string' ||
+          typeof (type === 'function' ? item.arguments : item.input) !== 'string') invalid()
+      calls.set(item.call_id, type)
+      messages.push({ role: 'assistant', content: null, tool_calls: [{ id: item.call_id, type,
+        ...(type === 'function' ? { function: { name: item.name, arguments: item.arguments } }
+          : { custom: { name: item.name, input: item.input } }),
+      }] })
+      continue
+    }
+    if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+      if (calls.get(item.call_id) !== (item.type === 'function_call_output' ? 'function' : 'custom') || typeof item.output !== 'string') invalid()
+      messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output })
+      continue
+    }
+    if ((item.type != null && item.type !== 'message') || !['user', 'assistant', 'system', 'developer'].includes(item.role)) invalid()
+    const content = [], refusals = []
+    if (typeof item.content === 'string') content.push({ type: 'text', text: item.content })
+    else if (Array.isArray(item.content)) for (const part of item.content) {
+      if (['text', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string') content.push({ type: 'text', text: part.text })
+      else if (part?.type === 'refusal' && item.role === 'assistant' && typeof part.refusal === 'string') refusals.push(part.refusal)
+      else if (part?.type === 'input_image' && item.role === 'user' && typeof part.image_url === 'string') content.push({ type: 'image_url', image_url: { url: part.image_url } })
+      else invalid()
+    } else invalid()
+    messages.push({ role: item.role, content, ...(refusals.length ? { refusal: refusals.join('') } : {}) })
+  }
+  if (body.tools != null && !Array.isArray(body.tools)) invalid()
+  const tools = body.tools?.map(tool => {
+    if (!tool || !['function', 'custom'].includes(tool.type)) invalid()
+    if (tool.type === 'custom') return { type: 'custom', custom: { name: tool.name, description: tool.description, format: tool.format } }
+    return { type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters, strict: tool.strict } }
+  })
+  return openaiToClaude({ ...body, messages, tools, max_completion_tokens: body.max_output_tokens ?? body.max_tokens }, opts)
 }
 
 export function fromClaudeToOpenAIChat(claude, requestedModel, vmId, mode = 'convert') {

@@ -1,4 +1,5 @@
 import { chatToCodexResponses, responsesToolChoice } from '../protocol/codex-chat-input.mjs'
+import { API_CUSTOM_TOOL, API_CUSTOM_USE, API_FUNCTION_USE, apiPolicyInputError } from './api-policy-tools.mjs'
 
 function flattenSystem(system) {
   if (!system) return ''
@@ -18,9 +19,25 @@ function contentToOpenAI(content) {
   const texts = []
   const toolCalls = []
   const toolResults = []
+  const refusals = []
+  const parts = []
   for (const block of Array.isArray(content) ? content : []) {
     if (!block || typeof block !== 'object') continue
-    if (block.type === 'text') texts.push(block.text || '')
+    if (block.type === 'text') { texts.push(block.text || ''); parts.push({ type: 'text', text: block.text || '' }) }
+    else if (block.type === 'image') {
+      const source = block.source
+      const url = source?.type === 'url' ? source.url : source?.type === 'base64' && source.media_type && source.data
+        ? `data:${source.media_type};base64,${source.data}` : null
+      if (typeof url !== 'string' || !url) throw apiPolicyInputError('api_bridge_input_unsupported')
+      parts.push({ type: 'image_url', image_url: { url } })
+    }
+    else if (block.type === 'refusal') refusals.push(block.refusal || '')
+    else if (block.type === API_CUSTOM_USE || block.type === API_FUNCTION_USE) {
+      toolCalls.push({ id: block.id, type: block.type === API_CUSTOM_USE ? 'custom' : 'function',
+        ...(block.type === API_CUSTOM_USE ? { custom: { name: block.name, input: block.input } }
+          : { function: { name: block.name, arguments: block.input } }),
+      })
+    }
     else if (block.type === 'tool_use') {
       toolCalls.push({
         id: block.id,
@@ -36,7 +53,7 @@ function contentToOpenAI(content) {
       })
     }
   }
-  return { text: texts.join('\n'), toolCalls, toolResults }
+  return { text: texts.join('\n'), parts, toolCalls, toolResults, refusal: refusals.join('') || null }
 }
 
 export function claudeToOpenAIResponsesRequest(claude = {}) {
@@ -47,6 +64,7 @@ export function claudeToOpenAIResponsesRequest(claude = {}) {
   if (chat.max_tokens) out.max_output_tokens = chat.max_tokens
   if (chat.temperature != null) out.temperature = chat.temperature
   if (chat.top_p != null) out.top_p = chat.top_p
+  if (claude.output_config?.format) out.text = { format: claude.output_config.format }
   return out
 }
 
@@ -56,27 +74,52 @@ export function claudeToOpenAIChatRequest(claude = {}) {
   if (system) messages.push({ role: 'system', content: system })
   for (const msg of claude.messages || []) {
     const role = msg.role === 'assistant' ? 'assistant' : msg.role === 'system' ? 'system' : 'user'
-    const { text, toolCalls, toolResults } = contentToOpenAI(msg.content)
+    if (role === 'user' && Array.isArray(msg.content)) {
+      // Tool results can share a policy user turn with text/images. Preserve
+      // their relative position instead of moving every result before text.
+      let pending = []
+      const flush = () => {
+        if (!pending.length) return
+        const { text, parts } = contentToOpenAI(pending)
+        if (text || parts.length) messages.push({ role: 'user', content: parts.length ? parts : text })
+        pending = []
+      }
+      for (const block of msg.content) {
+        if (block?.type !== 'tool_result') { pending.push(block); continue }
+        flush()
+        messages.push(...contentToOpenAI([block]).toolResults)
+      }
+      flush()
+      continue
+    }
+    const { text, parts, toolCalls, toolResults, refusal } = contentToOpenAI(msg.content)
     if (toolResults.length) messages.push(...toolResults)
     if (role === 'assistant' && toolCalls.length) {
-      messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls })
+      messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls, ...(refusal ? { refusal } : {}) })
+    } else if (role === 'assistant' && refusal) {
+      messages.push({ role: 'assistant', content: text || null, refusal })
     } else if (text || role === 'user') {
-      messages.push({ role, content: text })
+      messages.push({ role, content: role === 'user' && parts?.length ? parts : text })
     }
   }
   const out = { model: claude.model, messages, stream: true }
   if (claude.max_tokens) out.max_tokens = claude.max_tokens
   if (claude.temperature != null) out.temperature = claude.temperature
   if (claude.top_p != null) out.top_p = claude.top_p
+  if (claude.parallel_tool_calls != null) out.parallel_tool_calls = claude.parallel_tool_calls
+  if (claude.service_tier != null) out.service_tier = claude.service_tier
   if (Array.isArray(claude.tools) && claude.tools.length) {
     out.tools = claude.tools
       .filter((t) => t?.name)
-      .map((t) => ({
+      .map((t) => t.type === API_CUSTOM_TOOL ? { type: 'custom', custom: {
+        name: t.name, ...(t.description != null ? { description: t.description } : {}), ...(t.format != null ? { format: t.format } : {}),
+      } } : ({
         type: 'function',
         function: {
           name: t.name,
           description: t.description || '',
           parameters: t.input_schema || { type: 'object', properties: {} },
+          ...(t.strict != null ? { strict: t.strict } : {}),
         },
       }))
   }

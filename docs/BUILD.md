@@ -12,7 +12,7 @@ bash deploy-linux/build.sh
 
 准备 Node.js 24+、npm、Python 3（含 lzma）、curl、sha256sum、与各 Go 模块 `go.mod` 兼容的 Go 工具链。当前控制面声明 Go 1.27.3，不能直接照搬上游旧 Dockerfile 的 Go 版本。构建会访问 npm、Go 模块源、Node 发布站与 VM2API payload 发布源。
 
-脚本执行前端类型编译/Vite、Go 主程序与 API kernel 编译、生产 npm 依赖安装、固定 payload 下载和哈希核对，再组装 `dist/Es2API-linux-x64-20261104-r15.tar.gz`。它不执行测试、不导入账号、不创建业务槽、不发供应商推理，也不自动安装系统服务。
+脚本执行前端类型编译/Vite、Go 主程序与 API kernel 编译、生产 npm 依赖安装、固定 payload 下载和哈希核对，再组装 `dist/Es2API-linux-x64-20261104-r16.tar.gz`。它不执行测试、不导入账号、不创建业务槽、不发供应商推理，也不自动安装系统服务。
 
 重复打包时暂存目录和压缩包不会被直接覆盖，可使用新的输出路径：
 

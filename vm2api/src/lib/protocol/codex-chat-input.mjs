@@ -239,8 +239,8 @@ export function chatToCodexResponses(body = {}) {
   return out
 }
 
-// The API-key backend currently canonicalizes through Anthropic Messages.
-// Until that intermediate format can retain custom input, reject it explicitly.
+// Capability detection for bridge callers. API custom input must use the typed
+// policy representation; copying raw inbound around policy is not supported.
 export function hasCustomChatTools(body = {}) {
   const custom = tool => tool?.type === 'custom' || tool?.custom != null
   const choice = body.tool_choice

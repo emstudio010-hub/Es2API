@@ -98,7 +98,7 @@ WS逐轮15分钟预算，握手15秒、连接空闲15分钟。response.cancel和
 
 历史按call id记录function/custom类型，tool结果必须引用此前调用，使用相应function_call_output/custom_tool_call_output。重复调用ID、重复结果、找不到调用、双重ID矛盾或无custom input均返回codex_chat_tool_history_invalid；定义/格式错误为codex_chat_tool_invalid。转换边界捕获并返回400，避免未命名空调用或call_unknown猜测。该输入适配并不在服务器执行客户工具。
 
-API账号仍先转Anthropic中间格式；该格式未能保留Chat custom的原始输入，因此在调度/供应商请求前明确api_bridge_custom_tool_unsupported，不绕过现有请求拦截/身份/提示词策略。两条API桥接对n不等于1明确api_bridge_n_unsupported。规范function历史通过共享Chat→Responses转换，替换以前把tool结果当用户文本、漏掉assistant调用的映射；不宣称API custom已经实现。
+API账号仍先转Anthropic中间格式；该格式未能保留Chat custom的原始输入，因此在调度/供应商请求前明确api_bridge_custom_tool_unsupported，不绕过现有请求拦截/身份/提示词策略。两条API桥接对n不等于1明确api_bridge_n_unsupported。规范function历史通过共享Chat→Responses转换，替换以前把tool结果当用户文本、漏掉assistant调用的映射；这是preview.13当时的限制；后续实现见preview.16。
 
 WS每轮首次响应身份在现有隔离事务中claim，当前caller/group范围内的response索引已存在即拒绝，包括同一账号；同轮后续帧仍允许同一ID。新连接能识别24小时TTL内已记ID；同一连接另保存ID的SHA256摘要，最多4096个，满额即关闭并释放本轮失败结果，要求新连接。响应对象id与response_id矛盾或输出早于身份则关闭记失败；无ID错误/取消确认/keepalive不被当作成功响应。该检查不提供过期索引后的无限期重放识别，不证明容器隔离或执行退出。
 
@@ -131,6 +131,24 @@ CLI监督器不再创建空done文件。每次请求生成32字节随机nonce，
 共享JSON响应器只对显式注册的Codex流式响应转换已经提交的错误，因此覆盖账号权限闭包与外层异常处理。未提交时仍原HTTP状态/JSON；提交后保留错误status与details，Chat发送error后[DONE]，Responses/Anthropic发送event:error；不生成completed/message_stop。429/503重试秒数随error.details返回，避免已发头后setHeader。
 
 本版只抑制慢消费者积压时的额外保活，真实输出仍沿现有写出管线；SSE注释不等于WS保活、模型进度、执行退出或隔离证明。未进行行为验收。
+
+## API工具策略管线（preview.16）
+
+- API类别密钥调用GPT模型进入API端点调度，不再提前进入OAuth/Codex账号池；原平台/分组/租户和密钥限流门仍执行。
+- Chat及Responses工具输入经明确的内部类型进入现有before_upstream、协议拦截、身份及提示词链，保留custom原始字符串、grammar/text格式、选择、function原始arguments和工具结果；输出只从策略处理后的内容构建，不另传原始请求。
+- OpenAI端点恢复对应Responses工具类型；Anthropic端点明确拒绝custom，function原文须可解析成对象。API Responses对旧响应引用、加密reasoning、未知输入/宿主工具等不能表达的内容明确报错，Chat未知音频/文件等不静默丢弃。
+- 已生成的非流式Chat/Responses结果直接按该协议返回，修正外层再次当Anthropic转换导致内容/工具丢失；保留客户端用量隐藏处理，规范function strict不丢失。
+- SSE逐块使用UTF8解码器，避免网络块边界损坏工具原文；完成状态须有类型与状态一致的终止帧，截断不算完整推理，Chat正常终止不重复写[DONE]。
+
+仅API类别密钥的Chat/Responses转换生成内部es2api_custom_tool、es2api_custom_tool_use、es2api_function_tool_use类型。定义及调用原文位于策略可见的tools/messages中；before_upstream删除或修改后，构建上游只采用该处理结果。没有凭原始inbound补回已删除的工具或历史。普通OAuth/Claude转换不启用这些类型。
+
+最终API边界先做常规字段整形，再保留已处理的内部custom定义；仅生成原生OpenAI字段给Responses端点。原生Anthropic端点在forwardApi前拒绝custom，function原文须能解析为对象；allowed_tools等无法对应的约束拒绝而非降级。内部标记不会发给供应商，也不会在服务端执行客户工具。
+
+Responses支持本次完整上下文中的message、function/custom调用及对应字符串输出，并按调用类型和ID核对历史；previous_response_id、加密reasoning、item_reference、未知可见内容或宿主工具定义目前明确api_bridge_responses_input_unsupported。Chat音频/文件等当前无法转换的内容为api_bridge_input_unsupported。常规图片URL/数据可转回OpenAI用户图片；不宣称涵盖所有多模态或图片detail等选项。
+
+function strict、parallel_tool_calls、service_tier和可表达的结构化输出保留；OpenAI端点不再套用Claude工具名重映射。格式/重复调用/不匹配结果在发供应商前拒绝。非流式Chat/Responses结果携带内部协议标记，外层不再重复按Anthropic转换；Completions仍先产生Anthropic消息再转换。
+
+依据 [官方Chat输入/非流式输出](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) 与 [官方Chat流schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events) 核对。流式custom仍明确拒绝，不新造delta字段。API完成日志依赖实际完整终止状态；已知length/content_filter截断可交付Chat，但不算完整推理。保活、EOF、[DONE]或正文中出现response.completed字样均不能单独证明完成。没有行为或真实账号验收。
 
 ## 验收边界
 

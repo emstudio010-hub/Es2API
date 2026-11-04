@@ -56,6 +56,8 @@ import {
   healthUnavailableError,
 } from '../admin/health-probe.mjs'
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
+import { isCodexChatInputError } from './codex-chat-input.mjs'
+import { isApiPolicyInputError } from '../pool/api-policy-tools.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
@@ -746,7 +748,7 @@ export function createHandleProtocol(deps) {
     if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
       return
     }
-    if (platform.platform === 'openai') {
+    if (platform.platform === 'openai' && inferenceBackend !== 'api') {
       const routing = getRouting() || {}
       const codexSticky = {
         streamKeepaliveMs: Number(routing?.failover?.stream_keepalive_ms ?? cfg.limits?.stream_keepalive_ms ?? 10_000),
@@ -818,7 +820,7 @@ export function createHandleProtocol(deps) {
         ...codexSticky,
       })
     }
-    if (protocol === 'openai.responses') {
+    if (protocol === 'openai.responses' && inferenceBackend !== 'api') {
       stats.errors++
       logBag.error_code = 'protocol_not_allowed'
       return json(
@@ -851,12 +853,20 @@ export function createHandleProtocol(deps) {
     const officialInbound =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
-    const converted = toClaudeMessages(protocol, ctx.body, {
+    const apiToolPolicy = inferenceBackend === 'api' && ['openai.chat', 'openai.responses'].includes(protocol)
+    let converted
+    try { converted = toClaudeMessages(protocol, ctx.body, {
       rewrite: rewriteEnabled,
       model_map: false,
       strict_passthrough: String(req.headers['x-kin-strict-passthrough'] || '') === '1',
       preserve_content_shape: officialInbound,
-    })
+      preserve_api_tools: apiToolPolicy,
+    }) } catch (error) {
+      if (!isCodexChatInputError(error) && !isApiPolicyInputError(error)) throw error
+      stats.errors++
+      logBag.error_code = error.code
+      return json(res, 400, { error: { type: 'invalid_request_error', code: error.code, message: error.message } })
+    }
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
     if (converted.mode === 'passthrough') stats.passthrough++
@@ -1098,6 +1108,7 @@ export function createHandleProtocol(deps) {
           personaHideTokens,
           cacheTtl,
           requestContext,
+          apiToolPolicy,
           converters: {
             createClaudeMessageAssembler,
             applyClaudeSSELineToMessage,
@@ -1131,6 +1142,7 @@ export function createHandleProtocol(deps) {
         ? Math.max(0, result.firstTokenAt - logCtx.t0)
         : (result?.ttftMs ?? null)
       logBag.final_state = result?.terminalState || null
+      logBag.inference_completed = result?.ok === true && result?.terminalState === 'verified'
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
@@ -1143,7 +1155,11 @@ export function createHandleProtocol(deps) {
           if (!isClientCancelledResult(result)) stats.errors++
           return sendMapped(res, mapped)
         }
-        if (result?.ok && protocol !== 'anthropic.messages') res.write('data: [DONE]\n\n')
+        if (!result?.ok) {
+          stats.errors++
+          logBag.error_code = result?.body?.error?.code || 'api_upstream_incomplete'
+        }
+        if (result?.ok && protocol !== 'anthropic.messages' && !result.clientStreamTerminated) res.write('data: [DONE]\n\n')
         return res.end()
       }
       if (!result?.ok || isIncompleteAssistantMessage(result)) {
@@ -1154,6 +1170,9 @@ export function createHandleProtocol(deps) {
         return sendMapped(res, mapped)
       }
       let output
+      // OpenAI upstream already shaped this exact client protocol. Converting
+      // it as an Anthropic message again loses tools, text, refusal and usage.
+      if (result.clientBodyProtocol === protocol) return json(res, 200, hidePersonaUsageOnMessage(result.body, personaHideTokens))
       const clientBody = hidePersonaUsageOnMessage(result.body, personaHideTokens)
       if (protocol === 'anthropic.messages') output = clientBody
       else if (protocol === 'openai.chat') output = fromClaudeToOpenAIChat(clientBody, inbound.model)
