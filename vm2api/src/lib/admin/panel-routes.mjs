@@ -5002,7 +5002,7 @@ export function createPanelHandler(ctx) {
             catch { return json(res, 502, { ok: false, error: { code: 'codex_cli_refresh_failed', message: 'CLI OAuth 刷新失败，请检查账号凭据' } }) }
             return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
           }
-          await refreshStoredCodexCredential(cfg.paths.project, id, { proxyUrl: hostProxyUrlForVm(vm) })
+          await refreshStoredCodexCredential(cfg.paths.project, id, { expectedVm: vm })
           return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
         }
         if (isApiKeyMode(vm?.claude?.mode)) {

@@ -45,6 +45,7 @@ import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
 import { withCodexCredentialActivity } from '../oauth/codex-credential-activity.mjs'
+import { codexSlotSnapshot } from '../oauth/codex-slot-snapshot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -1256,20 +1257,23 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
-function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
+async function refreshSearchAccess(projectRoot, vm, usedAccess, { fetchImpl, refresh }) {
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''
-  const refreshKey = `${path.resolve(projectRoot)}\n${vm.id}`
+  const refreshKey = `${path.resolve(projectRoot)}\n${vm.id}\n${codexSlotSnapshot(vm)}`
   let pending = searchRefreshes.get(refreshKey)
   if (!pending) {
     pending = (async () => {
       try {
         const account = await refreshStoredCodexCredential(projectRoot, vm.id, {
-          previous: now.first, usedAccess, refresh, proxyUrl, fetchImpl,
+          previous: now.first, usedAccess, expectedVm: vm, refresh, fetchImpl,
         })
         return account.access_token
-      } catch { return '' }
+      } catch (error) {
+        if (/^(?:codex_[a-z_]+|provider_identity_[a-z_]+|vm2_credential_binding_mismatch)$/.test(error?.code || '')) throw error
+        return ''
+      }
     })().finally(() => searchRefreshes.delete(refreshKey))
     searchRefreshes.set(refreshKey, pending)
   }
@@ -1329,8 +1333,12 @@ async function postCodexJson({
     error: error.code || 'codex_metadata_unavailable', admission_rejected: true }))
   let out = await send()
   if (out.status === 401 || out.status === 403) {
-    const access = await refreshSearchAccess(projectRoot, attemptVm, creds.access, { proxyUrl: hostProxyUrlForVm(attemptVm), fetchImpl, refresh })
-    if (access) out = await send()
+    try {
+      const access = await refreshSearchAccess(projectRoot, attemptVm, creds.access, { fetchImpl, refresh })
+      if (access) out = await send()
+    } catch (error) {
+      return { status: Number(error.status) || 409, error: error.code || 'codex_metadata_unavailable', admission_rejected: true }
+    }
   }
   return out
 }

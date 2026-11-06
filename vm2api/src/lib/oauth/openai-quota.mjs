@@ -302,7 +302,7 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
   if (!slot.refresh) return slot
   try {
     const account = await refreshStoredCodexCredential(projectRoot, vmId, { previous: slot.first,
-      usedAccess: slot.access, proxyUrl: slot.proxyUrl, fetchImpl, timeoutMs: OPENAI_QUOTA_TIMEOUT_MS })
+      usedAccess: slot.access, expectedVm: slot.vm, fetchImpl, timeoutMs: OPENAI_QUOTA_TIMEOUT_MS })
     return { ...slot, access: account.access_token, refresh: account.refresh_token }
   } catch { return { ...slot, rotateError: 'refresh_failed' } }
 }

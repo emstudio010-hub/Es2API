@@ -209,7 +209,7 @@ export async function syncCodexCatalog({
         let saved
         try {
           saved = await refreshStoredCodexCredential(projectRoot, target.id, {
-            previous: account, usedAccess: access, proxyUrl, fetchImpl,
+            previous: account, usedAccess: access, expectedVm: target, fetchImpl,
           })
         } catch {
           lastError = {
@@ -1101,7 +1101,7 @@ export async function runVmTestChat(opts = {}) {
         let refreshed = false
         try {
           await refreshStoredCodexCredential(projectRoot, vmId, { previous: first,
-            proxyUrl: hostProxyUrlForVm(vm), fetchImpl: opts.fetchImpl })
+            expectedVm: vm, fetchImpl: opts.fetchImpl })
           refreshed = true
         } catch { push('error', 'Codex OAuth 刷新失败或实例正在交接') }
         if (refreshed) {

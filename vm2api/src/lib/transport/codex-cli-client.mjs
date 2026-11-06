@@ -11,6 +11,7 @@ import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { withCodexCredentialLock, assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
 import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
+import { codexSlotSnapshot, readCodexSlotSnapshot } from '../oauth/codex-slot-snapshot.mjs'
 import { verifyCodexProviderIdentity } from '../oauth/codex-provider-identity.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { CODEX_CLI_CONTAINER_BIN, CODEX_CLI_VERSION, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
@@ -138,8 +139,10 @@ export const ensureCodexCli = codexCliHealth
 // The request copy deliberately has no rotating refresh token. Refresh is owned by
 // the control plane, never concurrently by an ephemeral CLI and the quota worker.
 export async function refreshCliCredential(projectRoot, vm, { force = false, deadline = Infinity, signal } = {}) {
-  if (!supported({ vm })) throw Object.assign(new Error('CLI 固定出口不可用，已停止刷新'), { code: 'codex_cli_proxy_required' })
+  const expected = codexSlotSnapshot(vm)
   return withCodexCredentialLock(projectRoot, vm.id, async () => {
+    const current = readCodexSlotSnapshot(projectRoot, vm.id, expected)
+    if (!supported({ vm: current })) throw Object.assign(new Error('CLI 固定出口不可用，已停止刷新'), { code: 'codex_cli_proxy_required' })
     if (signal?.aborted) throw Object.assign(new Error('CLI 请求已取消，未开始刷新'), { code: 'codex_cli_cancelled' })
     if (Date.now() >= deadline) throw Object.assign(new Error('CLI 执行预算已用尽，未开始刷新'), { code: 'codex_cli_timeout' })
     const accounts = readCodexAccounts(projectRoot, vm.id)
@@ -148,9 +151,10 @@ export async function refreshCliCredential(projectRoot, vm, { force = false, dea
     if (force || needsAccessRefresh(account)) {
       if (!account.refresh_token) throw Object.assign(new Error('OAuth 需要刷新；请重新导入含刷新令牌的凭据'), { code: 'codex_cli_refresh_required' })
       account = await refreshStoredCodexCredential(projectRoot, vm.id, { previous: account,
-        proxyUrl: hostProxyUrlForVm(vm), signal, deadline, timeoutMs: Math.max(1, Math.min(15000, deadline - Date.now())) })
+        expectedVm: current, signal, deadline, timeoutMs: Math.max(1, Math.min(15000, deadline - Date.now())) })
     }
     await verifyCodexProviderIdentity(account)
+    readCodexSlotSnapshot(projectRoot, vm.id, expected)
     if (!account.id_token || !account.chatgpt_account_id) throw Object.assign(new Error('Codex CLI 需要 id_token 与 ChatGPT account ID，请补全 OAuth 文件'), { code: 'codex_cli_identity_required' })
     return account
   })
