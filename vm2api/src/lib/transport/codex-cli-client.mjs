@@ -21,6 +21,7 @@ import { claimCodexCliRequest, hasCodexCliClaim } from './codex-cli-claim.mjs'
 import { withCodexSlotActivity } from '../vm/codex-slot-coordination.mjs'
 import { codexCliLaunchArgs } from './codex-cli-launch.mjs'
 import { isCodexCliMetadataWarning, classifyCodexCliDiagnostic, codexCliFailureMessage } from './codex-cli-diagnostics.mjs'
+import { inspectCodexCliEgress } from '../vm/codex-cli-egress-health.mjs'
 
 const runFile = promisify(execFile)
 const TIMEOUT_MS = 300000
@@ -110,6 +111,8 @@ export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
   catch (error) { return { ok: false, reachable: false, status: 409, code: error.code || 'codex_credential_unavailable' } }
   const payload = inspectCodexCliPayload()
   if (!payload.ok) return { ok: false, reachable: false, code: payload.code }
+  const egress = await inspectCodexCliEgress(projectOf(exec), exec.vm, { timeoutMs })
+  if (!egress.ok) return egress
   const accounts = readCodexAccounts(projectOf(exec), exec.vm.id)
   if (accounts.length !== 1 || !accounts[0].id_token || !accounts[0].chatgpt_account_id || (!accounts[0].access_token && !accounts[0].refresh_token)) return { ok: false, reachable: false, code: 'codex_cli_identity_required', status: 503 }
   if (needsAccessRefresh(accounts[0]) && !accounts[0].refresh_token) return { ok: false, reachable: false, code: 'codex_cli_refresh_required', status: 503 }
@@ -126,7 +129,7 @@ export async function codexCliHealth(exec, { timeoutMs = 5000 } = {}) {
     // sending inference. A version-only check misses bootstrap config errors.
     const bootstrap = await runFile('docker', slotExecArgv(exec.vm, [CODEX_CLI_CONTAINER_BIN, ...codexCliLaunchArgs(), 'features', 'list'], { user: slotHost(exec.vm).execUser(exec.vm) }), { timeout: timeoutMs, maxBuffer: 32768, windowsHide: true })
     const ok = /^unbounded_connection_retries\s+\S+(?:\s+\S+)*\s+false\s*$/m.test(bootstrap.stdout)
-    return { ok, reachable: ok, status: ok ? 200 : 503, code: ok ? null : 'codex_cli_launch_config_invalid', ...(ok ? { version: CODEX_CLI_VERSION } : {}), backend: 'codex-cli' }
+    return { ok, reachable: ok, status: ok ? 200 : 503, code: ok ? null : 'codex_cli_launch_config_invalid', ...(ok ? { version: CODEX_CLI_VERSION, egress } : {}), backend: 'codex-cli' }
   } catch { return { ok: false, reachable: false, code: 'codex_cli_not_ready', status: 503 } }
 }
 
@@ -318,6 +321,8 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
   const abort = () => cancel('client_cancelled')
   signal?.addEventListener('abort', abort, { once: true })
   try {
+    const egress = await inspectCodexCliEgress(projectOf(exec), exec.vm, { timeoutMs: Math.min(4000, deadline - Date.now()) })
+    if (!egress.ok) return errorResult(503, egress.code, codexCliFailureMessage(egress.code))
     const account = await refreshCliCredential(projectOf(exec), exec.vm, { deadline, signal })
     if (signal?.aborted) return errorResult(499, 'client_cancelled', '请求已取消')
     fs.mkdirSync(dir, { mode: 0o700 })

@@ -26,6 +26,9 @@ export function classifyCodexCliDiagnostic(value) {
 }
 
 export function codexCliFailureMessage(code) {
+  if (/^codex_cli_egress_(?:unsupported|inspection_unavailable|slot_network_mismatch|network_policy_mismatch|process_unavailable|config_mismatch|listener_unavailable|rules_mismatch)$/.test(code || '')) {
+    return 'CLI 固定出口的本地网络配置未通过检查，请在实例中检查出口；未启动模型请求'
+  }
   return ({
     codex_cli_model_rerouted: '上游报告模型被切换，本次请求已停止；未自动重试',
     codex_cli_launch_config_invalid: 'Codex 启动配置无效，请更新执行实例；未自动重试',
