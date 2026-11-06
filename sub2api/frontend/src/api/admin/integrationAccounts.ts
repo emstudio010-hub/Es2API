@@ -54,6 +54,8 @@ export interface IntegrationAccount {
     status?: string
     ready: boolean
     credential_refresh_pending?: boolean
+    credential_refresh_state?: 'none' | 'prepared' | 'received' | 'incomplete' | 'unreadable' | 'unknown'
+    credential_refresh_recovery_available?: boolean
     health?: { ok: boolean | null; code?: string | null; checked_at?: string | null }
     egress?: { bound: boolean; proxy_id: string | null; timezone?: string | null }
     isolation?: { account_id: string | null; generation: number | null; runtime_type: string | null; container: string | null; identity_policy: string | null }

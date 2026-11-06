@@ -214,12 +214,16 @@ export function normalizeVmStatus(payload = {}) {
   const proxy = asRecord(vm.proxy ?? raw.proxy ?? raw.data?.proxy)
   const allocatedProxy = raw.allocated_proxy ?? raw.data?.allocated_proxy
   const refreshPending = vm.credential_refresh_pending === true
+  const refreshState = !refreshPending ? 'none'
+    : ['prepared', 'received', 'incomplete', 'unreadable'].includes(vm.credential_refresh_state) ? vm.credential_refresh_state : 'unknown'
   return {
     id,
     status,
     execution_backend: vm.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
     ready: status === 'running' && healthOk !== false && !refreshPending,
     credential_refresh_pending: refreshPending,
+    credential_refresh_state: refreshState,
+    credential_refresh_recovery_available: refreshPending && refreshState === 'received' && vm.credential_refresh_recovery_available === true,
     schedulable: vm.schedulable === true,
     isolation: {
       account_id: optionalString(vm.integration_binding?.account_id),

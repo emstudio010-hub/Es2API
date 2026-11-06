@@ -16,6 +16,19 @@ preview.29要求宿主刷新携带原调用的槽快照，在控制锁内、停�
 
 ## 未确认状态
 
+### 换票记录分级
+
+管理摘要增加 `credential_refresh_state` 与 `credential_refresh_recovery_available`，只返回固定枚举和布尔值，不返回日志、令牌、身份摘要或密钥。状态读取只检查本机加密记录，不换票、不验签或请求公开JWKS。
+
+- `none`：当前未发现待确认记录。
+- `prepared`：只保存意图，结果未知。无法判断供应商是否消费旧RT，不展示恢复按钮；明确拒绝并保留所有记录。
+- `received`：已保存成功且含access token的响应，允许尝试校验与恢复。仍需签名、原身份、完整凭据和槽快照检查，不能据此保证恢复成功或当前账号权限。
+- `incomplete`：已保存响应但不满足恢复候选条件，不展示恢复按钮。
+- `unreadable`：存储、密钥、解密或记录格式不可用，保持待确认与不可调度。
+- `unknown`：integration收到旧版或无法识别的待确认摘要；先同步状态，不把缺失字段当恢复许可。
+
+工作区按状态给出下一步；恢复API在停止Kernel前拒绝prepared和不完整响应，绕过UI直接提交也不会再次换票。页面和integration缓存可能过时，实际恢复仍以VM2控制锁内读取为准。当前仍没有用新OAuth替换未知结果的入口；重新授权后的显式凭据处置、保存原日志与新旧凭据的崩溃一致性仍待实现，不能引导用户直接重新导入覆盖。
+
 pending 跨进程重启保留。正常凭据读取、刷新、CLI/Kernel启动、凭据覆盖/清除、checkpoint与删除会拒绝；管理摘要仍可读，增加 `credential_refresh_pending` 布尔字段。允许停止实例；停止后恢复不会解除停止标记，需随后显式启动。
 
 本机管理员可调用 `POST /api/panel/vms/:id/oauth/recover`。该入口仍取得同一控制锁并排空/停止 Kernel，只读取已加密保存的响应，重新验签及比较后提交或确认已经完成的提交；**不再次请求 OAuth，不调用模型**。验签可能只获取公开 JWKS。响应仅返回 recovered 与 oauth_exchange_performed=false，不返回 token、日志正文或磁盘路径。

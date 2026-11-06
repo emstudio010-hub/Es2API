@@ -46,7 +46,18 @@ let disposed = false
 let debounceTimer: ReturnType<typeof setTimeout> | undefined
 let refreshTimer: ReturnType<typeof setTimeout> | undefined
 function lifecycleLocked(account: IntegrationAccount) { return account.deletion_pending || ['provisioning', 'deleting'].includes(account.status) }
-function refreshPending(account: IntegrationAccount) { return account.slot?.credential_refresh_pending === true || account.error?.code === 'codex_refresh_recovery_required' }
+function refreshPending(account: IntegrationAccount) {
+  return account.slot?.credential_refresh_pending === true || ['codex_refresh_recovery_required', 'codex_refresh_outcome_unknown',
+    'codex_refresh_response_incomplete', 'codex_refresh_storage_unavailable'].includes(account.error?.code || '')
+}
+function refreshRecoveryAvailable(account: IntegrationAccount) {
+  return account.slot?.credential_refresh_state === 'received' && account.slot.credential_refresh_recovery_available === true
+}
+function refreshHint(account: IntegrationAccount) {
+  const state = account.slot?.credential_refresh_state
+  return state === 'prepared' ? 'refreshPreparedHint' : state === 'incomplete' ? 'refreshIncompleteHint'
+    : state === 'unreadable' ? 'refreshUnreadableHint' : refreshRecoveryAvailable(account) ? 'refreshPendingHint' : 'refreshUnknownHint'
+}
 function stateCheckedAt(account: IntegrationAccount) {
   const at = account.dispatch.last_health_check_at
   return at ? new Date(at).toLocaleString() : t('admin.accountPool.notSynced')
@@ -58,7 +69,7 @@ function visibleActions(account: IntegrationAccount): IntegrationAccountAction[]
   return ['sync', ...power, ...((account.slot_binding_stale || ['error', 'provisioning'].includes(account.status)) ? ['retry' as const] : []), 'delete']
 }
 function canRun(account: IntegrationAccount, action: IntegrationAccountAction) {
-  if (action === 'recover-credential') return !!props.workspaceId && !!account.vm_id && refreshPending(account) && account.dispatch.inflight_requests === 0 && !['provisioning', 'deleting'].includes(account.status) && !account.binding.credential_handoff
+  if (action === 'recover-credential') return !!props.workspaceId && !!account.vm_id && refreshPending(account) && refreshRecoveryAvailable(account) && account.dispatch.inflight_requests === 0 && !['provisioning', 'deleting'].includes(account.status) && !account.binding.credential_handoff
   if (action === 'sync') return !!account.vm_id && !['provisioning', 'deleting'].includes(account.status)
   if (refreshPending(account) && action !== 'stop') return false
   if (['start', 'stop', 'recover'].includes(action)) return !!account.vm_id && !lifecycleLocked(account) && (action === 'stop' || !account.slot_binding_stale) && (action !== 'start' || account.dispatch.inflight_requests === 0)
@@ -178,11 +189,11 @@ onBeforeUnmount(() => { disposed = true; ++loadGeneration; clearTimeout(debounce
       <template #table>
         <section v-if="workspaceId && accounts[0]" class="mb-4 rounded-xl border p-4" :class="refreshPending(accounts[0]) ? 'border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-700 dark:bg-amber-950/20 dark:text-amber-100' : 'border-gray-200 dark:border-dark-600'" :aria-label="t('admin.accountPool.credentialState')">
           <h2 class="text-sm font-semibold">{{ t(refreshPending(accounts[0]) ? 'admin.accountPool.refreshPending' : 'admin.accountPool.credentialState') }}</h2>
-          <p v-if="refreshPending(accounts[0])" class="mt-2 max-w-3xl text-pretty text-sm">{{ t('admin.accountPool.refreshPendingHint') }}</p>
+          <p v-if="refreshPending(accounts[0])" class="mt-2 max-w-3xl text-pretty text-sm" role="status">{{ t(`admin.accountPool.${refreshHint(accounts[0])}`) }}</p>
           <p class="mt-2 text-xs text-gray-600 dark:text-gray-300">{{ t('admin.accountPool.stateSnapshot', { time: stateCheckedAt(accounts[0]) }) }}</p>
           <div class="mt-3 flex flex-wrap gap-2">
             <button type="button" class="btn btn-secondary btn-sm" :disabled="!!runningAction || loading || !canRun(accounts[0], 'sync')" @click="confirmation = { account: accounts[0], action: 'sync' }">{{ t('admin.accountPool.sync') }}</button>
-            <button v-if="refreshPending(accounts[0])" type="button" class="btn btn-primary btn-sm" :disabled="!!runningAction || loading || !canRun(accounts[0], 'recover-credential')" @click="confirmation = { account: accounts[0], action: 'recover-credential' }">{{ t('admin.accountPool.recover-credential') }}</button>
+            <button v-if="refreshPending(accounts[0]) && refreshRecoveryAvailable(accounts[0])" type="button" class="btn btn-primary btn-sm" :disabled="!!runningAction || loading || !canRun(accounts[0], 'recover-credential')" @click="confirmation = { account: accounts[0], action: 'recover-credential' }">{{ t('admin.accountPool.recover-credential') }}</button>
           </div>
           <p v-if="refreshPending(accounts[0]) && (accounts[0].dispatch.inflight_requests > 0 || accounts[0].binding.credential_handoff)" class="mt-2 text-xs">{{ t('admin.accountPool.credentialRecoveryBlocked') }}</p>
         </section>

@@ -1,8 +1,12 @@
 export default {
   accountPool: {
     start: '启动实例', stop: '停止实例', recover: '恢复实例', stopped: '已停止', actionQueued: '操作已提交，页面将自动刷新处理结果；请以最终状态为准。',
-    'recover-credential': '恢复已保存凭据', credentialState: '凭据恢复状态', refreshPending: '刷新结果待恢复',
+    'recover-credential': '校验并恢复凭据', credentialState: '凭据恢复状态', refreshPending: '刷新结果待确认',
     refreshPendingHint: '上次 OAuth 刷新结果尚待确认，调度已暂停。恢复只处理本机已保存的响应，不重新换票或调用模型。记录不完整或身份不一致时会保留记录并拒绝恢复。',
+    refreshPreparedHint: '未保存可恢复的换票响应，无法确认刷新令牌是否已被消费。调度保持暂停，原凭据和日志均保留。请保留备份并由管理员结合重新授权处理；当前没有强制解锁或替换入口，不要删除日志或再次使用旧刷新令牌。',
+    refreshIncompleteHint: '已保存的换票响应不完整，当前无法恢复。调度保持暂停，原凭据和响应记录均保留；请由管理员核查，不要再次换票或覆盖记录。',
+    refreshUnreadableHint: '换票记录无法读取或解密。请检查私密存储、权限和原加密密钥后同步状态；不要更换密钥、删除日志或重新导入覆盖凭据。',
+    refreshUnknownHint: '当前快照未能区分换票结果。请先同步状态；只有确认已保存完整响应后，才会显示校验与恢复入口。调度保持暂停。',
     stateSnapshot: '状态以最近同步为准：{time}。点击“同步状态”重新读取实例。', notSynced: '尚未同步',
     credentialRecoveryBlocked: '请先等待在途请求和凭据交接结束，再处理恢复。',
     confirmRecoverCredential: '校验该账号、实例代次、固定出口及原身份，排空请求并停止 Kernel 后，只提交已保存的刷新响应。成功后仍暂停调度；不会重新换票、调用模型或自动启动实例。不完整或冲突记录将保留，需进一步处理。',

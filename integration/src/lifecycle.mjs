@@ -196,6 +196,10 @@ export class AccountLifecycle {
     const before = await this.vm2.getSlot(vmId)
     assertSlot(binding, vmId, before)
     if (before.credential_refresh_pending !== true) throw Object.assign(new Error('当前执行槽没有待恢复刷新记录，请同步状态后检查'), { status: 409, code: 'codex_refresh_not_pending' })
+    if (before.credential_refresh_recovery_available !== true) throw Object.assign(new Error('尚未确认存在完整换票响应，未执行凭据恢复或重试换票；原记录已保留，请检查账号池状态'), {
+      status: 409, code: before.credential_refresh_state === 'prepared' ? 'codex_refresh_outcome_unknown'
+        : before.credential_refresh_state === 'incomplete' ? 'codex_refresh_response_incomplete' : 'codex_refresh_recovery_required',
+    })
     await this.vm2.recoverCredential(vmId, credentialBinding(binding), identityKey)
     const status = await this.vm2.getSlot(vmId)
     assertSlot(binding, vmId, status)

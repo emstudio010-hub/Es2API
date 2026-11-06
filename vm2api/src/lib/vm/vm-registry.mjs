@@ -107,6 +107,8 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
     credential_refresh_pending: kind.kind === 'codex' ? codex?.credential_refresh_pending === true : false,
+    credential_refresh_state: kind.kind === 'codex' ? codex?.credential_refresh_state || 'unknown' : 'none',
+    credential_refresh_recovery_available: kind.kind === 'codex' && codex?.credential_refresh_recovery_available === true,
     refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
     account_tier:
       kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || (hasAccessPresence(vm.claude) ? 'pro' : null),

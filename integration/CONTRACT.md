@@ -177,3 +177,6 @@ preview.28将宿主目录、配额/重置券、搜索/图片JSON请求及配额�
 恢复调用携带当前账号binding（canonical槽、账号、代次、独占固定代理、后端）与控制面原身份索引，VM2同控制锁内核对binding与日志身份；响应账号/代次来自锁内记录。仅处理已保存响应，无新换票或推理。成功保持调度暂停，不启动实例，不清理deletion_pending/slot_binding_stale；prepared、不完整、身份/快照不符继续保留并拒绝。无pending时拒绝，不重放。恢复接口不返回token、日志或身份索引。ifMissing导入已有槽也比较双方历史签名身份而非workspace提示。
 
 凭据、运行控制与完整恢复使用同一Linux flock控制作用域；Kernel/CLI宿主请求持共享活动锁，停止确认等待跨进程finalizer排空。争用失败保留原状态，不按PID/TTL清除claim或重放调用。所有控制进程需同时升级，锁文件不得删除。详见 [实例协调](../docs/SLOT_COORDINATION.md)。仅静态核对，未进行多进程、崩溃或真实账号行为验收。
+## 换票结果分级补充
+
+执行槽摘要保留 `credential_refresh_pending`，增加固定状态 `credential_refresh_state`（none/prepared/received/incomplete/unreadable/unknown）和 `credential_refresh_recovery_available`。只有pending、received且VM2显式允许时才可请求校验恢复；字段缺失归为unknown并拒绝恢复，不提高就绪或调度权限。integration先按缓存拒绝明确不可恢复状态，执行前重新读取VM2；最终VM2控制锁内仍重新检查响应、身份及槽快照。未知/不完整/不可读记录保留，状态查询不换票、推理或获取JWKS。新OAuth替换未知结果的处置入口尚未实现。

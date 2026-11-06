@@ -9,7 +9,7 @@ import { buildCodexUsageView, extraToCodexSnapshot, hasSpendableCodexCredits } f
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
 import { selectOAuthCredential } from '../oauth/credential-import.mjs'
 import { assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
-import { assertNoPendingCodexRefresh } from '../oauth/codex-refresh-journal.mjs'
+import { assertNoPendingCodexRefresh, codexRefreshStatus } from '../oauth/codex-refresh-journal.mjs'
 
 export { isCodexVm }
 
@@ -298,8 +298,8 @@ export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredi
 
 export function summarizeCodexSlot(projectRoot, vm = {}) {
   const accounts = projectRoot && vm?.id ? readCodexAccounts(projectRoot, vm.id, { allowPendingRefresh: true }) : []
-  let refreshPending = false
-  if (projectRoot && vm?.id) { try { assertNoPendingCodexRefresh(projectRoot, vm.id) } catch { refreshPending = true } }
+  const refresh = projectRoot && vm?.id ? codexRefreshStatus(projectRoot, vm.id)
+    : { pending: false, state: 'none', recovery_available: false }
   const first = enrichCodexAccountIdentity(accounts[0] || {})
   const extra = vm.codex?.extra || vm.codex_extra || {}
   // extra is the source of truth; the stored view is only a fallback for slots without extra.
@@ -317,7 +317,9 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     chatgpt_subscription_active_until: first.chatgpt_subscription_active_until || null,
     chatgpt_plan_type: first.chatgpt_plan_type || null,
     account_count: accounts.length,
-    credential_refresh_pending: refreshPending,
+    credential_refresh_pending: refresh.pending,
+    credential_refresh_state: refresh.state,
+    credential_refresh_recovery_available: refresh.recovery_available,
     usage,
     reset_credits: vm.codex?.reset_credits || null,
     credits: vm.codex?.credits || null,

@@ -14,6 +14,14 @@ function publicError(error, credential) {
   return { code: String(error?.code || 'lifecycle_failed').slice(0, 80), message }
 }
 
+function pendingRefreshMessage(slot) {
+  if (slot?.credential_refresh_state === 'prepared') return '换票结果未知且未保存可恢复响应；调度已暂停，凭据和日志保留，请由管理员处理'
+  if (slot?.credential_refresh_state === 'incomplete') return '保存的换票响应不完整；调度已暂停，未覆盖原凭据或重试换票'
+  if (slot?.credential_refresh_state === 'unreadable') return '换票记录无法读取；调度已暂停，请检查私密存储和原加密密钥'
+  return slot?.credential_refresh_recovery_available === true ? '已保存换票响应，请在工作区校验并恢复；调度已暂停'
+    : '换票状态尚未确认；调度已暂停，请同步状态并检查记录'
+}
+
 function assertInteger(value, field, min, max) {
   if (!Number.isInteger(value) || value < min || value > max) throw Object.assign(new Error(`${field} 超出范围`), { status: 400, code: 'invalid_field' })
 }
@@ -486,7 +494,7 @@ export class AccountPool {
         return this.store.updateAccount(id, {
           status: status.status === 'stopped' ? 'stopped' : ready ? 'ready' : 'error', schedulable, slot_json: status,
           last_health_check_at: new Date().toISOString(), error_code: status.credential_refresh_pending ? 'codex_refresh_recovery_required' : ready || status.status === 'stopped' ? null : 'slot_not_ready',
-          error_message: status.credential_refresh_pending ? 'OAuth 刷新结果待确认，请在工作区恢复已保存凭据；调度已暂停' : ready || status.status === 'stopped' ? null : '执行槽健康检查未通过',
+          error_message: status.credential_refresh_pending ? pendingRefreshMessage(status) : ready || status.status === 'stopped' ? null : '执行槽健康检查未通过',
         })
       } catch (error) {
         const safe = publicError(error)
@@ -531,6 +539,11 @@ export class AccountPool {
     if (!account) throw Object.assign(new Error('账号不存在'), { status: 404, code: 'account_not_found' })
     if (!account.vm_id || ['provisioning', 'deleting'].includes(account.status) || account.binding?.credential_handoff) throw Object.assign(new Error('生命周期尚未完成，无法恢复刷新凭据'), { status: 409, code: 'slot_not_available' })
     if (account.dispatch.inflight_requests > 0) throw Object.assign(new Error('仍有在途请求，请等待结束后恢复凭据'), { status: 409, code: 'account_busy' })
+    if (account.slot?.credential_refresh_pending && account.slot.credential_refresh_recovery_available !== true) {
+      throw Object.assign(new Error(pendingRefreshMessage(account.slot)), { status: 409,
+        code: account.slot.credential_refresh_state === 'prepared' ? 'codex_refresh_outcome_unknown'
+          : account.slot.credential_refresh_state === 'incomplete' ? 'codex_refresh_response_incomplete' : 'codex_refresh_recovery_required' })
+    }
     const identity = this.store.providerIdentityKey(id)
     if (!identity) throw Object.assign(new Error('原供应商账号身份尚未确认，未恢复凭据'), { status: 409, code: 'provider_identity_proof_required' })
     this.store.updateAccount(id, { status: 'provisioning', schedulable: false, group_pause_restore: false, error_code: null, error_message: null })

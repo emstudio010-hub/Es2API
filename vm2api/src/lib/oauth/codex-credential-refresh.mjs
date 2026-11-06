@@ -6,7 +6,7 @@ import { readCodexAccountsStrict, writeCodexAccounts, enrichCodexAccountIdentity
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { withCodexKernelCredentialOwner } from './codex-kernel-credential-owner.mjs'
 import { verifyCodexProviderIdentity } from './codex-provider-identity.mjs'
-import { beginCodexRefresh, captureCodexRefresh, readPendingCodexRefresh, commitCodexRefresh } from './codex-refresh-journal.mjs'
+import { beginCodexRefresh, captureCodexRefresh, readPendingCodexRefresh, commitCodexRefresh, assertCodexRefreshResponseRecoverable } from './codex-refresh-journal.mjs'
 import { codexSlotSnapshot, readCodexSlotSnapshot } from './codex-slot-snapshot.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
@@ -30,6 +30,7 @@ function candidate(account, token) {
     expires_at: token.expires_at || account.expires_at })
 }
 async function finish(projectRoot, vmId, session, expectedIdentity = null) {
+  assertCodexRefreshResponseRecoverable(session)
   const data = session.data
   // Older encrypted journals retain their original binding rule. New journals
   // additionally bind the route credentials, placement and instance identity.
@@ -102,6 +103,8 @@ export function recoverStoredCodexRefresh(projectRoot, vmId, { expectedBinding =
       if (!/^[a-f0-9]{64}$/.test(expectedIdentity || '')) throw Object.assign(new Error('独立账号池恢复必须核对控制面身份索引'), { status: 409, code: 'provider_identity_proof_required' })
     }
     const session = readPendingCodexRefresh(projectRoot, vmId)
+    // Reject unknown/incomplete outcomes before pausing or stopping a Kernel.
+    assertCodexRefreshResponseRecoverable(session)
     if (Object.hasOwn(session.data, 'slot_snapshot')) readCodexSlotSnapshot(projectRoot, vmId, session.data.slot_snapshot)
     return withCodexKernelCredentialOwner(projectRoot, vmId, async () => {
       await finish(projectRoot, vmId, session, expectedIdentity)

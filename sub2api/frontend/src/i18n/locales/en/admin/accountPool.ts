@@ -1,8 +1,12 @@
 export default {
   accountPool: {
     start: 'Start instance', stop: 'Stop instance', recover: 'Recover instance', stopped: 'Stopped', actionQueued: 'Action accepted. The page will refresh the result; check the final status.',
-    'recover-credential': 'Recover saved credentials', credentialState: 'Credential recovery status', refreshPending: 'Refresh result needs recovery',
+    'recover-credential': 'Verify and recover credentials', credentialState: 'Credential recovery status', refreshPending: 'Refresh result unconfirmed',
     refreshPendingHint: 'The previous OAuth refresh is unconfirmed and scheduling is paused. Recovery only processes a response saved on this host, with no new token exchange or model call. Incomplete records or identity conflicts are retained and recovery is refused.',
+    refreshPreparedHint: 'No recoverable refresh response was saved, so the old refresh token may have been consumed. Scheduling stays paused and all credentials and records are retained. Preserve the backup for an administrator to review alongside a fresh authorization. Forced unlock and replacement are not available; do not delete the record or reuse the old refresh token.',
+    refreshIncompleteHint: 'The saved refresh response is incomplete and cannot be recovered here. Scheduling stays paused and the original credentials and response are retained. Ask an administrator to review them; do not exchange again or overwrite the records.',
+    refreshUnreadableHint: 'The refresh record cannot be read or decrypted. Check private storage, permissions and the original encryption key, then sync status. Do not change the key, delete the record or overwrite credentials by importing again.',
+    refreshUnknownHint: 'This snapshot does not identify the refresh outcome. Sync status first. Verification and recovery become available only after a complete saved response is confirmed. Scheduling stays paused.',
     stateSnapshot: 'Last synchronized state: {time}. Use Sync status to read the instance again.', notSynced: 'Not synchronized yet',
     credentialRecoveryBlocked: 'Wait for active requests and credential handoff to finish before recovery.',
     confirmRecoverCredential: 'Check this account, instance generation, fixed egress and original identity, drain requests and stop the Kernel, then commit only the saved refresh response. Scheduling stays paused, with no new token exchange, model call or automatic instance start. Incomplete or conflicting records are retained for further handling.',
