@@ -18,6 +18,7 @@ import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot, readCodexAccounts } from '../vm/codex-slot.mjs'
 import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
+import { withCodexCredentialActivity, assertCodexCredentialSnapshot } from '../oauth/codex-credential-activity.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
@@ -188,18 +189,21 @@ export async function syncCodexCatalog({
     const accounts = readCodexAccounts(projectRoot, target.id)
     const rows = accounts.length ? accounts : [target.codex || {}]
     for (const account of rows) {
+      let selected = account
       let access = account.access_token || target.codex?.access_token
       const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
       const refreshToken = account.refresh_token || target.codex?.refresh_token
-      const fetchOnce = () =>
-        fetchChatgptModelCatalog({
+      const fetchOnce = () => withCodexCredentialActivity(projectRoot, target.id, currentVm => {
+        assertCodexCredentialSnapshot(projectRoot, target.id, selected, currentVm.codex)
+        return fetchChatgptModelCatalog({
           accessToken: access,
           accountId,
-          proxyUrl,
+          proxyUrl: hostProxyUrlForVm(currentVm),
           fetchImpl,
-          direct,
+          direct: isLocalEgressProxy(currentVm.proxy),
           catalogVersion: catalogVersion.version,
         })
+      }, { expectedVm: target }).catch(error => ({ ok: false, error: error.code || 'codex_metadata_unavailable' }))
       let live = await fetchOnce()
       if (live.error === 'upstream_auth' && rotate && refreshToken) {
         let saved
@@ -217,6 +221,7 @@ export async function syncCodexCatalog({
           continue
         }
         access = saved.access_token
+        selected = saved
         live = await fetchOnce()
       }
       if (!live.ok || !live.ids?.length) {

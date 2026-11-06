@@ -12,6 +12,7 @@ import { readCodexAccounts, persistCodexQuotaSnapshot } from '../vm/codex-slot.m
 import { isCodexCliVm } from '../vm/codex-cli-config.mjs'
 import { refreshCliCredential } from '../transport/codex-cli-client.mjs'
 import { refreshStoredCodexCredential } from './codex-credential-refresh.mjs'
+import { withCodexCredentialActivity, assertCodexCredentialSnapshot } from './codex-credential-activity.mjs'
 import {
   buildCodexUsageView,
   extraToCodexSnapshot,
@@ -242,13 +243,13 @@ function fail(code, message, status = 400, extra = {}) {
   return { ok: false, error: code, message, status, ...extra }
 }
 
-async function loadSlot(projectRoot, vmId) {
-  const vm = getVm(projectRoot, vmId)
+async function loadSlot(projectRoot, vmId, currentVm = null) {
+  const vm = currentVm || getVm(projectRoot, vmId)
   if (!vm) return { ok: false, error: 'vm_not_found', message: 'VM not found', status: 404 }
   if (!isCodexVm(vm)) {
     return { ok: false, error: 'not_gpt_slot', message: '只有 GPT 槽支持重置券', status: 400 }
   }
-  const first = readCodexAccounts(projectRoot, vmId)[0] || {}
+  const first = readCodexAccounts(projectRoot, vmId)[0] || vm.codex || {}
   const access = firstString(first.access_token, vm.codex?.access_token)
   const refresh = firstString(first.refresh_token, vm.codex?.refresh_token)
   if (!access && !refresh) {
@@ -326,7 +327,11 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
   let current = slot
   const headersOf = (access) => buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId })
 
-  const run = async (access) => {
+  const run = () => withCodexCredentialActivity(projectRoot, vmId, async vm => {
+    current = await loadSlot(projectRoot, vmId, vm)
+    if (!current.ok) return current
+    if (!current.proxyUrl && !fetchImpl && !current.direct) return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
+    const access = current.access
     const usage = await quotaFetch(CHATGPT_USAGE_URL, {
       headers: headersOf(access),
       proxyUrl: current.proxyUrl,
@@ -349,15 +354,15 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
       direct: current.direct,
     })
     return { usage, details }
-  }
+  }, { expectedVm: slot.vm })
 
-  let pack = await run(current.access)
+  let pack = await run()
   if (pack.error === 'upstream_auth' && rotate && current.refresh) {
     current = await rotateIfNeeded(current, projectRoot, vmId, fetchImpl)
     if (!current.access || current.rotateError) {
       return fail(current.rotateError || 'refresh_failed', 'GPT OAuth 刷新失败，请重新导入', 502)
     }
-    pack = await run(current.access)
+    pack = await run()
   }
   if (pack.error === 'upstream_auth') {
     return fail('upstream_auth', 'GPT 凭证已失效，请重新导入', mapUpstreamStatus(pack.status || 401), {
@@ -366,37 +371,40 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
   }
   if (pack.ok === false || pack.error) return pack
 
-  const extra = extraFromRateLimit(pack.usage.payload?.rate_limit || pack.usage.payload?.rateLimit || {})
-  const usageCredits = pack.usage.payload?.rate_limit_reset_credits || pack.usage.payload?.rateLimitResetCredits
-  const detailCredits = pack.details?.ok ? parseResetCreditDetails(pack.details.payload) : null
-  const resetCredits = mergeResetCredits(
-    usageCredits && typeof usageCredits === 'object'
-      ? {
-          available_count: num(usageCredits.available_count ?? usageCredits.availableCount) || 0,
-          credits: asCreditList(usageCredits.credits)
-            .map((row) => ({ expires_at: creditExpiresAt(row) }))
-            .filter((row) => row.expires_at),
-        }
-      : null,
-    detailCredits,
-  )
-  const persistable = resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
-  const credits = normalizeCodexCredits(pack.usage.payload?.credits)
-  persistCodexQuotaSnapshot(projectRoot, vmId, {
-    extra,
-    credits,
-    planType: pack.usage.payload?.plan_type || pack.usage.payload?.planType,
-    ...(persistable ? { resetCredits: persistable } : {}),
-  })
-  syncCodexQuotaSchedule(projectRoot, getVm(projectRoot, vmId), {
-    policy,
-  })
-  return {
-    ok: true,
-    ...publicUsage(extra, persistable || resetCredits, credits, pack.usage.payload || {}),
-    fetched_at: resetCredits.fetched_at,
-    warning: persistable ? undefined : 'reset_credit_cache_refresh_failed',
-  }
+  return withCodexCredentialActivity(projectRoot, vmId, vm => {
+    assertCodexCredentialSnapshot(projectRoot, vmId, current.first, vm.codex)
+    const extra = extraFromRateLimit(pack.usage.payload?.rate_limit || pack.usage.payload?.rateLimit || {})
+    const usageCredits = pack.usage.payload?.rate_limit_reset_credits || pack.usage.payload?.rateLimitResetCredits
+    const detailCredits = pack.details?.ok ? parseResetCreditDetails(pack.details.payload) : null
+    const resetCredits = mergeResetCredits(
+      usageCredits && typeof usageCredits === 'object'
+        ? {
+            available_count: num(usageCredits.available_count ?? usageCredits.availableCount) || 0,
+            credits: asCreditList(usageCredits.credits)
+              .map((row) => ({ expires_at: creditExpiresAt(row) }))
+              .filter((row) => row.expires_at),
+          }
+        : null,
+      detailCredits,
+    )
+    const persistable = resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
+    const credits = normalizeCodexCredits(pack.usage.payload?.credits)
+    persistCodexQuotaSnapshot(projectRoot, vmId, {
+      extra,
+      credits,
+      planType: pack.usage.payload?.plan_type || pack.usage.payload?.planType,
+      ...(persistable ? { resetCredits: persistable } : {}),
+    })
+    syncCodexQuotaSchedule(projectRoot, getVm(projectRoot, vmId), {
+      policy,
+    })
+    return {
+      ok: true,
+      ...publicUsage(extra, persistable || resetCredits, credits, pack.usage.payload || {}),
+      fetched_at: resetCredits.fetched_at,
+      warning: persistable ? undefined : 'reset_credit_cache_refresh_failed',
+    }
+  }, { expectedVm: current.vm })
 }
 
 export async function queryOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true, policy = null } = {}) {
@@ -417,23 +425,26 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
   })
   const redeemId = redeemRequestId()
 
-  const consume = async (access) =>
-    quotaFetch(CHATGPT_RESET_CONSUME_URL, {
+  const consume = () => withCodexCredentialActivity(projectRoot, vmId, async vm => {
+    current = await loadSlot(projectRoot, vmId, vm)
+    if (!current.ok) return current
+    return quotaFetch(CHATGPT_RESET_CONSUME_URL, {
       method: 'POST',
-      headers: headersOf(access),
+      headers: headersOf(current.access),
       body: JSON.stringify({ redeem_request_id: redeemId }),
       proxyUrl: current.proxyUrl,
       fetchImpl,
       direct: current.direct,
     })
+  }, { expectedVm: slot.vm })
 
-  let res = await consume(current.access)
+  let res = await consume()
   if ((res.status === 401 || res.status === 403) && rotate && current.refresh) {
     current = await rotateIfNeeded(current, projectRoot, vmId, fetchImpl)
     if (!current.access || current.rotateError) {
       return fail(current.rotateError || 'refresh_failed', 'GPT OAuth 刷新失败，请重新导入', 502)
     }
-    res = await consume(current.access)
+    res = await consume()
   }
   if (res.error && !res.status) return res
   if (res.status === 401 || res.status === 403) {
@@ -448,6 +459,7 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
   }
 
   const after = await queryUpstream(current, { fetchImpl, rotate: false, projectRoot, vmId, policy })
+    .catch(() => fail('reset_credit_cache_refresh_failed', '重置已提交，但后续状态未确认', 409))
   if (!after.ok) {
     return {
       ok: true,

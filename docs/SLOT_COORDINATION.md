@@ -1,5 +1,9 @@
 # Codex 实例的控制与请求协调
 
+## 宿主目录、配额与搜索请求（preview.28）
+
+目录、配额/重置券、搜索/图片JSON使用同一Kernel共享活动锁。入场后检查最新槽/凭据，读取完整响应体后释放；需要刷新时先释放读锁，换票后重新入场。配额写回另入场并核对凭据/归属快照；维护冲突不自动触发搜索/图片跨槽重试。具体范围和未验收边界见[宿主请求协调](CREDENTIAL_ACTIVITY.md)。第三方Kernel内部自行刷新仍未纳入宿主日志保护。
+
 ## Linux 同机控制进程（preview.19）
 
 `vm2api/src/lib/vm/codex-slot-coordination.mjs` 为同一真实 projectRoot、同一槽 ID 建立三类基础 Linux `flock`：

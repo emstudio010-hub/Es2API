@@ -44,6 +44,7 @@ import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
+import { withCodexCredentialActivity } from '../oauth/codex-credential-activity.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -1259,7 +1260,8 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''
-  let pending = searchRefreshes.get(vm.id)
+  const refreshKey = `${path.resolve(projectRoot)}\n${vm.id}`
+  let pending = searchRefreshes.get(refreshKey)
   if (!pending) {
     pending = (async () => {
       try {
@@ -1268,8 +1270,8 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
         })
         return account.access_token
       } catch { return '' }
-    })().finally(() => searchRefreshes.delete(vm.id))
-    searchRefreshes.set(vm.id, pending)
+    })().finally(() => searchRefreshes.delete(refreshKey))
+    searchRefreshes.set(refreshKey, pending)
   }
   return pending
 }
@@ -1296,12 +1298,18 @@ async function postCodexJson({
 }) {
   const proxyUrl = hostProxyUrlForVm(vm)
   if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy)) return { status: 0, error: 'proxy_required' }
-  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs, { maxMs: timeoutMs })
-  const creds = searchCredentials(projectRoot, vm)
-  const send = async (access) => {
+  let creds
+  let attemptVm = vm
+  const send = () => withCodexCredentialActivity(projectRoot, vm.id, async currentVm => {
+    attemptVm = currentVm
+    const currentProxy = hostProxyUrlForVm(currentVm)
+    if (!fetchImpl && !currentProxy && !isLocalEgressProxy(currentVm.proxy)) return { status: 0, error: 'proxy_required' }
+    const doFetch = fetchImpl || makeProxyFetch(currentProxy, timeoutMs, { maxMs: timeoutMs })
+    creds = searchCredentials(projectRoot, currentVm)
+    if (!creds.access) return creds.refresh ? { status: 401 } : { status: 0, error: 'no_oauth_token' }
     // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
     const headers = {
-      authorization: `Bearer ${access}`,
+      authorization: `Bearer ${creds.access}`,
       'content-type': 'application/json',
       accept: 'application/json',
       originator: CODEX_CATALOG_ORIGINATOR,
@@ -1317,12 +1325,12 @@ async function postCodexJson({
     } catch (e) {
       return { status: 0, error: /abort/i.test(`${e?.name} ${e?.message}`) ? 'upstream_timeout' : 'upstream_transport' }
     }
-  }
-  if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token' }
-  let out = creds.access ? await send(creds.access) : { status: 401 }
+  }, { expectedVm: vm }).catch(error => ({ status: Number(error.status) || 503,
+    error: error.code || 'codex_metadata_unavailable', admission_rejected: true }))
+  let out = await send()
   if (out.status === 401 || out.status === 403) {
-    const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
-    if (access) out = await send(access)
+    const access = await refreshSearchAccess(projectRoot, attemptVm, creds.access, { proxyUrl: hostProxyUrlForVm(attemptVm), fetchImpl, refresh })
+    if (access) out = await send()
   }
   return out
 }
@@ -1332,6 +1340,7 @@ function postCodexSearch(args) {
 }
 
 function isSearchFailover(out) {
+  if (out?.admission_rejected) return false
   const status = Number(out?.status) || 0
   return status === 0 || status === 401 || status === 402 || status === 403 || status === 429 || status >= 500
 }

@@ -166,6 +166,8 @@ Responses JSON/SSE 只观察 response ID 进行归属登记，不更改回传正
 
 ## 同机控制进程协调（preview.19）
 
+preview.28将宿主目录、配额/重置券、搜索/图片JSON请求及配额缓存写回纳入原Kernel活动锁，并在刷新前释放读锁、刷新后重新入场；写回核对原凭据和归属快照，维护冲突不触发搜索/图片跨槽重试。详见[宿主请求协调](../docs/CREDENTIAL_ACTIVITY.md)。这是源码接线，未运行并发/真实刷新或供应商验收，第三方Kernel内部刷新仍未受宿主日志包裹。
+
 ### 工作区凭据恢复（preview.27）
 
 `POST /api/v1/admin/accounts/:id/recover-credential` 是管理员明确动作，经Go路由白名单转发。拒绝在途请求、进行中的生命周期和凭据交接；同步暂停调度后返回202，最终结果写回账号状态。`slot.credential_refresh_pending`来自VM2顶层摘要；同步发现pending将槽视为未就绪并暂停调度。页面状态按最后同步时间解释，不是实时监控。
