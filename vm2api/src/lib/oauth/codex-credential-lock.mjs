@@ -8,7 +8,7 @@ export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShu
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-  if (!allowShutdown && !allowRefreshRecovery) assertNoPendingCodexRefresh(projectRoot, vmId)
+  if (!allowRefreshRecovery) assertNoPendingCodexRefresh(projectRoot, vmId)
   if (vm.credential_handoff) throw Object.assign(new Error('凭据正在交接给重建任务；请重试完成重建'), {
     status: 409, code: 'codex_credential_handoff_pending',
   })
