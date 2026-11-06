@@ -29,9 +29,12 @@ function assertSlot(binding, id, status = null) {
   if (binding.proxy_id && status?.egress?.bound && status.egress.proxy_id !== binding.proxy_id) {
     throw Object.assign(new Error('执行槽出口与账号固定 IP 不一致，已拒绝操作'), { code: 'vm2_exit_binding_mismatch', status: 409 })
   }
-  if (status?.isolation?.account_id && (status.isolation.account_id !== binding.account_id ||
-    (status.isolation.generation && status.isolation.generation !== binding.provision_generation))) {
-    throw Object.assign(new Error('执行槽归属或创建代次与账号不匹配'), { code: 'vm2_slot_binding_mismatch', status: 409 })
+  // A canonical VM id alone is not ownership proof. Missing metadata must not
+  // allow adoption, credential transfer or lifecycle changes on an old slot.
+  if (status && (status.isolation?.account_id !== binding.account_id ||
+    !Number.isSafeInteger(status.isolation?.generation) || status.isolation.generation < 1 ||
+    status.isolation.generation !== binding.provision_generation)) {
+    throw Object.assign(new Error('执行槽归属或创建代次缺失或与账号不匹配，请检查原槽位记录'), { code: 'vm2_slot_binding_mismatch', status: 409 })
   }
 }
 
