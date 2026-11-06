@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { selectOAuthCredential } from '../../vm2api/src/lib/oauth/credential-import.mjs'
+import { publicCodexCliObservation } from '../../vm2api/src/lib/transport/codex-cli-observation.mjs'
 
 export const ACCOUNT_MODES = Object.freeze({
   POOL: 'pool',
@@ -220,6 +221,7 @@ export function normalizeVmStatus(payload = {}) {
     id,
     status,
     execution_backend: vm.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
+    cli_execution: vm.execution_backend === 'codex-cli' ? publicCodexCliObservation(vm.cli_execution) : null,
     ready: status === 'running' && healthOk !== false && !refreshPending,
     credential_refresh_pending: refreshPending,
     credential_refresh_state: refreshState,

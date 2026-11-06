@@ -38,6 +38,7 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { runtimeKind } from './runtime-kind.mjs'
 import { hasBoundExit } from './egress.mjs'
 import { ensureSlotSmbios } from './machine-spec.mjs'
+import { readCodexCliObservation } from '../transport/codex-cli-observation.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
@@ -92,6 +93,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     family: kind.family,
     codex_kernel: kind.kind === 'codex',
     execution_backend: vm.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
+    cli_execution: vm.execution_backend === 'codex-cli' ? readCodexCliObservation(projectRoot, vm) : null,
     email: kind.kind === 'codex' ? codex?.email || null : vm.claude?.email || null,
     account_uuid: kind.kind === 'codex' ? null : vm.claude?.account_uuid || null,
     org_uuid: kind.kind === 'codex' ? vm.codex?.chatgpt_account_id || null : vm.claude?.org_uuid || null,

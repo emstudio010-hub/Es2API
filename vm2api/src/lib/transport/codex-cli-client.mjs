@@ -21,7 +21,8 @@ import { readCodexCliExitReceipt, waitCodexCliExitReceipt } from './codex-cli-re
 import { claimCodexCliRequest, hasCodexCliClaim } from './codex-cli-claim.mjs'
 import { withCodexSlotActivity } from '../vm/codex-slot-coordination.mjs'
 import { codexCliLaunchArgs } from './codex-cli-launch.mjs'
-import { isCodexCliMetadataWarning, classifyCodexCliDiagnostic, codexCliFailureMessage } from './codex-cli-diagnostics.mjs'
+import { isCodexCliMetadataWarning, classifyCodexCliDiagnostic, preferCodexCliDiagnostic, codexCliFailureMessage, CODEX_CLI_DIAGNOSTIC_CODES } from './codex-cli-diagnostics.mjs'
+import { writeCodexCliObservation, codexCliSystemError } from './codex-cli-observation.mjs'
 import { inspectCodexCliEgress } from '../vm/codex-cli-egress-health.mjs'
 
 const runFile = promisify(execFile)
@@ -296,6 +297,21 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
   let failure = null, child, heartbeat, timeout, hardTimeout, cancelTimeout, emitted = false, firstTokenAt = null
   let completed = false, usage = null, text = '', closed = false, terminalAttempted = false, exitReceipt = null
   let diagnostic = '', diagnosticCode = null, metadataWarningObserved = false
+  let phase = 'egress', failurePhase = null, hostSpawnFailed = false, systemError = null
+  let runOutcome = 'failed', reportedError = null
+  const diagnosticSignals = new Set()
+  const counters = { stdout_bytes: 0, stderr_bytes: 0, jsonl_events: 0, turn_started: 0, turn_completed: 0, turn_failed: 0, error_events: 0, agent_messages: 0 }
+  const count = (name, amount = 1) => { counters[name] = Math.min(1024 * 1024 * 1024, counters[name] + amount) }
+  const observeDiagnostic = value => {
+    const code = classifyCodexCliDiagnostic(value)
+    if (code) diagnosticSignals.add(code)
+    diagnosticCode = preferCodexCliDiagnostic(diagnosticCode, code)
+  }
+  const finish = result => {
+    runOutcome = result.ok ? 'verified' : 'failed'
+    reportedError = result.body?.error?.code || null
+    return result
+  }
   const responseId = `resp_cli_${crypto.randomUUID().replaceAll('-', '')}`
   const messageId = `msg_${crypto.randomUUID().replaceAll('-', '')}`
   let sequence = 0
@@ -312,6 +328,7 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     try { await emit({ type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', error: result.body.error, usage } }) } catch {}
   }
   const cancel = code => {
+    failurePhase ||= code === 'codex_cli_delivery_failed' ? 'delivery' : phase
     failure ||= code
     try { fs.writeFileSync(path.join(dir, 'cancel'), '') } catch {}
     if (child && !cancelTimeout) cancelTimeout = setTimeout(() => { clearInterval(heartbeat); child.kill() }, 25000)
@@ -321,9 +338,11 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
   signal?.addEventListener('abort', abort, { once: true })
   try {
     const egress = await inspectCodexCliEgress(projectOf(exec), exec.vm, { timeoutMs: Math.min(4000, deadline - Date.now()) })
-    if (!egress.ok) return errorResult(503, egress.code, codexCliFailureMessage(egress.code))
+    if (!egress.ok) return finish(errorResult(503, egress.code, codexCliFailureMessage(egress.code)))
+    phase = 'credential'
     const account = await refreshCliCredential(projectOf(exec), exec.vm, { deadline, signal })
-    if (signal?.aborted) return errorResult(499, 'client_cancelled', '请求已取消')
+    if (signal?.aborted) return finish(errorResult(499, 'client_cancelled', '请求已取消'))
+    phase = 'prepare'
     fs.mkdirSync(dir, { mode: 0o700 })
     fs.mkdirSync(path.join(dir, 'work'), { mode: 0o700 })
     fs.mkdirSync(path.join(dir, 'home'), { mode: 0o700 })
@@ -337,21 +356,23 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
       const [uid, gid] = user.split(':').map(Number)
       for (const target of [root, dir, path.join(dir, 'work'), path.join(dir, 'home'), path.join(dir, 'home', 'config.toml'), path.join(dir, 'home', 'auth.json'), path.join(dir, 'heartbeat')]) fs.chownSync(target, uid, gid)
     }
-    if (signal?.aborted || failure) return errorResult(499, 'client_cancelled', '请求已取消')
+    if (signal?.aborted || failure) return finish(errorResult(499, 'client_cancelled', '请求已取消'))
     const remaining = deadline - Date.now()
-    if (remaining <= 0) return errorResult(504, 'codex_cli_timeout', 'CLI 执行预算已用尽，未启动推理')
+    if (remaining <= 0) return finish(errorResult(504, 'codex_cli_timeout', 'CLI 执行预算已用尽，未启动推理'))
     // CODEX_HOME contains only our generated config and short-lived auth copy.
     // --ignore-user-config would discard the request's developer instructions.
     const argv = [CODEX_CLI_CONTAINER_BIN, ...codexCliLaunchArgs(), 'exec', '--json', '--ephemeral', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only', '-C', `${guest}/work`, '-m', request.model]
     if (request.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(request.effort)}`)
     argv.push('-')
     const args = slotExecArgv(exec.vm, ['python3', '-c', RUNNER, guest, String(remaining), receiptNonce, ...argv], { interactive: true, user, workdir: `${guest}/work`, env: { CODEX_HOME: `${guest}/home`, HOME: guest, XDG_CONFIG_HOME: `${guest}/config`, XDG_CACHE_HOME: `${guest}/cache`, RUST_LOG: 'off' } })
+    phase = 'spawn'
     child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     child.stdin.on('error', () => {})
     child.stdin.end(request.prompt)
     child.stderr.on('data', chunk => {
+      count('stderr_bytes', chunk.length)
       diagnostic = (diagnostic + chunk.toString('utf8')).slice(-8192)
-      diagnosticCode = classifyCodexCliDiagnostic(diagnostic) || diagnosticCode
+      observeDiagnostic(diagnostic)
     }) // Transient only; stderr and upstream bodies are never persisted.
     heartbeat = setInterval(() => { try { const now = new Date(); fs.utimesSync(path.join(dir, 'heartbeat'), now, now) } catch {} }, 3000)
     timeout = setTimeout(() => cancel('codex_cli_timeout'), remaining)
@@ -363,6 +384,13 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
       let event
       try { event = JSON.parse(line) } catch { cancel('codex_cli_invalid_jsonl'); return }
       if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string') { cancel('codex_cli_invalid_jsonl'); return }
+      phase = 'events'
+      count('jsonl_events')
+      if (event.type === 'turn.started') count('turn_started')
+      if (event.type === 'turn.completed') count('turn_completed')
+      if (event.type === 'turn.failed') count('turn_failed')
+      if (event.type === 'error' || event.item?.type === 'error') count('error_events')
+      if (event.type === 'item.completed' && event.item?.type === 'agent_message') count('agent_messages')
       // Cancellation stops delivery, not observation of already-produced real
       // usage. Keep terminal usage queued behind a failed write observable.
       if (event.type === 'turn.completed') {
@@ -378,7 +406,8 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
       }
       if (failure) return
       if (event.type === 'turn.failed' || event.type === 'error') {
-        cancel(classifyCodexCliDiagnostic(event.error?.message || event.message) || diagnosticCode || 'codex_cli_turn_failed')
+        observeDiagnostic(event.error?.message || event.message)
+        cancel(diagnosticCode || 'codex_cli_turn_failed')
         return
       }
       if (isCodexCliMetadataWarning(event, request.model)) {
@@ -388,7 +417,8 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
         return
       }
       if (event.item?.type === 'error') {
-        cancel(classifyCodexCliDiagnostic(event.item.message) || 'codex_cli_turn_failed')
+        observeDiagnostic(event.item.message)
+        cancel(diagnosticCode || 'codex_cli_turn_failed')
         return
       }
       if (event.item && !['agent_message', 'reasoning'].includes(event.item.type)) { cancel('codex_cli_tool_execution_unsupported'); return }
@@ -406,6 +436,7 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
       }
     }
     child.stdout.on('data', chunk => {
+      count('stdout_bytes', chunk.length)
       bytes += chunk.length
       if (bytes > MAX_BYTES) { cancel('codex_cli_output_limit'); return }
       pending += decoder.write(chunk)
@@ -413,14 +444,20 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
       for (const line of lines) queue = queue.then(() => eventLine(line)).catch(() => cancel('codex_cli_delivery_failed'))
     })
     const exit = await new Promise(resolve => {
-      child.once('error', () => resolve(-1))
+      child.once('error', error => {
+        hostSpawnFailed = !Number.isSafeInteger(child.pid)
+        systemError = codexCliSystemError(error.code)
+        cancel(hostSpawnFailed ? 'codex_cli_spawn_failed' : 'codex_cli_execution_failed')
+        resolve(-1)
+      })
       child.once('close', code => { closed = true; resolve(code) })
     })
     pending += decoder.end()
     await queue
     if (pending.trim()) await eventLine(pending)
-    if (failure === 'codex_cli_turn_failed' && diagnosticCode) failure = diagnosticCode
-    exitReceipt = await waitCodexCliExitReceipt(dir, receiptNonce)
+    if (failure === 'codex_cli_turn_failed' || CODEX_CLI_DIAGNOSTIC_CODES.includes(failure)) failure = preferCodexCliDiagnostic(failure, diagnosticCode) || failure
+    phase = 'exit'
+    exitReceipt = hostSpawnFailed ? null : await waitCodexCliExitReceipt(dir, receiptNonce)
     if (!failure) {
       let outcome = null
       try { outcome = fs.readFileSync(path.join(dir, 'outcome'), 'utf8') }
@@ -434,31 +471,42 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     if (failure) {
       const result = errorResult(['client_cancelled', 'codex_cli_cancelled'].includes(failure) ? 499 : failure === 'codex_cli_timeout' ? 504 : 502, failure, codexCliFailureMessage(failure))
       await emitFailure(result)
-      return { ...result, committed: emitted, usage, firstTokenAt, executionExitConfirmed: !!exitReceipt }
+      return finish({ ...result, committed: emitted, usage, firstTokenAt, executionExitConfirmed: hostSpawnFailed || !!exitReceipt })
     }
     const part = { type: 'output_text', text, annotations: [] }
     const item = { id: messageId, type: 'message', status: 'completed', role: 'assistant', content: [part] }
     const response = { id: responseId, object: 'response', created_at: Math.floor(started / 1000), model: request.model, status: 'completed', output: [item], usage }
+    phase = 'delivery'
     await emit({ type: 'response.output_text.done', output_index: 0, item_id: messageId, content_index: 0, text })
     await emit({ type: 'response.content_part.done', output_index: 0, item_id: messageId, content_index: 0, part })
     await emit({ type: 'response.output_item.done', output_index: 0, item })
     await emit({ type: 'response.completed', response })
-    return { ok: true, status: 200, committed: true, terminalState: 'verified', body: response, usage, firstTokenAt, ttftMs: firstTokenAt - started, executionExitConfirmed: true }
+    return finish({ ok: true, status: 200, committed: true, terminalState: 'verified', body: response, usage, firstTokenAt, ttftMs: firstTokenAt - started, executionExitConfirmed: true })
   } catch (error) {
     const code = failure || (/^(?:codex_(?:cli|refresh)_[a-z_]+|provider_identity_(?:invalid|verification_unavailable))$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed')
     cancel(code)
     // Do not expose spawn stderr, paths, argv, auth or network diagnostics.
     const result = errorResult(code === 'codex_cli_timeout' ? 504 : signal?.aborted || code === 'codex_cli_cancelled' || code === 'client_cancelled' ? 499 : 503, code, 'Codex CLI 准备或执行失败，请检查实例与 OAuth 状态')
     await emitFailure(result)
-    return { ...result, committed: emitted, usage, firstTokenAt, ttftMs: firstTokenAt == null ? null : firstTokenAt - started }
+    return finish({ ...result, committed: emitted, usage, firstTokenAt, ttftMs: firstTokenAt == null ? null : firstTokenAt - started })
   } finally {
+    try {
+      const receipt = exitReceipt || readCodexCliExitReceipt(dir, receiptNonce)
+      writeCodexCliObservation(projectOf(exec), exec.vm, {
+        format: 'es2api-cli-observation-v1', request_id: id, started_at: new Date(started).toISOString(), completed_at: new Date().toISOString(),
+        duration_ms: Math.max(0, Date.now() - started), outcome: runOutcome, phase: runOutcome === 'verified' ? phase : failurePhase || phase,
+        error_code: runOutcome === 'verified' ? null : reportedError || failure, diagnostic_signals: [...diagnosticSignals], system_error: systemError, counters,
+        usage_observed: usage !== null, metadata_warning_observed: metadataWarningObserved,
+        exit: { confirmed: hostSpawnFailed || !!receipt, host_spawn_failed: hostSpawnFailed, phase: receipt?.phase || null, code: receipt?.exit_code ?? null },
+      })
+    } catch { console.warn('[codex-cli] execution_summary_unavailable') }
     diagnostic = ''
     diagnosticCode = null
     clearInterval(heartbeat); clearTimeout(timeout); clearTimeout(hardTimeout); clearTimeout(cancelTimeout)
     signal?.removeEventListener('abort', abort)
     active.delete(exec.vmId)
     // A crashed Docker client is not proof the in-container process exited.
-    if (!child || (closed && readCodexCliExitReceipt(dir, receiptNonce))) {
+    if (!child || hostSpawnFailed || (closed && readCodexCliExitReceipt(dir, receiptNonce))) {
       try { fs.rmSync(dir, { recursive: true, force: true }); releaseClaim() }
       catch { console.warn('[codex-cli] completed_request_cleanup_failed') }
     }
