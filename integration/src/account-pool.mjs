@@ -1,4 +1,5 @@
 import crypto, { randomUUID } from 'node:crypto'
+import { verifyCodexProviderIdentity } from '../../vm2api/src/lib/oauth/codex-provider-identity.mjs'
 import {
   normalizeAccountBinding,
   normalizeOpenAICredential,
@@ -134,7 +135,7 @@ export class AccountPool {
     return binding
   }
 
-  insertProvisioning(input, credential, idempotency = null) {
+  insertProvisioning(input, credential, idempotency = null, identityProof = null) {
     const accountId = String(input.account_id ?? input.id ?? '').trim()
     if (!/^[a-z0-9][a-z0-9_-]{0,75}$/i.test(accountId) || accountId.toLowerCase().endsWith('-chat')) throw Object.assign(new Error('account_id 格式无效（最多 76 个字母、数字、下划线或连字符，不能以 -chat 结尾）'), { status: 400, code: 'invalid_account_id' })
     if (this.store.getAccount(accountId)) throw Object.assign(new Error('账号已存在'), { status: 409, code: 'account_exists' })
@@ -163,13 +164,16 @@ export class AccountPool {
           credential: status,
           modeltrace_overrides: { enabled: binding.mode === 'pool' },
         }
-        const saved = this.store.createAccount(account, normalized)
+        const saved = this.store.createAccount(account, normalized, identityProof)
         if (idempotency) this.store.saveIdempotency({ ...idempotency, account_id: accountId,
           response: { account_id: accountId, status: 'provisioning' } })
         return saved
       })
     }
     catch (error) {
+      if (String(error?.message).includes('UNIQUE constraint failed: pool_accounts.provider_identity_key')) {
+        throw Object.assign(new Error('该 ChatGPT 用户与工作区已存在于账号池，请使用原工作区'), { status: 409, code: 'provider_identity_already_imported' })
+      }
       if (String(error?.message).includes('UNIQUE constraint failed: pool_accounts.credential_fingerprint')) {
         throw Object.assign(new Error('该凭据已存在于账号池'), { status: 409, code: 'credential_already_imported' })
       }
@@ -204,9 +208,25 @@ export class AccountPool {
       }
       const credentialInput = input.credential ?? input.credentials ?? input.tokens ?? input.auth_json
       const normalized = normalizeOpenAICredential(credentialInput)
+      const identityProof = await verifyCodexProviderIdentity(normalized)
+      // Verify outside SQLite transactions, then reserve with fingerprint CAS.
+      // Startup itself never sends JWKS/OAuth/model requests or rewrites tokens.
+      for (const pending of this.store.listAccountsNeedingIdentity()) {
+        const existing = this.store.getAccount(pending.id, { includeCredential: true })
+        if (!existing) continue
+        try {
+          const proof = await verifyCodexProviderIdentity(existing.credentials)
+          this.store.bindProviderIdentity(existing.id, existing.credentials, proof,
+            { expectedFingerprint: existing.credential.fingerprint })
+        } catch (error) {
+          if (error.code === 'provider_identity_invalid') throw Object.assign(new Error('存量账号身份尚未确认，未创建新工作区；请先为存量账号补全 OAuth'),
+            { status: 409, code: 'provider_identity_inventory_incomplete' })
+          throw error
+        }
+      }
       const created = this.insertProvisioning({ ...input, account_id: accountId }, normalized, key ? {
         key, operation: 'account-import', request_hash: requestHash,
-      } : null)
+      } : null, identityProof)
       try {
         const result = await this.runProvision(created.account.id, created.binding, normalized)
         if (key) this.store.saveIdempotency({ key, operation: 'account-import', request_hash: requestHash, account_id: accountId, response: result })
@@ -292,9 +312,15 @@ export class AccountPool {
           if (error.status !== 404 || !committed) throw error
         }
         if (checkpoint?.credential) {
+          // Compare against the stored pre-handoff identity before committing a
+          // new token set or deleting the old execution slot.
+          const previousIdentity = await verifyCodexProviderIdentity(account.credentials)
+          this.store.bindProviderIdentity(id, account.credentials, previousIdentity,
+            { expectedFingerprint: account.credential.fingerprint })
+          const nextIdentity = await verifyCodexProviderIdentity(checkpoint.credential)
           this.store.checkpointCredential(id, checkpoint.credential, { vmId: account.vm_id,
             generation: account.provision_generation, handoffId: checkpoint.handoff_id,
-            expectedFingerprint: account.credential.fingerprint })
+            expectedFingerprint: account.credential.fingerprint, identityProof: nextIdentity })
           credential = checkpoint.credential
         }
         await this.lifecycle.remove({ ...account.binding, account_id: account.id, mode: account.mode, group_ids: account.group_ids }, account.vm_id,

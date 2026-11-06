@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { normalizeOpenAICredential, publicCredentialStatus } from './contract.mjs'
+import { assertVerifiedCodexIdentity } from '../../vm2api/src/lib/oauth/codex-provider-identity.mjs'
 
 function credentialKey(value) {
   if (Buffer.isBuffer(value) && value.length === 32) return value
@@ -215,10 +216,14 @@ export class Store {
       ['temp_unschedulable_until', 'ALTER TABLE pool_accounts ADD COLUMN temp_unschedulable_until TEXT'],
       ['temp_unschedulable_reason', 'ALTER TABLE pool_accounts ADD COLUMN temp_unschedulable_reason TEXT'],
       ['last_health_check_at', 'ALTER TABLE pool_accounts ADD COLUMN last_health_check_at TEXT'],
+      ['provider_identity_key', 'ALTER TABLE pool_accounts ADD COLUMN provider_identity_key TEXT'],
+      ['provider_identity_profile', 'ALTER TABLE pool_accounts ADD COLUMN provider_identity_profile TEXT'],
+      ['provider_identity_verified_at', 'ALTER TABLE pool_accounts ADD COLUMN provider_identity_verified_at TEXT'],
     ]
     for (const [column, statement] of migrations) {
       if (!columns.includes(column)) this.db.exec(statement)
     }
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS pool_accounts_provider_identity ON pool_accounts(provider_identity_key) WHERE provider_identity_key IS NOT NULL')
     const leaseColumns = this.db.prepare('PRAGMA table_info(account_request_leases)').all().map(row => row.name)
     if (!leaseColumns.includes('selection_hash')) this.db.exec("ALTER TABLE account_request_leases ADD COLUMN selection_hash TEXT NOT NULL DEFAULT ''")
     const recoveredAt = new Date().toISOString()
@@ -375,17 +380,50 @@ export class Store {
     })
   }
 
-  createAccount(account, credential) {
+  listAccountsNeedingIdentity() {
+    return this.db.prepare('SELECT id,credential_fingerprint FROM pool_accounts WHERE provider_identity_key IS NULL ORDER BY id').all()
+  }
+
+  bindProviderIdentity(id, credential, proof, { expectedFingerprint }) {
+    const verified = assertVerifiedCodexIdentity(proof, credential)
+    const normalized = normalizeOpenAICredential(credential)
+    if (publicCredentialStatus(normalized).fingerprint !== expectedFingerprint) throw Object.assign(new Error('身份核对期间凭据已变化'),
+      { status: 409, code: 'provider_identity_changed' })
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT credential_fingerprint,provider_identity_key FROM pool_accounts WHERE id=?').get(String(id))
+      if (!row || row.credential_fingerprint !== expectedFingerprint || row.provider_identity_key && row.provider_identity_key !== verified.identity_key) {
+        throw Object.assign(new Error('账号身份或凭据已变化，已保留原记录'), { status: 409, code: 'provider_identity_changed' })
+      }
+      try {
+        this.db.prepare('UPDATE pool_accounts SET provider_identity_key=?,provider_identity_profile=?,provider_identity_verified_at=? WHERE id=? AND credential_fingerprint=?')
+          .run(verified.identity_key, verified.profile, verified.verified_at, String(id), expectedFingerprint)
+      } catch (error) {
+        if (String(error?.message).includes('UNIQUE constraint failed: pool_accounts.provider_identity_key')) throw Object.assign(new Error('存量账号存在相同供应商身份，已保留两条记录和执行槽，请先处理重复账号'),
+          { status: 409, code: 'provider_identity_legacy_duplicate' })
+        throw error
+      }
+      return this.getAccount(id)
+    })
+  }
+
+  createAccount(account, credential, proof) {
+    const normalized = normalizeOpenAICredential(credential)
+    const verified = assertVerifiedCodexIdentity(proof, normalized)
+    const status = publicCredentialStatus(normalized)
+    if (this.listAccountsNeedingIdentity().length) throw Object.assign(new Error('存量账号身份尚未确认，未创建新工作区；请先补全存量 OAuth'),
+      { status: 409, code: 'provider_identity_inventory_incomplete' })
     const now = new Date().toISOString()
     const result = this.db.prepare(`INSERT INTO pool_accounts(
       id,name,mode,group_ids,credential_ciphertext,credential_fingerprint,
       has_access_token,has_refresh_token,has_id_token,has_api_key,
-      status,schedulable,concurrency,priority,binding_json,modeltrace_overrides,created_at,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?, 'provisioning',0,?,?,?,?,?,?)`).run(
-      account.id, account.name, account.mode, JSON.stringify(account.group_ids), encryptJson(this.key, credential),
-      account.credential.fingerprint, Number(account.credential.has_access_token), Number(account.credential.has_refresh_token),
-      Number(account.credential.has_id_token), Number(account.credential.has_api_key), account.concurrency,
+      status,schedulable,concurrency,priority,binding_json,modeltrace_overrides,created_at,updated_at,
+      provider_identity_key,provider_identity_profile,provider_identity_verified_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?, 'provisioning',0,?,?,?,?,?,?,?,?,?)`).run(
+      account.id, account.name, account.mode, JSON.stringify(account.group_ids), encryptJson(this.key, normalized),
+      status.fingerprint, Number(status.has_access_token), Number(status.has_refresh_token),
+      Number(status.has_id_token), Number(status.has_api_key), account.concurrency,
       account.priority, JSON.stringify(account.binding || {}), JSON.stringify(account.modeltrace_overrides), now, now,
+      verified.identity_key, verified.profile, verified.verified_at,
     )
     return result.changes === 1 ? this.getAccount(account.id) : null
   }
@@ -398,11 +436,15 @@ export class Store {
     return account
   }
 
-  checkpointCredential(id, credential, { vmId, generation, handoffId, expectedFingerprint }) {
+  checkpointCredential(id, credential, { vmId, generation, handoffId, expectedFingerprint, identityProof }) {
     const normalized = normalizeOpenAICredential(credential)
+    const verified = assertVerifiedCodexIdentity(identityProof, normalized)
     const status = publicCredentialStatus(normalized)
     return this.transaction(() => {
       const account = this.getAccount(id)
+      const identity = this.db.prepare('SELECT provider_identity_key FROM pool_accounts WHERE id=?').get(String(id))
+      if (!identity?.provider_identity_key || identity.provider_identity_key !== verified.identity_key) throw Object.assign(new Error('交接凭据与原供应商账号身份不符，已保留旧槽'),
+        { status: 409, code: 'provider_identity_changed' })
       if (!account || account.vm_id !== vmId || account.provision_generation !== generation
         || account.credential.fingerprint !== expectedFingerprint) {
         throw Object.assign(new Error('账号在凭据交接期间已变化，未保存或删除执行槽'), { status: 409, code: 'credential_handoff_changed' })
@@ -412,11 +454,13 @@ export class Store {
       let result
       try {
         result = this.db.prepare(`UPDATE pool_accounts SET credential_ciphertext=?,credential_fingerprint=?,
-          has_access_token=?,has_refresh_token=?,has_id_token=?,has_api_key=?,binding_json=?,updated_at=?
+          has_access_token=?,has_refresh_token=?,has_id_token=?,has_api_key=?,binding_json=?,updated_at=?,
+          provider_identity_profile=?,provider_identity_verified_at=?
           WHERE id=? AND vm_id=? AND provision_generation=? AND credential_fingerprint=?`).run(
           encryptJson(this.key, normalized), status.fingerprint, Number(status.has_access_token),
           Number(status.has_refresh_token), Number(status.has_id_token), Number(status.has_api_key),
-          JSON.stringify(binding), new Date().toISOString(), String(id), vmId, generation, expectedFingerprint,
+          JSON.stringify(binding), new Date().toISOString(), verified.profile, verified.verified_at,
+          String(id), vmId, generation, expectedFingerprint,
         )
       } catch (error) {
         if (String(error?.message).includes('UNIQUE constraint failed: pool_accounts.credential_fingerprint')) {

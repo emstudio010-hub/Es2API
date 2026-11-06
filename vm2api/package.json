@@ -24,6 +24,7 @@
   "dependencies": {
     "croner": "^10.0.1",
     "https-proxy-agent": "^9.1.0",
+    "jose": "6.2.15",
     "node-fetch": "^2.7.0",
     "socks-proxy-agent": "^10.1.0",
     "ssh2": "^1.17.0",

@@ -5,6 +5,7 @@ Es2API 是衍生整合项目。公开源码不改变上游项目的权利、许�
 | 组件 | 来源及固定版本 | 本项目用途 | 许可位置 |
 | --- | --- | --- | --- |
 | VM2API | [dofastted/vm2api](https://github.com/dofastted/vm2api)，`6f188e94e10ff6ce9239b4c39f964da4c98916d7` | 槽位、容器、固定出口、执行协议、辅助管理台 | `vm2api/LICENSE`；商用另需书面授权 |
+| jose | [panva/jose](https://github.com/panva/jose)，`6.2.15` | 固定 Codex client 的历史签名身份绑定及导入去重 | MIT，分发包 `vm2api/node_modules/jose/LICENSE.md` |
 | Undici | [nodejs/undici](https://github.com/nodejs/undici)，`8.12.3` | 账号池私有 HTTP 转发及长等待超时 | MIT，分发包 `integration/node_modules/undici/LICENSE` |
 | Sub2API | [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)，`37067e8e340e9440d173a92b4faa05e8ce58368f` | 用户、分组、Key、计费与管理台 | `sub2api/LICENSE`，LGPL-3.0 |
 | CPA Codex Candy Eval | [haowang02/cpa-plugin-codex-candy-eval](https://github.com/haowang02/cpa-plugin-codex-candy-eval)，`4f8367642cc1e629c4ee15a975e5e0fc53c4ac16` | 固定检测器、候选模型与挑战数据 | `integration/resources/modeltrace/cpa-v2/` 原许可证 |
