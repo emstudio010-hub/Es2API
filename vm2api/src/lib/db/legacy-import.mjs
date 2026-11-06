@@ -116,12 +116,12 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
       if (raw === undefined) counts.errors += 1
       if (raw?.proxies?.length || raw?.config) {
         const repo = new ProxiesRepo(d)
-        if (raw.config) repo.setConfig(raw.config)
-        const current = repo.loadAll()
-        if (!current.length && Array.isArray(raw.proxies)) {
-          repo.replaceAll(raw.proxies)
-          counts.proxies = raw.proxies.length
-        }
+        const current = repo.loadSnapshot()
+        const importRows = !current.proxies.length && Array.isArray(raw.proxies)
+        repo.replaceAll(importRows ? raw.proxies : current.proxies, {
+          expectedFingerprint: current.fingerprint, config: raw.config || current.config,
+        })
+        if (importRows) counts.proxies = raw.proxies.length
       }
     } catch {
       counts.errors += 1
