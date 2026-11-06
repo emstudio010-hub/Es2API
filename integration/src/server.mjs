@@ -99,6 +99,9 @@ export function createIntegrationServer({ store, accountPool, modeltrace, manage
       if ((match = url.pathname.match(/^\/api\/v1\/admin\/accounts\/([^/]+)\/sync$/)) && req.method === 'POST') {
         return success(res, 200, await accountPool.syncAccount(decodeURIComponent(match[1])))
       }
+      if ((match = url.pathname.match(/^\/api\/v1\/admin\/accounts\/([^/]+)\/recover-credential$/)) && req.method === 'POST') {
+        return success(res, 202, accountPool.queueCredentialRecovery(decodeURIComponent(match[1])))
+      }
       if ((match = url.pathname.match(/^\/api\/v1\/admin\/accounts\/([^/]+)\/(start|stop|recover)$/)) && req.method === 'POST') {
         return success(res, 202, accountPool.queueInstanceOperation(decodeURIComponent(match[1]), match[2]))
       }

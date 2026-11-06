@@ -1,6 +1,11 @@
 export default {
   accountPool: {
-    start: '启动实例', stop: '停止实例', recover: '恢复实例', stopped: '已停止', actionQueued: '实例操作已提交，页面将自动刷新状态。',
+    start: '启动实例', stop: '停止实例', recover: '恢复实例', stopped: '已停止', actionQueued: '操作已提交，页面将自动刷新处理结果；请以最终状态为准。',
+    'recover-credential': '恢复已保存凭据', credentialState: '凭据恢复状态', refreshPending: '刷新结果待恢复',
+    refreshPendingHint: '上次 OAuth 刷新结果尚待确认，调度已暂停。恢复只处理本机已保存的响应，不重新换票或调用模型。记录不完整或身份不一致时会保留记录并拒绝恢复。',
+    stateSnapshot: '状态以最近同步为准：{time}。点击“同步状态”重新读取实例。', notSynced: '尚未同步',
+    credentialRecoveryBlocked: '请先等待在途请求和凭据交接结束，再处理恢复。',
+    confirmRecoverCredential: '校验该账号、实例代次、固定出口及原身份，排空请求并停止 Kernel 后，只提交已保存的刷新响应。成功后仍暂停调度；不会重新换票、调用模型或自动启动实例。不完整或冲突记录将保留，需进一步处理。',
     confirmStart: '启动现有实例，不导入新凭据、不更换固定 IP。完成后保持暂停调度，请检查状态后在运行设置中手动开启。',
     confirmStop: '暂停调度并停止实例，正在执行的请求会被中断。账号、凭据和固定 IP 绑定保留。',
     confirmRecover: '暂停调度，停止实例；确认容器停止后清理 CLI 临时请求，再启动并检查健康。正在执行的请求会中断，完成后需手动开启调度。',

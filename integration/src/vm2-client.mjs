@@ -192,6 +192,19 @@ export class Vm2Client {
     return normalizeVmStatus(payload)
   }
 
+  async recoverCredential(vmId, binding, identityKey) {
+    await this.ensureSession()
+    const payload = await this.request(`/api/panel/vms/${encodeURIComponent(vmId)}/oauth/recover`, {
+      method: 'POST', body: { expected_binding: binding, expected_provider_identity: identityKey }, timeoutMs: this.lifecycleTimeoutMs,
+    })
+    const result = payload.data || payload
+    if (result.recovered !== true || result.oauth_exchange_performed !== false || result.vm_id !== vmId
+      || result.account_id !== binding.account_id || result.provision_generation !== binding.provision_generation) {
+      throw Object.assign(new Error('凭据恢复响应与账号归属不符，请同步状态后检查'), { status: 502, code: 'credential_recovery_unconfirmed' })
+    }
+    return { recovered: true, oauth_exchange_performed: false }
+  }
+
   async deleteSlot(vmId, idempotencyKey) {
     await this.ensureSession()
     try { await this.getSlot(vmId) } catch (error) {

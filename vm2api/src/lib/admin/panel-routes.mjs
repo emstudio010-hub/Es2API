@@ -269,6 +269,7 @@ import { withCodexCredentialLock, assertCodexIntegrationBinding } from '../oauth
 import { checkpointCodexCredential } from '../oauth/codex-credential-handoff.mjs'
 import { refreshStoredCodexCredential, recoverStoredCodexRefresh } from '../oauth/codex-credential-refresh.mjs'
 import { assertNoPendingCodexRefresh } from '../oauth/codex-refresh-journal.mjs'
+import { verifyCodexProviderIdentity } from '../oauth/codex-provider-identity.mjs'
 import { withCodexKernelCredentialOwner } from '../oauth/codex-kernel-credential-owner.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -424,8 +425,10 @@ async function commitImportedCodexVm({
         if (current.length !== 1 || (!current[0].access_token && !current[0].refresh_token)) {
           throw Object.assign(new Error('现有 OAuth 记录不可确认，已保留原文件并停止导入'), { status: 409, code: 'codex_existing_credential_invalid' })
         }
-        if (account.chatgpt_account_id && current[0].chatgpt_account_id
-          && account.chatgpt_account_id !== current[0].chatgpt_account_id) {
+        const [incomingIdentity, existingIdentity] = await Promise.all([
+          verifyCodexProviderIdentity(account), verifyCodexProviderIdentity(current[0]),
+        ])
+        if (incomingIdentity.identity_key !== existingIdentity.identity_key) {
           throw Object.assign(new Error('现有 OAuth 账号与导入身份不同，已拒绝覆盖'), { status: 409, code: 'codex_existing_identity_mismatch' })
         }
         return true
@@ -4980,8 +4983,10 @@ export function createPanelHandler(ctx) {
         const vm = getVm(cfg.paths.project, id)
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
         if (!isCodexVm(vm)) return json(res, 400, { ok: false, error: { code: 'credential_kind_mismatch', message: '仅支持 Codex 刷新恢复' } })
-        await recoverStoredCodexRefresh(cfg.paths.project, id)
-        return json(res, 200, panel.ok({ recovered: true, oauth_exchange_performed: false }))
+        const body = await readBody(req, 16 * 1024)
+        const recovered = await recoverStoredCodexRefresh(cfg.paths.project, id, { expectedBinding: body.expected_binding || null,
+          expectedIdentity: body.expected_provider_identity || null })
+        return json(res, 200, panel.ok(recovered))
       }
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/oauth\/refresh$/.test(p)) {

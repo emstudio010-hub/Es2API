@@ -213,11 +213,13 @@ export function normalizeVmStatus(payload = {}) {
     : health.ok === true || codexHealth.reachable === true ? true : null
   const proxy = asRecord(vm.proxy ?? raw.proxy ?? raw.data?.proxy)
   const allocatedProxy = raw.allocated_proxy ?? raw.data?.allocated_proxy
+  const refreshPending = vm.credential_refresh_pending === true
   return {
     id,
     status,
     execution_backend: vm.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
-    ready: status === 'running' && healthOk !== false,
+    ready: status === 'running' && healthOk !== false && !refreshPending,
+    credential_refresh_pending: refreshPending,
     schedulable: vm.schedulable === true,
     isolation: {
       account_id: optionalString(vm.integration_binding?.account_id),

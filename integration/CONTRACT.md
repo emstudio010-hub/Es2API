@@ -166,4 +166,10 @@ Responses JSON/SSE 只观察 response ID 进行归属登记，不更改回传正
 
 ## 同机控制进程协调（preview.19）
 
+### 工作区凭据恢复（preview.27）
+
+`POST /api/v1/admin/accounts/:id/recover-credential` 是管理员明确动作，经Go路由白名单转发。拒绝在途请求、进行中的生命周期和凭据交接；同步暂停调度后返回202，最终结果写回账号状态。`slot.credential_refresh_pending`来自VM2顶层摘要；同步发现pending将槽视为未就绪并暂停调度。页面状态按最后同步时间解释，不是实时监控。
+
+恢复调用携带当前账号binding（canonical槽、账号、代次、独占固定代理、后端）与控制面原身份索引，VM2同控制锁内核对binding与日志身份；响应账号/代次来自锁内记录。仅处理已保存响应，无新换票或推理。成功保持调度暂停，不启动实例，不清理deletion_pending/slot_binding_stale；prepared、不完整、身份/快照不符继续保留并拒绝。无pending时拒绝，不重放。恢复接口不返回token、日志或身份索引。ifMissing导入已有槽也比较双方历史签名身份而非workspace提示。
+
 凭据、运行控制与完整恢复使用同一Linux flock控制作用域；Kernel/CLI宿主请求持共享活动锁，停止确认等待跨进程finalizer排空。争用失败保留原状态，不按PID/TTL清除claim或重放调用。所有控制进程需同时升级，锁文件不得删除。详见 [实例协调](../docs/SLOT_COORDINATION.md)。仅静态核对，未进行多进程、崩溃或真实账号行为验收。

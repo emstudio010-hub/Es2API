@@ -65,9 +65,9 @@ flowchart LR
 从 [Releases](https://github.com/emstudio010-hub/Es2API/releases) 下载 `.tar.gz` 及 `.sha256`，在服务器执行：
 
 ```bash
-sha256sum -c Es2API-linux-x64-20261106-r26.tar.gz.sha256
-tar -xzf Es2API-linux-x64-20261106-r26.tar.gz
-cd Es2API-linux-x64-20261106-r26
+sha256sum -c Es2API-linux-x64-20261106-r27.tar.gz.sha256
+tar -xzf Es2API-linux-x64-20261106-r27.tar.gz
+cd Es2API-linux-x64-20261106-r27
 sudo ./es2api.sh init
 sudo ./es2api.sh run
 ```

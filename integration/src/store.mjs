@@ -384,6 +384,10 @@ export class Store {
     return this.db.prepare('SELECT id,credential_fingerprint FROM pool_accounts WHERE provider_identity_key IS NULL ORDER BY id').all()
   }
 
+  providerIdentityKey(id) {
+    return this.db.prepare('SELECT provider_identity_key FROM pool_accounts WHERE id=?').get(String(id))?.provider_identity_key || null
+  }
+
   bindProviderIdentity(id, credential, proof, { expectedFingerprint }) {
     const verified = assertVerifiedCodexIdentity(proof, credential)
     const normalized = normalizeOpenAICredential(credential)

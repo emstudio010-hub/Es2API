@@ -485,8 +485,8 @@ export class AccountPool {
           !(account.modeltrace?.state || {}).auto_paused
         return this.store.updateAccount(id, {
           status: status.status === 'stopped' ? 'stopped' : ready ? 'ready' : 'error', schedulable, slot_json: status,
-          last_health_check_at: new Date().toISOString(), error_code: ready || status.status === 'stopped' ? null : 'slot_not_ready',
-          error_message: ready || status.status === 'stopped' ? null : '执行槽健康检查未通过',
+          last_health_check_at: new Date().toISOString(), error_code: status.credential_refresh_pending ? 'codex_refresh_recovery_required' : ready || status.status === 'stopped' ? null : 'slot_not_ready',
+          error_message: status.credential_refresh_pending ? 'OAuth 刷新结果待确认，请在工作区恢复已保存凭据；调度已暂停' : ready || status.status === 'stopped' ? null : '执行槽健康检查未通过',
         })
       } catch (error) {
         const safe = publicError(error)
@@ -522,6 +522,32 @@ export class AccountPool {
     }).catch(() => {
       this.store.updateAccount(id, { status: 'error', schedulable: false, error_code: 'slot_action_interrupted', error_message: '实例操作中断，请同步状态后检查' })
     })
+    return this.store.getAccount(id)
+  }
+
+  queueCredentialRecovery(id) {
+    if (this.locks.has(String(id))) throw Object.assign(new Error('实例操作正在进行'), { status: 409, code: 'lifecycle_busy' })
+    const account = this.store.getAccount(id)
+    if (!account) throw Object.assign(new Error('账号不存在'), { status: 404, code: 'account_not_found' })
+    if (!account.vm_id || ['provisioning', 'deleting'].includes(account.status) || account.binding?.credential_handoff) throw Object.assign(new Error('生命周期尚未完成，无法恢复刷新凭据'), { status: 409, code: 'slot_not_available' })
+    if (account.dispatch.inflight_requests > 0) throw Object.assign(new Error('仍有在途请求，请等待结束后恢复凭据'), { status: 409, code: 'account_busy' })
+    const identity = this.store.providerIdentityKey(id)
+    if (!identity) throw Object.assign(new Error('原供应商账号身份尚未确认，未恢复凭据'), { status: 409, code: 'provider_identity_proof_required' })
+    this.store.updateAccount(id, { status: 'provisioning', schedulable: false, group_pause_restore: false, error_code: null, error_message: null })
+    void this.withLock(id, async () => {
+      try {
+        await this.beforeRemoveAccount(String(id))
+        const slot = await this.lifecycle.recoverCredential({ ...account.binding, account_id: account.id,
+          provision_generation: account.provision_generation }, account.vm_id, identity)
+        return this.store.updateAccount(id, { status: slot.status === 'stopped' ? 'stopped' : slot.ready ? 'ready' : 'error',
+          schedulable: false, slot_json: slot, error_code: slot.ready || slot.status === 'stopped' ? null : 'slot_not_ready',
+          error_message: slot.ready || slot.status === 'stopped' ? null : '凭据已恢复，实例未就绪；请检查后显式启动', last_health_check_at: new Date().toISOString() })
+      } catch (error) {
+        const safe = publicError(error)
+        this.store.updateAccount(id, { status: 'error', schedulable: false, error_code: safe.code, error_message: safe.message })
+      }
+    }).catch(() => this.store.updateAccount(id, { status: 'error', schedulable: false,
+      error_code: 'credential_recovery_interrupted', error_message: '凭据恢复中断，请同步状态后检查；未自动重试' }))
     return this.store.getAccount(id)
   }
 

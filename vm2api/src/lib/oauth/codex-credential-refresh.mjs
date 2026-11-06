@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { withCodexCredentialLock } from './codex-credential-lock.mjs'
+import { withCodexCredentialLock, assertCodexIntegrationBinding } from './codex-credential-lock.mjs'
 import { readCodexAccountsStrict, writeCodexAccounts, enrichCodexAccountIdentity, codexCredentialPath } from '../vm/codex-slot.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { withCodexKernelCredentialOwner } from './codex-kernel-credential-owner.mjs'
@@ -26,10 +26,11 @@ function candidate(account, token) {
     refresh_token: token.refresh_token || account.refresh_token, id_token: token.id_token || account.id_token,
     expires_at: token.expires_at || account.expires_at })
 }
-async function finish(projectRoot, vmId, session) {
+async function finish(projectRoot, vmId, session, expectedIdentity = null) {
   const data = session.data
   if (!Array.isArray(data.accounts) || !Number.isSafeInteger(data.index) || !data.accounts[data.index]
     || !data.expected_identity || binding(projectRoot, vmId) !== data.binding) throw changed()
+  if (expectedIdentity && data.expected_identity !== expectedIdentity) throw Object.assign(new Error('待恢复日志与控制面账号身份不符，已保留原凭据和日志'), { status: 409, code: 'codex_refresh_identity_mismatch' })
   const next = candidate(data.accounts[data.index], data.response)
   const proof = await verifyCodexProviderIdentity(next)
   if (proof.identity_key !== data.expected_identity) throw Object.assign(new Error('换票结果与原供应商账号身份不同，未提交新凭据；加密响应已保留'),
@@ -68,7 +69,19 @@ export function refreshStoredCodexCredential(projectRoot, vmId, {
 }
 
 // Explicit local recovery only: no OAuth exchange, inference or token retry.
-export function recoverStoredCodexRefresh(projectRoot, vmId) {
-  return withCodexCredentialLock(projectRoot, vmId, () => withCodexKernelCredentialOwner(projectRoot, vmId, () =>
-    finish(projectRoot, vmId, readPendingCodexRefresh(projectRoot, vmId))), { allowRefreshRecovery: true, allowShutdown: true }).catch(safeError)
+export function recoverStoredCodexRefresh(projectRoot, vmId, { expectedBinding = null, expectedIdentity = null } = {}) {
+  return withCodexCredentialLock(projectRoot, vmId, async () => {
+    const vm = JSON.parse(fs.readFileSync(path.join(projectRoot, 'vms', `${vmId}.json`), 'utf8'))
+    if (vm.integration_binding?.account_id) {
+      assertCodexIntegrationBinding(vm, expectedBinding)
+      if (!/^[a-f0-9]{64}$/.test(expectedIdentity || '')) throw Object.assign(new Error('独立账号池恢复必须核对控制面身份索引'), { status: 409, code: 'provider_identity_proof_required' })
+    }
+    return withCodexKernelCredentialOwner(projectRoot, vmId, async () => {
+      await finish(projectRoot, vmId, readPendingCodexRefresh(projectRoot, vmId), expectedIdentity)
+      // Return only the binding checked under this lock, never token material.
+      return { recovered: true, oauth_exchange_performed: false, vm_id: vmId,
+        account_id: vm.integration_binding?.account_id || null,
+        provision_generation: vm.integration_binding?.provision_generation || null }
+    })
+  }, { allowRefreshRecovery: true, allowShutdown: true }).catch(safeError)
 }

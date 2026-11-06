@@ -1,6 +1,11 @@
 export default {
   accountPool: {
-    start: 'Start instance', stop: 'Stop instance', recover: 'Recover instance', stopped: 'Stopped', actionQueued: 'Instance action accepted. Status will refresh automatically.',
+    start: 'Start instance', stop: 'Stop instance', recover: 'Recover instance', stopped: 'Stopped', actionQueued: 'Action accepted. The page will refresh the result; check the final status.',
+    'recover-credential': 'Recover saved credentials', credentialState: 'Credential recovery status', refreshPending: 'Refresh result needs recovery',
+    refreshPendingHint: 'The previous OAuth refresh is unconfirmed and scheduling is paused. Recovery only processes a response saved on this host, with no new token exchange or model call. Incomplete records or identity conflicts are retained and recovery is refused.',
+    stateSnapshot: 'Last synchronized state: {time}. Use Sync status to read the instance again.', notSynced: 'Not synchronized yet',
+    credentialRecoveryBlocked: 'Wait for active requests and credential handoff to finish before recovery.',
+    confirmRecoverCredential: 'Check this account, instance generation, fixed egress and original identity, drain requests and stop the Kernel, then commit only the saved refresh response. Scheduling stays paused, with no new token exchange, model call or automatic instance start. Incomplete or conflicting records are retained for further handling.',
     confirmStart: 'Start the existing instance with its current credentials and fixed IP. Scheduling stays paused; enable it in runtime settings after checking the result.',
     confirmStop: 'Pause scheduling and stop the instance. Active requests will be interrupted. The account, credentials and fixed IP binding are retained.',
     confirmRecover: 'Pause scheduling, stop the instance, confirm the container stopped, clear CLI temporary requests, then start and check health. Active requests will be interrupted. Enable scheduling manually afterwards.',

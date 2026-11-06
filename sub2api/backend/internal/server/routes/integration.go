@@ -26,6 +26,7 @@ func registerIntegrationRoutes(admin *gin.RouterGroup) {
 		{http.MethodPost, "/accounts/:id/start"},
 		{http.MethodPost, "/accounts/:id/stop"},
 		{http.MethodPost, "/accounts/:id/recover"},
+		{http.MethodPost, "/accounts/:id/recover-credential"},
 		{http.MethodGet, "/groups"},
 		{http.MethodPost, "/groups"},
 		{http.MethodPut, "/groups/:id"},

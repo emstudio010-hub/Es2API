@@ -36,7 +36,7 @@ const columns = computed(() => props.surface === 'accounts' ? ['account', 'statu
 const statuses = ['ready', 'stopped', 'provisioning', 'error', 'deleting'] as const
 const confirmMessages: Record<IntegrationAccountAction, string> = {
   sync: 'confirmSync', retry: 'confirmRetry', 'retry-delete': 'confirmDelete', delete: 'confirmDelete',
-  start: 'confirmStart', stop: 'confirmStop', recover: 'confirmRecover'
+  start: 'confirmStart', stop: 'confirmStop', recover: 'confirmRecover', 'recover-credential': 'confirmRecoverCredential'
 }
 const groupNames = computed(() => new Map(groups.value.map(group => [group.id, group.name])))
 let loadController: AbortController | undefined
@@ -46,13 +46,21 @@ let disposed = false
 let debounceTimer: ReturnType<typeof setTimeout> | undefined
 let refreshTimer: ReturnType<typeof setTimeout> | undefined
 function lifecycleLocked(account: IntegrationAccount) { return account.deletion_pending || ['provisioning', 'deleting'].includes(account.status) }
+function refreshPending(account: IntegrationAccount) { return account.slot?.credential_refresh_pending === true || account.error?.code === 'codex_refresh_recovery_required' }
+function stateCheckedAt(account: IntegrationAccount) {
+  const at = account.dispatch.last_health_check_at
+  return at ? new Date(at).toLocaleString() : t('admin.accountPool.notSynced')
+}
 function visibleActions(account: IntegrationAccount): IntegrationAccountAction[] {
+  if (refreshPending(account)) return ['sync', ...(props.workspaceId && !account.deletion_pending ? ['stop' as const] : [])]
   if (account.deletion_pending) return ['retry-delete']
   const power: IntegrationAccountAction[] = account.vm_id && props.workspaceId && !lifecycleLocked(account) ? [account.slot?.status === 'running' ? 'stop' : 'start', 'recover'] : []
   return ['sync', ...power, ...((account.slot_binding_stale || ['error', 'provisioning'].includes(account.status)) ? ['retry' as const] : []), 'delete']
 }
 function canRun(account: IntegrationAccount, action: IntegrationAccountAction) {
-  if (action === 'sync') return !!account.vm_id && !lifecycleLocked(account)
+  if (action === 'recover-credential') return !!props.workspaceId && !!account.vm_id && refreshPending(account) && account.dispatch.inflight_requests === 0 && !['provisioning', 'deleting'].includes(account.status) && !account.binding.credential_handoff
+  if (action === 'sync') return !!account.vm_id && !['provisioning', 'deleting'].includes(account.status)
+  if (refreshPending(account) && action !== 'stop') return false
   if (['start', 'stop', 'recover'].includes(action)) return !!account.vm_id && !lifecycleLocked(account) && (action === 'stop' || !account.slot_binding_stale) && (action !== 'start' || account.dispatch.inflight_requests === 0)
   if (account.dispatch.inflight_requests > 0) return false
   if (action === 'retry-delete') return account.deletion_pending
@@ -168,6 +176,16 @@ onBeforeUnmount(() => { disposed = true; ++loadGeneration; clearTimeout(debounce
         </div>
       </template>
       <template #table>
+        <section v-if="workspaceId && accounts[0]" class="mb-4 rounded-xl border p-4" :class="refreshPending(accounts[0]) ? 'border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-700 dark:bg-amber-950/20 dark:text-amber-100' : 'border-gray-200 dark:border-dark-600'" :aria-label="t('admin.accountPool.credentialState')">
+          <h2 class="text-sm font-semibold">{{ t(refreshPending(accounts[0]) ? 'admin.accountPool.refreshPending' : 'admin.accountPool.credentialState') }}</h2>
+          <p v-if="refreshPending(accounts[0])" class="mt-2 max-w-3xl text-pretty text-sm">{{ t('admin.accountPool.refreshPendingHint') }}</p>
+          <p class="mt-2 text-xs text-gray-600 dark:text-gray-300">{{ t('admin.accountPool.stateSnapshot', { time: stateCheckedAt(accounts[0]) }) }}</p>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button type="button" class="btn btn-secondary btn-sm" :disabled="!!runningAction || loading || !canRun(accounts[0], 'sync')" @click="confirmation = { account: accounts[0], action: 'sync' }">{{ t('admin.accountPool.sync') }}</button>
+            <button v-if="refreshPending(accounts[0])" type="button" class="btn btn-primary btn-sm" :disabled="!!runningAction || loading || !canRun(accounts[0], 'recover-credential')" @click="confirmation = { account: accounts[0], action: 'recover-credential' }">{{ t('admin.accountPool.recover-credential') }}</button>
+          </div>
+          <p v-if="refreshPending(accounts[0]) && (accounts[0].dispatch.inflight_requests > 0 || accounts[0].binding.credential_handoff)" class="mt-2 text-xs">{{ t('admin.accountPool.credentialRecoveryBlocked') }}</p>
+        </section>
         <nav v-if="workspaceId" :aria-label="t('admin.accountPool.workspace')" class="mb-5 flex flex-wrap gap-2 border-b border-gray-200 pb-3 dark:border-dark-600">
           <button v-for="section in (['instance', 'ip', 'settings'] as const)" :key="section" type="button" class="btn" :class="workspaceSection === section ? 'btn-primary' : 'btn-secondary'" :aria-pressed="workspaceSection === section" @click="workspaceSection = section">{{ t(`admin.accountPool.section_${section}`) }}</button>
         </nav>
@@ -187,7 +205,7 @@ onBeforeUnmount(() => { disposed = true; ++loadGeneration; clearTimeout(debounce
               <div><dt class="text-sm text-gray-500">{{ t('admin.accountPool.priority') }}</dt><dd class="mt-1 tabular-nums">{{ accounts[0].priority }}</dd></div>
               <div><dt class="text-sm text-gray-500">{{ t('admin.accountPool.slotGeneration') }}</dt><dd class="mt-1 tabular-nums">{{ accounts[0].provision_generation }}</dd></div>
             </dl>
-            <button type="button" class="btn btn-primary" :disabled="lifecycleLocked(accounts[0])" @click="openEdit(accounts[0])">{{ t('admin.accountPool.edit') }}</button>
+            <button type="button" class="btn btn-primary" :disabled="lifecycleLocked(accounts[0]) || refreshPending(accounts[0])" @click="openEdit(accounts[0])">{{ t('admin.accountPool.edit') }}</button>
             <AccountPoolPublishPanel :key="workspaceId" :groups="groups.filter(group => group.lease_account_id === workspaceId || (accounts[0]?.group_ids.includes(group.id) && group.account_count === 1))" />
           </template>
         </section>
@@ -199,6 +217,7 @@ onBeforeUnmount(() => { disposed = true; ++loadGeneration; clearTimeout(debounce
               <h2 class="text-balance break-words text-lg font-semibold">{{ account.name }}</h2>
               <p class="mt-1 break-all font-mono text-xs text-gray-500">{{ account.id }}</p>
               <p class="mt-3 text-sm" :class="account.status === 'error' ? 'text-red-600' : 'text-primary-700 dark:text-primary-300'">{{ t(`admin.accountPool.${account.status}`) }}</p>
+              <p v-if="refreshPending(account)" class="mt-2 text-sm font-medium text-amber-800 dark:text-amber-200">{{ t('admin.accountPool.refreshPending') }}</p>
               <dl class="my-4 space-y-2 text-sm">
                 <div><dt class="text-xs text-gray-500">{{ t('admin.accountPool.slotOwner') }}</dt><dd class="break-all">{{ account.name }}</dd></div>
                 <div><dt class="text-xs text-gray-500">{{ t('admin.accountPool.fixed') }}</dt><dd class="break-all font-mono">{{ account.slot?.egress?.proxy_id || account.binding.proxy_id || t('admin.accountPool.waitingIp') }}</dd></div>
@@ -233,6 +252,7 @@ onBeforeUnmount(() => { disposed = true; ++loadGeneration; clearTimeout(debounce
                   <p class="mt-1 text-xs">{{ t(account.schedulable ? 'admin.accountPool.schedulable' : 'admin.accountPool.paused') }}</p>
                   <p v-if="account.slot_binding_stale" class="mt-1 text-xs text-amber-700 dark:text-amber-300">{{ t('admin.accountPool.stale') }}</p>
                   <p v-if="account.deletion_pending" class="mt-1 text-xs text-red-600">{{ t('admin.accountPool.deletionPending') }}</p>
+                  <p v-if="refreshPending(account)" class="mt-1 text-xs font-medium text-amber-800 dark:text-amber-200">{{ t('admin.accountPool.refreshPending') }}</p>
                   <p v-if="account.slot?.health?.ok === false" class="mt-1 text-xs text-red-600">{{ t('admin.accountPool.healthFailed') }}</p>
                   <p v-else-if="account.slot && account.slot.health?.ok == null" class="mt-1 text-xs text-gray-500">{{ t('admin.accountPool.healthUnknown') }}</p>
                   <p v-if="account.error" class="mt-1 break-words text-xs text-red-600 dark:text-red-300">{{ account.error.message }} <span class="font-mono">({{ account.error.code }})</span></p>
@@ -266,7 +286,7 @@ onBeforeUnmount(() => { disposed = true; ++loadGeneration; clearTimeout(debounce
                 <td>
                   <div class="flex max-w-72 flex-wrap gap-2">
                     <RouterLink v-if="!workspaceId" :to="`/admin/account-pool/${encodeURIComponent(account.id)}`" class="btn btn-primary btn-sm">{{ t('admin.accountPool.openWorkspace') }}</RouterLink>
-                    <button type="button" class="btn btn-secondary btn-sm" :disabled="!!runningAction || loading || lifecycleLocked(account)" @click="openEdit(account)">{{ t('admin.accountPool.edit') }}</button>
+                    <button type="button" class="btn btn-secondary btn-sm" :disabled="!!runningAction || loading || lifecycleLocked(account) || refreshPending(account)" @click="openEdit(account)">{{ t('admin.accountPool.edit') }}</button>
                     <button v-for="action in visibleActions(account)" :key="action" type="button" :data-action="action" class="btn btn-secondary btn-sm" :disabled="!!runningAction || loading || !canRun(account, action)" @click="confirmation = { account, action }">{{ t(`admin.accountPool.${action}`) }}</button>
                     <RouterLink :to="{ path: '/admin/modeltrace', query: { account_id: account.id } }" class="btn btn-ghost btn-sm">{{ t('admin.accountPool.modeltrace') }}</RouterLink>
                   </div>

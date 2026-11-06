@@ -190,6 +190,18 @@ export class AccountLifecycle {
     if (action === 'stop' ? status.status !== 'stopped' : !status.ready) throw Object.assign(new Error('实例操作结果尚未确认，请同步状态后检查'), { status: 502, code: 'slot_action_unconfirmed' })
     return status
   }
+
+  async recoverCredential(accountInput, vmId, identityKey) {
+    const binding = normalizeAccountBinding(accountInput)
+    const before = await this.vm2.getSlot(vmId)
+    assertSlot(binding, vmId, before)
+    if (before.credential_refresh_pending !== true) throw Object.assign(new Error('当前执行槽没有待恢复刷新记录，请同步状态后检查'), { status: 409, code: 'codex_refresh_not_pending' })
+    await this.vm2.recoverCredential(vmId, credentialBinding(binding), identityKey)
+    const status = await this.vm2.getSlot(vmId)
+    assertSlot(binding, vmId, status)
+    if (status.credential_refresh_pending) throw Object.assign(new Error('刷新日志仍待恢复，已保持暂停调度'), { status: 409, code: 'codex_refresh_recovery_required' })
+    return status
+  }
 }
 
 export { buildCodexImportRequest }

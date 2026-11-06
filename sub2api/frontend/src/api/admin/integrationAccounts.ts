@@ -40,6 +40,7 @@ export interface IntegrationAccount {
     ip_selection: 'create_only'
     identity_policy: 'ip_derived'
     execution_backend?: 'kernel' | 'codex-cli'
+    credential_handoff?: { id: string }
     timezone: string | null
     locale: string
     max_concurrency: number | null
@@ -52,6 +53,7 @@ export interface IntegrationAccount {
     id?: string | null
     status?: string
     ready: boolean
+    credential_refresh_pending?: boolean
     health?: { ok: boolean | null; code?: string | null; checked_at?: string | null }
     egress?: { bound: boolean; proxy_id: string | null; timezone?: string | null }
     isolation?: { account_id: string | null; generation: number | null; runtime_type: string | null; container: string | null; identity_policy: string | null }
@@ -95,7 +97,7 @@ export interface IntegrationAccountUpdate {
   group_ids?: string[]
   schedulable?: boolean
 }
-export type IntegrationAccountAction = 'sync' | 'retry' | 'retry-delete' | 'delete' | 'start' | 'stop' | 'recover'
+export type IntegrationAccountAction = 'sync' | 'retry' | 'retry-delete' | 'delete' | 'start' | 'stop' | 'recover' | 'recover-credential'
 const accountPath = (id: string) => `/accounts/${encodeURIComponent(id)}`
 export const listIntegrationAccounts = (params: IntegrationAccountFilters = {}, signal?: AbortSignal) =>
   integrationRequest<IntegrationPage<IntegrationAccount>>('/accounts', { params, signal })
