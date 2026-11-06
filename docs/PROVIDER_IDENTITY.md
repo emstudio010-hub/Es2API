@@ -28,4 +28,4 @@ JWKS 请求只获取公开密钥：固定 URL，无 token/账号/workspace 参�
 
 当前专用账号做过只读真实签名核对，未改凭据或调用模型。语法/模块加载、迁移与健康检查不等于并发导入、轮换、混配或删除/重建验收；按用户要求没有运行测试。
 
-签名核对绑定可见 access/ID token，不能证明不透明 refresh token 与它们同属一个账号。本版在管理侧 checkpoint 阻止错账号提交；CLI/第三方 Kernel 自行刷新到 checkpoint 之间的完整身份锁定仍需补齐。后续必须先保护轮转后的新 refresh token，再处理验签失败，不能因 JWKS 故障丢失轮转凭据。真实 CLI→API 连接失败与其他验收缺口仍独立存在。
+签名核对绑定可见 access/ID token，不能证明不透明 refresh token 与它们同属一个账号。管理侧 checkpoint 核对原身份；宿主主动刷新增加 [加密日志、前后签名比较与本地恢复](REFRESH_RECOVERY.md)，先保存轮转响应再验签/提交，失败保留日志并阻止再次换票。第三方 Kernel 内部自行刷新到 checkpoint 之间的完整身份锁定仍需补齐。真实 CLI→API 连接失败与其他验收缺口仍独立存在。

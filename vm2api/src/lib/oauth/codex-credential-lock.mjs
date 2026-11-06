@@ -2,15 +2,17 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { withCodexSlotControl } from '../vm/codex-slot-coordination.mjs'
+import { assertNoPendingCodexRefresh, inCodexRefreshCommit } from './codex-refresh-journal.mjs'
 
-export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown = false } = {}) {
+export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown = false, allowRefreshRecovery = false } = {}) {
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (!allowShutdown && !allowRefreshRecovery) assertNoPendingCodexRefresh(projectRoot, vmId)
   if (vm.credential_handoff) throw Object.assign(new Error('凭据正在交接给重建任务；请重试完成重建'), {
     status: 409, code: 'codex_credential_handoff_pending',
   })
-  if (!allowShutdown && vm.codex_shutdown) throw Object.assign(new Error('实例已进入停机或删除流程；请完成操作后显式启动'), {
+  if (!allowShutdown && vm.codex_shutdown && !inCodexRefreshCommit(projectRoot, vmId)) throw Object.assign(new Error('实例已进入停机或删除流程；请完成操作后显式启动'), {
     status: 409, code: 'codex_shutdown_pending',
   })
   return vm
@@ -18,10 +20,10 @@ export function assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShu
 
 // All host-side Codex token exchanges and writes use this same key. The kernel
 // is stopped and confirmed before a handoff snapshot is read under this lock.
-export function withCodexCredentialLock(projectRoot, vmId, operation, { allowHandoff = false, allowShutdown = false } = {}) {
+export function withCodexCredentialLock(projectRoot, vmId, operation, { allowHandoff = false, allowShutdown = false, allowRefreshRecovery = false } = {}) {
   if (!isValidVmId(vmId)) throw Object.assign(new Error('无效的执行槽 ID'), { status: 400, code: 'invalid_vm_id' })
   return withCodexSlotControl(projectRoot, vmId, () => {
-    if (!allowHandoff) assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown })
+    if (!allowHandoff) assertCodexCredentialNotHandingOff(projectRoot, vmId, { allowShutdown, allowRefreshRecovery })
     return operation()
   })
 }

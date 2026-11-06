@@ -26,7 +26,7 @@
 
 只保留选中记录及其透明包装层的 `chatgpt_account_id`、`email`、`expires_at`；选中令牌对象中的 account_id/accountId，以及 auth.json 中 tokens 旁的该字段，作为供应商 ID 别名。credentials 包装层的管理 account_id 和任意 id 不能作为供应商 ID。字段有长度/格式限制；无效可选元数据忽略。绝对期限支持 Unix 秒、毫秒、带时区 ISO 文本（含 expired 别名），统一成秒；没有基准时间的 expires_in 不推算。嵌套深度最多64，遍历对象最多10000。
 
-这些字段是导入提示，不代表已认证的供应商身份。元数据随凭据加密保存，不进入 publicCredentialStatus；凭据指纹仍只使用原有四个令牌字段，不改旧数据库指纹，不重写或迁移已有账号。相同账号刷新后的新令牌目前仍可能形成不同指纹，不能宣称已经实现供应商稳定身份去重。
+这些字段是导入提示，不代表已认证的供应商身份。元数据随凭据加密保存，不进入 publicCredentialStatus；凭据指纹仍只使用原有四个令牌字段，不改旧数据库指纹。preview.24 起，另外使用固定旧版 Codex client 的已验签用户/workspace哈希作身份唯一索引，导入与checkpoint要求可信proof；不能把邮箱或未验证JWT作为身份。非 stale retry 也须验证存储凭据与原索引一致。宿主刷新日志及未覆盖的第三方 Kernel 边界见 [刷新恢复](../docs/REFRESH_RECOVERY.md)。
 
 1. 控制面验证并保存账号，生成稳定的 `account_id`。
 2. `AccountLifecycle.provision()` 调用 VM2 `/api/panel/vms/create`，固定 `runtime_type=docker`、`platform=openai`、`kind=codex`，并以 `start=false` 创建空槽。

@@ -9,9 +9,11 @@ import { slotHost } from '../vm/slot-host.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { stopCodexKernelForCheckpoint } from '../transport/codex-kernel-stop.mjs'
 import { codexKernelBinPath, codexKernelOwnerBinPath } from '../transport/codex-kernel-supervisor.mjs'
+import { assertNoPendingCodexRefresh } from './codex-refresh-journal.mjs'
 
 export async function checkpointCodexCredential(projectRoot, vmId, expected, stop) {
   return withCodexCredentialLock(projectRoot, vmId, async () => {
+    assertNoPendingCodexRefresh(projectRoot, vmId)
     const file = path.join(projectRoot, 'vms', `${vmId}.json`)
     let vm = JSON.parse(fs.readFileSync(file, 'utf8'))
     assertCodexIntegrationBinding(vm, expected)

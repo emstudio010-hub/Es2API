@@ -9,6 +9,7 @@ import { buildCodexUsageView, extraToCodexSnapshot, hasSpendableCodexCredits } f
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
 import { selectOAuthCredential } from '../oauth/credential-import.mjs'
 import { assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
+import { assertNoPendingCodexRefresh } from '../oauth/codex-refresh-journal.mjs'
 
 export { isCodexVm }
 
@@ -16,7 +17,8 @@ export function codexCredentialPath(projectRoot, vmId) {
   return path.join(projectRoot, 'vms', vmId, 'codex-credentials.json')
 }
 
-export function readCodexAccounts(projectRoot, vmId) {
+export function readCodexAccounts(projectRoot, vmId, { allowPendingRefresh = false } = {}) {
+  if (!allowPendingRefresh) assertNoPendingCodexRefresh(projectRoot, vmId)
   const file = codexCredentialPath(projectRoot, vmId)
   try {
     const raw = readJsonCached(file)
@@ -295,7 +297,9 @@ export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredi
 }
 
 export function summarizeCodexSlot(projectRoot, vm = {}) {
-  const accounts = projectRoot && vm?.id ? readCodexAccounts(projectRoot, vm.id) : []
+  const accounts = projectRoot && vm?.id ? readCodexAccounts(projectRoot, vm.id, { allowPendingRefresh: true }) : []
+  let refreshPending = false
+  if (projectRoot && vm?.id) { try { assertNoPendingCodexRefresh(projectRoot, vm.id) } catch { refreshPending = true } }
   const first = enrichCodexAccountIdentity(accounts[0] || {})
   const extra = vm.codex?.extra || vm.codex_extra || {}
   // extra is the source of truth; the stored view is only a fallback for slots without extra.
@@ -313,6 +317,7 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     chatgpt_subscription_active_until: first.chatgpt_subscription_active_until || null,
     chatgpt_plan_type: first.chatgpt_plan_type || null,
     account_count: accounts.length,
+    credential_refresh_pending: refreshPending,
     usage,
     reset_credits: vm.codex?.reset_credits || null,
     credits: vm.codex?.credits || null,

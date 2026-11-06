@@ -297,6 +297,10 @@ export class AccountPool {
     const binding = normalizeAccountBinding({ ...(account.binding || {}), account_id: account.id,
       name: account.name, mode: account.mode, group_ids: account.group_ids, max_concurrency: account.concurrency })
     let credential = account.credentials
+    if (!staleRebind) {
+      const identity = await verifyCodexProviderIdentity(credential)
+      this.store.bindProviderIdentity(id, credential, identity, { expectedFingerprint: account.credential.fingerprint })
+    }
     if (staleRebind && account.vm_id) {
       this.store.updateAccount(id, { status: 'provisioning', schedulable: false })
       try {

@@ -76,7 +76,6 @@ import {
   saveGptModelPolicy,
   resetGptModelPolicy,
 } from '../protocol/gpt-model-policy.mjs'
-import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import {
   defaultSeedPolicy,
   isTelemetryEnabled,
@@ -268,7 +267,8 @@ import { isCodexCliVm, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs
 import { codexCliHealth, cancelCodexCli, refreshCliCredential } from '../transport/codex-cli-client.mjs'
 import { withCodexCredentialLock, assertCodexIntegrationBinding } from '../oauth/codex-credential-lock.mjs'
 import { checkpointCodexCredential } from '../oauth/codex-credential-handoff.mjs'
-import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
+import { refreshStoredCodexCredential, recoverStoredCodexRefresh } from '../oauth/codex-credential-refresh.mjs'
+import { assertNoPendingCodexRefresh } from '../oauth/codex-refresh-journal.mjs'
 import { withCodexKernelCredentialOwner } from '../oauth/codex-kernel-credential-owner.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -433,12 +433,7 @@ async function commitImportedCodexVm({
     }
     return withCodexKernelCredentialOwner(cfg.paths.project, existing.id, async () => {
     if (!account.access_token && account.refresh_token) {
-      const slotProxy = requireSlotProxy(existing, importBody)
-      if (!slotProxy.ok) throw Object.assign(new Error(slotProxy.message), { status: slotProxy.status, code: 'proxy_required' })
-      const tok = await refreshCodexAccessToken({ refreshToken: account.refresh_token, proxyUrl: slotProxy.proxyUrl })
-      if (!tok.ok || !tok.access_token) throw Object.assign(new Error('Refresh Token 换票失败，请检查 RT 或重新授权'), { status: 502, code: 'refresh_failed' })
-      account = { ...account, access_token: tok.access_token, refresh_token: tok.refresh_token || account.refresh_token,
-        id_token: tok.id_token || account.id_token, expires_at: tok.expires_at || account.expires_at }
+      throw Object.assign(new Error('请导入含可验签 access token 的完整 OAuth；未消费 refresh token'), { status: 400, code: 'provider_identity_required' })
     }
     const wasCodex = isCodexVm(existing)
     if (isCodexCliVm(existing) && cancelCodexCli(existing.id)) throw Object.assign(new Error('CLI 正在退出，请等待执行结束后重新导入'), { status: 409, code: 'codex_cli_busy' })
@@ -3503,6 +3498,7 @@ export function createPanelHandler(ctx) {
           if (prev.integration_binding?.account_id) return json(res, 409, { ok: false, error: { code: 'account_pool_managed', message: '独立账号池凭据请通过账号管理维护；不能在旧执行槽入口清除账号' } })
           if (prev.credential_handoff) return json(res, 409, { ok: false, error: { code: 'codex_credential_handoff_pending', message: '凭据正在交接，不能清除凭据' } })
           if (prev.codex_shutdown) return json(res, 409, { ok: false, error: { code: 'codex_shutdown_pending', message: '停机或删除尚未解除，不能清除凭据' } })
+          if (isCodexVm(prev)) assertNoPendingCodexRefresh(cfg.paths.project, id)
           prev.id = prev.id || id
           if (isCodexCliVm(prev) && cancelCodexCli(id)) return json(res, 409, { ok: false, error: { code: 'codex_cli_busy', message: 'CLI 正在退出，请等待执行结束后清除凭据' } })
           const clear = async () => {
@@ -4976,6 +4972,16 @@ export function createPanelHandler(ctx) {
             official_cc_bootstrap: committed.official_cc_bootstrap || null,
           }),
         )
+      }
+
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/oauth\/recover$/.test(p)) {
+        if (panelIdentity(req).role !== 'admin') return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Admin access required' } })
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        if (!isCodexVm(vm)) return json(res, 400, { ok: false, error: { code: 'credential_kind_mismatch', message: '仅支持 Codex 刷新恢复' } })
+        await recoverStoredCodexRefresh(cfg.paths.project, id)
+        return json(res, 200, panel.ok({ recovered: true, oauth_exchange_performed: false }))
       }
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/oauth\/refresh$/.test(p)) {

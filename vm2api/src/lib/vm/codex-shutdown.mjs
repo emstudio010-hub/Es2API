@@ -7,6 +7,7 @@ import { stopConfiguredCodexKernel } from '../oauth/codex-kernel-credential-owne
 import { withCodexKernelPause } from '../transport/codex-kernel-activity.mjs'
 import { codexCliJobs } from '../transport/codex-cli-state.mjs'
 import { withCodexSlotControl, withCodexSlotDrain } from './codex-slot-coordination.mjs'
+import { assertNoPendingCodexRefresh } from '../oauth/codex-refresh-journal.mjs'
 
 // Keep intent on disk until explicit start or record deletion. Node restarts,
 // stale request snapshots and quota recovery must not resurrect the process.
@@ -22,6 +23,7 @@ export async function shutdownCodexSlot(vm, projectRoot, action, halt, { credent
       if (action === 'stop' && acknowledgedHandoffId && record.credential_handoff?.id === acknowledgedHandoffId) action = 'delete'
       else throw Object.assign(new Error('实例删除尚未完成，请继续删除'), { code: 'codex_delete_pending' })
     }
+    if (action === 'delete') assertNoPendingCodexRefresh(projectRoot, vm.id)
     const intent = record.codex_shutdown?.action === action ? record.codex_shutdown
       : { id: crypto.randomUUID(), action, at: new Date().toISOString() }
     atomicWriteJson(file, { ...record, codex_shutdown: { ...intent, confirmed: false },

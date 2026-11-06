@@ -26,6 +26,9 @@ export function classifyCodexCliDiagnostic(value) {
 }
 
 export function codexCliFailureMessage(code) {
+  if (/^(?:codex_refresh_[a-z_]+|provider_identity_(?:invalid|verification_unavailable))$/.test(code || '')) {
+    return 'OAuth 身份或刷新状态未确认，请由管理员恢复已保存的凭据；未自动重试换票'
+  }
   if (/^codex_cli_egress_(?:unsupported|inspection_unavailable|slot_network_mismatch|network_policy_mismatch|process_unavailable|config_mismatch|listener_unavailable|rules_mismatch)$/.test(code || '')) {
     return 'CLI 固定出口的本地网络配置未通过检查，请在实例中检查出口；未启动模型请求'
   }

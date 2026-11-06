@@ -267,6 +267,7 @@ export async function refreshCodexAccessToken(opts = {}) {
   try {
     const res = await fetchFn(CODEX_OAUTH_TOKEN_URL, {
       method: 'POST',
+      redirect: 'error',
       headers: {
         accept: 'application/json',
         'content-type': 'application/x-www-form-urlencoded',
@@ -276,6 +277,15 @@ export async function refreshCodexAccessToken(opts = {}) {
     })
     const status = Number(res?.status) || 0
     const payload = await readFetchBody(res)
+    // Preserve any token-bearing refresh response before validation/early returns.
+    if (typeof opts.capture === 'function' && [payload?.access_token, payload?.refresh_token, payload?.id_token].some(v => typeof v === 'string' && v)) {
+      const expiresIn = Number(payload?.expires_in)
+      await opts.capture({ ok: status >= 200 && status < 300 && typeof payload?.access_token === 'string' && !!payload.access_token.trim(), status,
+        access_token: typeof payload?.access_token === 'string' ? payload.access_token.trim() : '',
+        refresh_token: typeof payload?.refresh_token === 'string' ? payload.refresh_token.trim() : '',
+        id_token: typeof payload?.id_token === 'string' ? payload.id_token.trim() : '',
+        expires_at: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0 })
+    }
     if (status === 401 || status === 403) {
       return { ok: false, error: 'refresh_rejected', status }
     }
@@ -291,6 +301,7 @@ export async function refreshCodexAccessToken(opts = {}) {
       expires_at: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0,
     }
   } catch (e) {
+    if (e?.code === 'codex_refresh_storage_unavailable') throw e
     const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
     return { ok: false, error: aborted ? 'timeout' : 'fetch_failed' }
   }

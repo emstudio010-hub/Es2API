@@ -8,10 +8,10 @@ import { StringDecoder } from 'node:string_decoder'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { slotHost, hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
-import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { withCodexCredentialLock, assertCodexCredentialNotHandingOff } from '../oauth/codex-credential-lock.mjs'
-import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
-import { withCodexKernelCredentialOwner } from '../oauth/codex-kernel-credential-owner.mjs'
+import { refreshStoredCodexCredential } from '../oauth/codex-credential-refresh.mjs'
+import { verifyCodexProviderIdentity } from '../oauth/codex-provider-identity.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { CODEX_CLI_CONTAINER_BIN, CODEX_CLI_VERSION, inspectCodexCliPayload } from '../vm/codex-cli-config.mjs'
 import { codexCliJobs as active, codexCliInMaintenance } from './codex-cli-state.mjs'
@@ -139,7 +139,7 @@ export const ensureCodexCli = codexCliHealth
 // the control plane, never concurrently by an ephemeral CLI and the quota worker.
 export async function refreshCliCredential(projectRoot, vm, { force = false, deadline = Infinity, signal } = {}) {
   if (!supported({ vm })) throw Object.assign(new Error('CLI 固定出口不可用，已停止刷新'), { code: 'codex_cli_proxy_required' })
-  return withCodexCredentialLock(projectRoot, vm.id, () => withCodexKernelCredentialOwner(projectRoot, vm.id, async () => {
+  return withCodexCredentialLock(projectRoot, vm.id, async () => {
     if (signal?.aborted) throw Object.assign(new Error('CLI 请求已取消，未开始刷新'), { code: 'codex_cli_cancelled' })
     if (Date.now() >= deadline) throw Object.assign(new Error('CLI 执行预算已用尽，未开始刷新'), { code: 'codex_cli_timeout' })
     const accounts = readCodexAccounts(projectRoot, vm.id)
@@ -147,18 +147,13 @@ export async function refreshCliCredential(projectRoot, vm, { force = false, dea
     let account = accounts[0]
     if (force || needsAccessRefresh(account)) {
       if (!account.refresh_token) throw Object.assign(new Error('OAuth 需要刷新；请重新导入含刷新令牌的凭据'), { code: 'codex_cli_refresh_required' })
-      const usedRefresh = account.refresh_token
-      const token = await refreshCodexAccessToken({ refreshToken: usedRefresh, proxyUrl: hostProxyUrlForVm(vm), timeoutMs: Math.max(1, Math.min(15000, deadline - Date.now())) })
-      if (!token.ok || !token.access_token) throw Object.assign(new Error('OAuth 刷新失败，请在账号管理中检查凭据'), { code: Date.now() >= deadline ? 'codex_cli_timeout' : 'codex_cli_refresh_failed' })
-      const current = readCodexAccounts(projectRoot, vm.id)
-      const latest = current[0]
-      if (current.length !== 1 || latest?.refresh_token !== usedRefresh || latest?.access_token !== account.access_token) throw Object.assign(new Error('凭据已在其他操作中变化，请重试'), { code: 'codex_cli_credential_changed' })
-      upsertCodexAccount(projectRoot, vm.id, { access_token: token.access_token, refresh_token: token.refresh_token || usedRefresh, id_token: token.id_token || account.id_token, expires_at: token.expires_at || account.expires_at })
-      account = readCodexAccounts(projectRoot, vm.id)[0]
+      account = await refreshStoredCodexCredential(projectRoot, vm.id, { previous: account,
+        proxyUrl: hostProxyUrlForVm(vm), signal, deadline, timeoutMs: Math.max(1, Math.min(15000, deadline - Date.now())) })
     }
+    await verifyCodexProviderIdentity(account)
     if (!account.id_token || !account.chatgpt_account_id) throw Object.assign(new Error('Codex CLI 需要 id_token 与 ChatGPT account ID，请补全 OAuth 文件'), { code: 'codex_cli_identity_required' })
     return account
-  }, { timeoutMs: Math.max(1, Math.min(15000, deadline - Date.now())) }))
+  })
 }
 
 // This supervisor lives inside the slot. It kills the entire CLI process group on
@@ -446,7 +441,7 @@ async function streamCodexCliActive({ exec, signal, body, rawBody, onEvent } = {
     await emit({ type: 'response.completed', response })
     return { ok: true, status: 200, committed: true, terminalState: 'verified', body: response, usage, firstTokenAt, ttftMs: firstTokenAt - started, executionExitConfirmed: true }
   } catch (error) {
-    const code = failure || (/^codex_cli_[a-z_]+$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed')
+    const code = failure || (/^(?:codex_(?:cli|refresh)_[a-z_]+|provider_identity_(?:invalid|verification_unavailable))$/.test(error.code || '') ? error.code : 'codex_cli_execution_failed')
     cancel(code)
     // Do not expose spawn stderr, paths, argv, auth or network diagnostics.
     const result = errorResult(code === 'codex_cli_timeout' ? 504 : signal?.aborted || code === 'codex_cli_cancelled' || code === 'client_cancelled' ? 499 : 503, code, 'Codex CLI 准备或执行失败，请检查实例与 OAuth 状态')

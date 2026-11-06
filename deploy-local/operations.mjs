@@ -79,6 +79,12 @@ async function createBackup() {
     if (fs.existsSync(path.join(runtime, source))) await fsp.copyFile(path.join(runtime, source), path.join(destination, name))
   }
   const vms = path.join(runtime, 'vm2', 'vms')
+  const refreshJournal = path.join(runtime, 'vm2', '.codex-refresh')
+  if (fs.existsSync(refreshJournal)) await fsp.cp(refreshJournal, path.join(destination, 'codex-refresh'), { recursive: true, filter: source => {
+    const stat = fs.lstatSync(source)
+    if (stat.isSymbolicLink() || !(stat.isDirectory() || stat.isFile())) throw new Error('Invalid refresh journal backup entry')
+    return true
+  } })
   if (fs.existsSync(vms)) await fsp.cp(vms, path.join(destination, 'vms'), { recursive: true, filter: source => {
     const stat = fs.lstatSync(source)
     return !stat.isSymbolicLink() && (stat.isDirectory() || stat.isFile()) && !source.split(path.sep).includes('run')
@@ -108,6 +114,9 @@ async function restore(directory) {
     try { await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) }); running = true } catch {}
     if (running) throw new Error('Stop application services before restore; PostgreSQL must remain running')
   }
+  const refreshJournal = path.join(runtime, 'vm2', '.codex-refresh')
+  if (fs.existsSync(refreshJournal) && (fs.lstatSync(refreshJournal).isSymbolicLink()
+    || fs.readdirSync(refreshJournal).some(name => name.endsWith('.pending.json')))) throw new Error('Resolve pending OAuth rotation before restoring older credentials or encryption keys')
   const manifest = JSON.parse(await fsp.readFile(path.join(source, 'manifest.json'), 'utf8'))
   if (manifest.version !== 1 || !manifest.files) throw new Error('Unsupported backup manifest')
   for (const [relative, digest] of Object.entries(manifest.files)) {
@@ -130,6 +139,8 @@ async function restore(directory) {
     if (fs.existsSync(target)) await fsp.rename(target, target + '.before-restore-' + Date.now())
     await fsp.cp(path.join(source, 'vms'), target, { recursive: true })
   }
+  if (fs.existsSync(refreshJournal)) await fsp.rename(refreshJournal, refreshJournal + '.before-restore-' + Date.now())
+  if (fs.existsSync(path.join(source, 'codex-refresh'))) await fsp.cp(path.join(source, 'codex-refresh'), refreshJournal, { recursive: true })
   record('restore_completed', { source, rollback }); console.log('Restore completed. Start the stack when ready.')
 }
 async function rollbackBinary(file) {
