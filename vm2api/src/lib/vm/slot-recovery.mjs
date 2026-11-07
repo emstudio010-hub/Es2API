@@ -405,7 +405,14 @@ async function powerOnSlotUnlocked({ projectRoot, id, proxyPool, routing = {}, f
   if (!bound) {
     return { ok: false, status: 409, code: 'proxy_required', error: 'No SOCKS5 is bound or free for this VM' }
   }
-  bindVmProxy(projectRoot, id, bound)
+  // Allocation returns a PUBLIC summary. It deliberately omits URL/auth;
+  // writing it into vm.proxy silently breaks authenticated SOCKS on start.
+  // Resolve the current actual binding again using the private accessor.
+  const runtimeProxy = proxyPool.getProxyForVm(id)
+  if (!runtimeProxy || runtimeProxy.id !== bound.id) {
+    return { ok: false, status: 409, code: 'proxy_binding_changed', error: 'Fixed proxy binding changed before runtime configuration; no fallback applied' }
+  }
+  bindVmProxy(projectRoot, id, runtimeProxy)
   if (binding?.proxy_exclusive) patchVmRecord(projectRoot, id, { integration_binding: { ...binding, proxy_id: bound.id } })
   await (fillTimezone || ((vmId) => fillVmTimezoneFromExit(projectRoot, proxyPool, vmId)))(id)
   vm = getVm(projectRoot, id) || vm

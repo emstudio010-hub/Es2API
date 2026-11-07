@@ -144,7 +144,10 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     timezone: vm.timezone || null,
     timezone_source: vm.timezone_source || 'auto',
     locale: vm.locale || null,
-    proxy: vm.proxy ? { ...vm.proxy, password: vm.proxy.password ? '***' : (vm.proxy.password ?? null) } : null,
+    proxy: vm.proxy ? { id: vm.proxy.id, host: vm.proxy.host, port: vm.proxy.port,
+      scheme: vm.proxy.scheme || vm.proxy.kind || 'socks5', kind: vm.proxy.kind || null,
+      has_auth: !!(vm.proxy.username || vm.proxy.password || (vm.proxy.url && /@/.test(vm.proxy.url))),
+      url: null, username: null, password: null } : null,
     claude_code_version: vm.claude_code_version || null,
     stats: vm.stats || {},
     fingerprint: vm.fingerprint || null,
@@ -589,6 +592,10 @@ export function clearKernelRestartPending(project, id) {
 }
 
 export function bindVmProxy(projectRoot, id, proxyInfo) {
+  // Public pool summaries are suitable for a panel response, never runtime
+  // configuration. Reject them before touching a credential-bearing record.
+  if (proxyInfo && Object.hasOwn(proxyInfo, 'has_auth')) throw Object.assign(
+    new Error('运行出口必须使用私有绑定记录，不能保存展示用代理摘要'), { status: 409, code: 'proxy_runtime_auth_required' })
   const file = path.join(projectRoot, 'vms', `${id}.json`)
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))

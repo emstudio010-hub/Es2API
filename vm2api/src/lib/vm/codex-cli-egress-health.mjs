@@ -4,12 +4,33 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { DatabaseSync } from 'node:sqlite'
+import { getDbPath, resolveDbPath } from '../db/database.mjs'
 import { slotExecContainer } from './slot-exec.mjs'
 import { EGRESS_BIN, boundProxyUrl, bridgeName, chainName, egressRunDir, inspectEgressProcess,
   iptablesPlan, isLocalEgressProxy, networkName, portsForProxy } from './egress.mjs'
 
 const runFile = promisify(execFile)
 const failed = reason => ({ ok: false, reachable: false, status: 503, code: `codex_cli_egress_${reason}` })
+
+// vm.json and egress.json can agree on the SAME accidentally stripped auth.
+// Read the authoritative private pool row as well; agreement between two
+// derived runtime copies alone does not establish the selected proxy route.
+function poolRouteMatches(projectRoot, vm) {
+  const file = getDbPath() || resolveDbPath({ dataDir: path.join(projectRoot, 'data') })
+  const db = new DatabaseSync(file, { readOnly: true })
+  try {
+    const row = db.prepare('SELECT * FROM proxies WHERE id=?').get(vm.proxy.id)
+    if (!row || row.enabled !== 1 || row.status === 'dead') return false
+    let ids = row.bound_vm_id
+    if (typeof ids === 'string') {
+      const value = ids.trim()
+      ids = value.startsWith('[') ? JSON.parse(value) : value.split(',')
+    }
+    if (!Array.isArray(ids) || !ids.includes(vm.id) || (vm.integration_binding?.proxy_exclusive && ids.length !== 1)) return false
+    return boundProxyUrl({ ...row, scheme: row.protocol }) === boundProxyUrl(vm.proxy)
+  } finally { db.close() }
+}
 
 // iptables-save canonicalizes option order and adds protocol match modules.
 // Compare complete rules, retaining negation and duplicate options; never use
@@ -58,6 +79,7 @@ export async function inspectCodexCliEgress(projectRoot, vm, { timeoutMs = 4000 
     } catch { return { ok: false } } // Never surface stderr/configuration/secrets.
   }
   try {
+    if (!poolRouteMatches(projectRoot, vm)) return failed('proxy_record_mismatch')
     const expectedNetwork = networkName(vm.proxy.id), ports = portsForProxy(vm.proxy.id)
     const [containerResult, networkResult, sockets, nat, filter] = await Promise.all([
       command('docker', ['inspect', '--type', 'container', slotExecContainer(vm)]),
@@ -98,6 +120,7 @@ export async function inspectCodexCliEgress(projectRoot, vm, { timeoutMs = 4000 
     // The process may have disappeared during the asynchronous inventory.
     const finalState = inspectEgressProcess(projectRoot, vm.proxy.id)
     if (finalState.pid !== state.pid || !finalState.ok) return failed('process_unavailable')
+    if (!poolRouteMatches(projectRoot, vm)) return failed('proxy_record_mismatch')
     return { ok: true, scope: 'local_configuration_only', upstream_reachability_verified: false }
   } catch { return failed('inspection_unavailable') }
 }
