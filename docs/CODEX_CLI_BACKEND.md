@@ -1,5 +1,9 @@
 # 真实 Codex CLI 执行后端（预览）
 
+## 最近真实验收（2026-11-07）
+
+固定出口认证恢复后，单独授权的一次 gpt-6-luna 经直接 VM2 Responses API → 独立容器 Codex CLI 成功：HTTP 200/completed、正文 ES2API_OK、usage 输入4564/输出8、30442ms、原请求退出回执确认，无重试、无 OAuth 换票。Go 主产品用户 Key/group/billing、流式及 Chat 未在此次验收中覆盖。以下按版本保留的历史失败与未验收说明应结合本节阅读；完整边界见 [验收记录](CLI_ACCEPTANCE-2026-11-07.md)。
+
 ## 固定出口本地检查（2026-11-06）
 
 CLI 就绪检查和请求准备现在都只读核对：实际容器的账号标签、单一网络绑定、桥接禁用伪装/互通/IPv6、独占出口配置、当前执行文件和用户对应的出口进程、该进程的 TCP/DNS TCP/UDP 监听，以及本代理 NAT 链的完整规则顺序与转发/输入规则。检查命令共享至多5秒预算，结果只包含固定错误码，不输出代理认证、Docker环境变量或命令错误正文。
@@ -193,7 +197,7 @@ ping/pong是WS控制帧，nonce匹配才证明链路回应，不用于模型完�
 
 ## 验收边界
 
-本次不运行测试套件或真实推理。语法、类型、编译、二进制完整性、`--version` 与应用健康只证明安装及构建情况；不证明 OAuth 认证、容器沙箱兼容、取消行为、真实模型用量或跨账号隔离已经通过实测。当前已有账号/IP 保持原配置，不能把它的 Kernel 健康状态当成 CLI 验收。Linux 包和公开源码按发行版本分别提供，请核对对应 Release 的版本、附件和校验文件。
+不运行测试套件。2026-11-07 单次直接 VM2→CLI 成功具有正文、真实用量及退出证据；它不证明取消、跨账号隔离、完整 OAuth 生命周期、Go 计费入口或 Linux 安装已验收。语法、编译、二进制完整性、`--version` 和健康状态也不能替代这些验收。Linux 包与源码按版本分别提供，请核对 Release、附件和校验文件。
 
 参考：[官方非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[官方 CLI 命令](https://learn.chatgpt.com/docs/developer-commands?surface=cli)、[官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。本实现核对固定0.155.1源码提交 `be2951ea34f0d295ed0becf97079f92fa5f6950e` 的exec CLI、配置loader及developer指令合并逻辑；当前官方文档不能代替该固定版本的实际调用验收。
 

@@ -7,6 +7,7 @@
  */
 
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
+import { publicCodexCliObservation } from '../transport/codex-cli-observation.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import os from 'node:os'
 import path from 'node:path'
@@ -2082,6 +2083,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     identity_policy: v.identity_policy || null,
     integration_binding: v.integration_binding || null,
     execution_backend: v.execution_backend === 'codex-cli' ? 'codex-cli' : 'kernel',
+    cli_execution: v.execution_backend === 'codex-cli' ? publicCodexCliObservation(v.cli_execution) : null,
     runtime: v.runtime || null,
     ip: v.ip || v.runtime?.ip || null,
     pid: v.pid || v.runtime?.pid || null,
